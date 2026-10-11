@@ -1,0 +1,15 @@
+{
+  "name": "cautious_push",
+  "description": "Commander-selected Marine squad attacks the objective, locally retreats on low HP or superior visible enemy value, resumes after hysteresis/cooldown. No economy or global army control.",
+  "file": "cautious_push.py",
+  "unit": "marine",
+  "actions": [
+    "attack_move",
+    "move"
+  ],
+  "parameters": {
+    "retreat_ratio": "Enemy/own mineral+gas cost threshold; default 1.3, finite >1.",
+    "resume_ratio": "Resume below this value ratio; default 0.8, below retreat_ratio.",
+    "health_floor": "Retreat below average HP fraction, default 0.35, range 0..1."
+  }
+}

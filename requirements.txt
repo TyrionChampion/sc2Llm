@@ -1,0 +1,33 @@
+# Python 3.11; versions from the working local environment.
+# Install the bundled PySC2 with its local patches.
+-e ./pysc2-src
+absl-py==2.5.0
+attrs==26.1.0
+cachebox==5.2.3
+certifi==2026.7.22
+charset-normalizer==3.5.2
+deepdiff==9.1.0
+dm-env==1.6
+dm-tree==0.1.10
+enum34==1.1.10
+future==1.0.0
+idna==3.20
+mock==5.2.0
+mpyq==0.2.5
+numpy==2.4.6
+orderly-set==5.5.0
+pillow==12.3.0
+portpicker==1.6.0
+protobuf==3.20.3
+psutil==7.2.2
+pygame==2.6.1
+requests==2.34.2
+s2clientprotocol==5.0.16.97563.0
+s2protocol==5.0.16.97563.0
+scipy==1.17.1
+six==1.17.0
+sk-video==1.1.10
+urllib3==2.8.0
+websocket-client==1.9.2
+whichcraft==0.6.1
+wrapt==2.5.0

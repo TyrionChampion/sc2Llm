@@ -1,0 +1,42 @@
+{
+  "repository": "https://github.com/BurnySc2/python-sc2",
+  "commit": "81d66110cb0aa57cc7c2895dad207775e496fbd1",
+  "files": {
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/BurnySc2/python-sc2/81d66110cb0aa57cc7c2895dad207775e496fbd1/LICENSE",
+      "sha256": "74b446893e6c91d958871a1ed90fa4ff4bf4f2f4641a5f677d41e391dd691dc4"
+    },
+    "sc2/dicts/unit_train_build_abilities.py": {
+      "url": "https://raw.githubusercontent.com/BurnySc2/python-sc2/81d66110cb0aa57cc7c2895dad207775e496fbd1/sc2/dicts/unit_train_build_abilities.py",
+      "sha256": "4f692d6c8ab51407033b6a2954c2a76ececc35a873e48a625a95149a9922c014"
+    },
+    "sc2/dicts/unit_trained_from.py": {
+      "url": "https://raw.githubusercontent.com/BurnySc2/python-sc2/81d66110cb0aa57cc7c2895dad207775e496fbd1/sc2/dicts/unit_trained_from.py",
+      "sha256": "45130f1fa40cb74e2cf4eed25ee316d6baff0d592bde9dc5a884e3a099408031"
+    },
+    "sc2/dicts/unit_research_abilities.py": {
+      "url": "https://raw.githubusercontent.com/BurnySc2/python-sc2/81d66110cb0aa57cc7c2895dad207775e496fbd1/sc2/dicts/unit_research_abilities.py",
+      "sha256": "57d935f10098ea794ed4d794b01b0b7e371937c2614d794550399bc138b63877"
+    },
+    "sc2/dicts/upgrade_researched_from.py": {
+      "url": "https://raw.githubusercontent.com/BurnySc2/python-sc2/81d66110cb0aa57cc7c2895dad207775e496fbd1/sc2/dicts/upgrade_researched_from.py",
+      "sha256": "c7c647a2ea49893fd464ba382dbb7a3cd1e5f737004112c9d7f60d2ee9c9eb46"
+    },
+    "sc2/ids/unit_typeid.py": {
+      "url": "https://raw.githubusercontent.com/BurnySc2/python-sc2/81d66110cb0aa57cc7c2895dad207775e496fbd1/sc2/ids/unit_typeid.py",
+      "sha256": "40196bb9617d177410525a57c2d7d77fff89d34e49adf82b9f05abce35372786"
+    },
+    "sc2/ids/ability_id.py": {
+      "url": "https://raw.githubusercontent.com/BurnySc2/python-sc2/81d66110cb0aa57cc7c2895dad207775e496fbd1/sc2/ids/ability_id.py",
+      "sha256": "2ed15d70e59fb544dab7a1370acc7d6fcc126d91c29fa6aeb2e25faaabc9fffc"
+    },
+    "sc2/ids/upgrade_id.py": {
+      "url": "https://raw.githubusercontent.com/BurnySc2/python-sc2/81d66110cb0aa57cc7c2895dad207775e496fbd1/sc2/ids/upgrade_id.py",
+      "sha256": "45c8fa6874540a275b0e8cc2537bfc803362df99fb6d083292c8388163048ec6"
+    },
+    "sc2/dicts/unit_abilities.py": {
+      "url": "https://raw.githubusercontent.com/BurnySc2/python-sc2/81d66110cb0aa57cc7c2895dad207775e496fbd1/sc2/dicts/unit_abilities.py",
+      "sha256": "3428954ee5b4b2810545bbc5300bb43922454fa19e57a181f6b399f5fccadb34"
+    }
+  }
+}

@@ -1,0 +1,32 @@
+.env
+*.log
+logs
+downloads
+engine
+Replays
+.uv-cache
+.uv-python
+.venv
+.venv311
+pysc2-src/.git
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+bin
+osmesa-lib
+native-runtime
+official-runtime
+session-runtime
+.env.*
+!.env.example
+
+# Private OpenCode runtime, local auth copy, sessions and match logs
+opencode-runtime
+
+# Per-model private validated skills and replay fixtures
+skill-library
+
+# Local match launcher and private model service state
+launcher-runtime
+.vendor-history
