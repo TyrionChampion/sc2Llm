@@ -287,10 +287,38 @@ class MacroRun:
             if r.get('addon'):actors=[u for u in actors if not u.addon_tag]
             if len(actors)<r.get('actor_count',1):hints.append('need idle '+tree.names[producer]);continue
             minerals=entry.get('minerals',r.get('minerals',0));gas=entry.get('gas',r.get('gas',0));supply=r.get('supply',0)
-            if bank<minerals or q.gas_bank<gas or q.supply_bank<supply:
+            if bank<minerals or q.gas_bank<gas or (supply>0 and q.supply_bank<supply):
                 hints.append('need %d minerals/%d gas/%.1f free supply'%(minerals,gas,supply));continue
             available=q.backend.available_abilities(q.index,[u.tag for u in actors])
             legal=[u for u in actors if tree.ability_available(r['ability'],available.get(u.tag,set()))]
+            if kind=='production' and not entry.get('structure') and not r.get('requires_techlab'):
+                # Assign interchangeable production away from a ready specialist slot.
+                # Only already-requested, currently feasible products reserve that slot.
+                held={}
+                for actor in legal:
+                    addon=w.by_tag(actor.addon_tag) if actor.addon_tag else None
+                    for other in q.tasks:
+                        program=other.program
+                        if other is t or not other.active or not isinstance(program,MacroRun):continue
+                        spec=program.spec;special=spec.get('entry',{})
+                        if spec.get('kind')!='production' or program.issued>=other.count:continue
+                        for recipe in special.get('recipes',[]):
+                            if recipe['producer']!=producer:continue
+                            needs_lab=(recipe.get('requires_techlab') and addon and addon.type_id in (37,39,41))
+                            needs_addon=(special.get('structure') and recipe.get('addon') and not actor.addon_tag)
+                            if not (needs_lab or needs_addon):continue
+                            need_m=special.get('minerals',recipe.get('minerals',0))
+                            need_g=special.get('gas',recipe.get('gas',0));need_s=recipe.get('supply',0)
+                            if (bank>=minerals+need_m and q.gas_bank>=gas+need_g
+                                    and q.supply_bank>=supply+need_s
+                                    and tree.ability_available(recipe['ability'],available.get(actor.tag,set()))):
+                                held[actor.tag]=special['name']
+                legal=[actor for actor in legal if actor.tag not in held]
+                legal.sort(key=lambda actor:bool(actor.addon_tag and w.by_tag(actor.addon_tag)
+                    and w.by_tag(actor.addon_tag).type_id in (37,39,41)))
+                if held and len(legal)<r.get('actor_count',1):
+                    hints.append('producer capacity reserved for existing '+', '.join(sorted(set(held.values())))+' request')
+                    continue
             if product==141 and r.get('actor_count')==2:
                 # Real native discriminator: per-unit queries omit the multi-selection merge,
                 # while a single raw order with both templars successfully creates an Archon.
@@ -343,7 +371,7 @@ class MacroRun:
                 ability_id=r['ability'],target_pos=pos,target_tag=target,minerals=minerals,gas=gas,supply=supply,quantity=amount,
                 execution='issued; completion awaits observation')
             addon=w.by_tag(actor.addon_tag) if actor.addon_tag else None
-            if kind=='production' and not entry.get('structure') and addon and addon.type_id in (38,40,42) and self.issued<t.count and bank>=minerals and q.gas_bank>=gas and q.supply_bank>=supply:
+            if kind=='production' and not entry.get('structure') and addon and addon.type_id in (38,40,42) and self.issued<t.count and bank>=minerals and q.gas_bank>=gas and (supply<=0 or q.supply_bank>=supply):
                 q.issue(t,command(r['ability'],tags,queued=True),out)
                 self.issued+=amount;bank-=minerals;q.gas_bank-=gas;q.supply_bank-=supply
                 self.pending.append(dict(tags=tags,ability=r['ability'],sent=w.seconds,seen=False,consumes_actor=False,scv_build=False))

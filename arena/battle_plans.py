@@ -257,7 +257,7 @@ def output_schema(payload):
         variants.extend(task_schemas(payload))
     if payload.get('control_policy',{}).get('defense_orders_available'):
         from arena.defense_orders import task_schemas as defense_schemas
-        variants.extend(defense_schemas())
+        variants.extend(defense_schemas(payload))
     scalar={'type':['number','boolean','string','null']}
     for entry in payload.get('python_skill_library',[]):
         params=obj({k:{**scalar,'description':v} for k,v in entry['parameters'].items()})

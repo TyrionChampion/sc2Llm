@@ -247,6 +247,7 @@ class SpatialMission:
         self.stop_tags=set();self.stance_pending={}
         self.contacts=[];self.contact_omitted=0;self.allocated_count=0
         self.requested_route=None
+        self.engaged_target_health={}
 
     def close(self): self.stop_tags=set(self.tags); self.tags.clear()
     def summary(self):
@@ -275,8 +276,16 @@ class SpatialMission:
         try: self.advance(w, q, t, used, out)
         except Exception as error:
             import traceback
+            squad=[u for u in w.my_units if u.tag in self.tags]
+            engaged={u.engaged_target for u in squad if u.engaged_target}
             q.event('spatial_mission_error',task_id=t.id,skill=self.skill,
-                error=type(error).__name__+': '+str(error),traceback=traceback.format_exc())
+                error=type(error).__name__+': '+str(error),traceback=traceback.format_exc(),
+                observed_squad=[dict(tag=u.tag,pos=list(u.pos),health=u.health,
+                    engaged_target=u.engaged_target,orders=list(u.orders),radius=u.radius,
+                    attack_range=u.attack_range) for u in squad],
+                visible_engaged_targets=[dict(tag=u.tag,unit=NAMES.get(u.type_id,str(u.type_id)),
+                    pos=list(u.pos),health=u.health,radius=u.radius) for u in w.enemy_units if u.tag in engaged],
+                observation_scope='Current own raw snapshot; engaged target is not proof of damage or killer attribution')
             self.finish(w, q, t, out, 'failed', type(error).__name__+': '+str(error), stop=True)
         return bank
 
@@ -284,6 +293,12 @@ class SpatialMission:
         if w.seconds-t.created > self.args['timeout_s']:
             self.finish(w, q, t, out, 'failed', 'mission game-time deadline; fresh model decision required', stop=True); return
         if self.route is None:
+            from arena.python_skills import KINDS
+            if self.skill=='order_units' and self.args['count']=='all' and any(
+                    u.tag in getattr(q,'reserved_for_cancel',set()) and not u.is_building
+                    and u.done and u.type_id in KINDS[self.args['unit']] for u in w.my_units):
+                q.update(t,'waiting','awaiting explicit defense release stop before binding all free units')
+                return
             targets = self.args.get('targets', [self.args.get('target')])
             if targets == 'expansion_sites':
                 from arena.tech_tree import TOWNHALLS
@@ -293,7 +308,6 @@ class SpatialMission:
                 if len(self.route)>64:raise ValueError('more than 64 sites; model must supply a bounded explicit route')
             else:
                 self.route = [resolve_target(v, w, q) for v in targets]
-            from arena.python_skills import KINDS
             candidates = [u for u in w.my_units if not u.is_building and u.type_id in KINDS[self.args['unit']]
                           and u.done and u.tag not in used and u.tag not in q.protected()]
             candidates.sort(key=lambda u: (u.distance(self.route[0]), u.tag))
@@ -312,8 +326,14 @@ class SpatialMission:
             self.started = w.seconds
             self.requested_route=list(self.route)
             q.event('spatial_mission_started', task_id=t.id, skill=self.skill, report=self.summary())
+        # A confirmed loss releases only that member. The surviving allocated units
+        # keep the explicit mission and their existing engine orders; absence from
+        # the observation alone is still handled by the waiting path below.
+        self.tags.difference_update(w.dead_units)
         units = [u for u in w.my_units if u.tag in self.tags]
-        if any(tag in w.dead_units for tag in self.tags): raise ValueError('allocated unit death observed; sightings remain in intelligence')
+        if not self.tags:
+            self.finish(w, q, t, out, 'failed', 'all allocated units confirmed dead; no replacement', stop=False)
+            return
         if not units:
             q.update(t, 'waiting', 'allocated units not observed (possibly transported); no replacement'); return
         if len(units)!=len(self.tags):
@@ -341,6 +361,18 @@ class SpatialMission:
             center = tuple(sum(getattr(u,k) for u in units)/len(units) for k in ('x','y'))
             if self.last_pos is None or math.dist(self.last_pos,center) >= 1:
                 self.last_pos = center; self.changed_at = w.seconds
+            visible = {e.tag: e for e in w.enemy_units}
+            current_health = {}
+            for u in units:
+                target = visible.get(u.engaged_target)
+                if (target is None or not u.can_attack(target) or
+                    u.distance(target) > u.attack_range + u.radius + target.radius + .1):
+                    continue
+                current_health[target.tag] = target.health
+            if any(tag in self.engaged_target_health and health < self.engaged_target_health[tag]
+                   for tag, health in current_health.items()):
+                self.changed_at = w.seconds
+            self.engaged_target_health = current_health
             if self.changed_at is not None and w.seconds-self.changed_at > 20:
                 raise ValueError('no observed movement progress for 20 game seconds; combat/obstruction cause unknown')
             return
@@ -371,4 +403,8 @@ class SpatialMission:
             raise ValueError('requested movement ability unavailable for allocated squad')
         if q.issue(t,command(ability,sorted(self.tags),pos=point),out):
             self.issued = True; self.sent = w.seconds; self.last_pos = None; self.changed_at = w.seconds
+            self.engaged_target_health = {e.tag: e.health for e in w.enemy_units
+                if any(u.engaged_target == e.tag and u.can_attack(e) and
+                       u.distance(e) <= u.attack_range + u.radius + e.radius + .1
+                       for u in units)}
             q.update(t,'running','movement dispatched; waiting for actual arrival/contact')

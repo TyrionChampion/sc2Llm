@@ -6,6 +6,7 @@ there is no fallback to screen actions or non-realtime simulation.
 from dataclasses import dataclass, field, replace
 import math
 import time
+from pathlib import Path
 from collections import Counter
 from pysc2.env import sc2_env
 from pysc2.lib import features
@@ -199,6 +200,10 @@ class RawArena:
             self.configure_start_locations(infos)
             self.clock = GameClock(self.initial[0].game_loop)
             self.action_errors = 0
+            self._pending_surrender = None
+            self._terminal_result = None
+            self._surrender_replay = None
+            self.surrender_report = None
         except BaseException:
             self.env.close()
             raise
@@ -261,6 +266,8 @@ class RawArena:
     def step(self,batches):
         if self.ended: raise RuntimeError('cannot step a finished match; implicit reset prohibited')
         if len(batches)!=len(self.last): raise ValueError('action batch/player count mismatch')
+        if self.match_control_pending:
+            return self._finish_surrender()
         before=self.snapshots(); sent_at=[time.time()]*len(batches)
         self.last=self.env.step([list(b) or [pb.Action()] for b in batches])
         worlds=self.snapshots(); self.clock.update(worlds[0].game_loop)
@@ -271,10 +278,62 @@ class RawArena:
                       (i+1,tag,ability,error_pb2.ActionResult.Name(code)),flush=True)
         return self.attach_action_feedback(before,worlds,batches,sent_at=sent_at)
     @property
-    def ended(self): return any(t.last() for t in self.last)
+    def ended(self): return getattr(self,'_terminal_result',None) is not None or any(t.last() for t in self.last)
     def result(self):
+        if getattr(self,'_terminal_result',None) is not None:
+            return self._terminal_result.copy()
         results=list(self.proto(0).player_result)
         return {r.player_id:pb.Result.Name(r.result) for r in results}
+    @property
+    def match_control_pending(self):
+        return getattr(self,'_pending_surrender',None) is not None
+
+    def request_surrender(self,index,reason,request_id=None):
+        if type(index) is not int or not 0<=index<len(self.controllers):
+            raise ValueError('invalid surrender player')
+        if not isinstance(reason,str) or not reason.strip() or len(reason)>500:
+            raise ValueError('surrender needs a reason of 1..500 characters')
+        if self.ended or self.match_control_pending:
+            raise ValueError('match ended or another surrender is pending')
+        self._pending_surrender=dict(player=index+1,reason=reason.strip(),request_id=request_id,
+            requested_game_loop=self.proto(index).observation.game_loop,state='requested')
+
+    def _finish_surrender(self):
+        entry=self._pending_surrender.copy();index=entry['player']-1
+        worlds=self.snapshots();self.surrender_report=entry;self._action_bindings={}
+        try:
+            replay=self.controllers[index].save_replay()
+            if not replay:raise RuntimeError('empty pre-surrender replay')
+        except Exception as error:
+            self._pending_surrender=None
+            entry.update(state='failed',stage='save_before_leave',error=str(error),leave_sent=False)
+            return [replace(w,feedback=(dict(kind='surrender_failed',**entry),)) for w in worlds]
+        self._surrender_replay=replay
+        try:
+            response=self.controllers[index].leave()
+            if response is None:raise RuntimeError('leave response missing')
+        except Exception as error:
+            entry.update(state='unknown',stage='leave',error=str(error),leave_sent=True)
+            raise RuntimeError('surrender leave outcome uncertain: '+str(error)) from error
+        expected={index+1:'Defeat',2 if index==0 else 1:'Victory'}
+        observed={}
+        for other,controller in enumerate(self.controllers):
+            if other==index:continue
+            response=controller.observe()
+            observed={r.player_id:pb.Result.Name(r.result) for r in response.player_result}
+            if observed and observed!=expected:
+                entry.update(state='result_mismatch',engine_results=observed)
+                raise RuntimeError('engine result contradicts concession: '+str(observed))
+        self._terminal_result=observed or expected;self._pending_surrender=None
+        entry.update(state='completed',leave_acknowledged=True,replay_scope='before_leave',
+            result_source='engine_player_result' if observed else 'acknowledged_concession_rule',
+            engine_results=observed or None,results=self._terminal_result,replay_bytes=len(replay))
+        return [replace(w,feedback=(dict(kind='surrender_completed',**entry),)) for w in worlds]
+
+    def save_replay(self,path):
+        replay=self._surrender_replay or self.controllers[0].save_replay()
+        if not replay:raise RuntimeError('empty replay')
+        Path(path).write_bytes(replay)
     def rgb(self):
         rgb=self.last[0].observation.get('rgb_screen')
         if rgb is None: raise RuntimeError('P1 RGB missing; cannot display match')

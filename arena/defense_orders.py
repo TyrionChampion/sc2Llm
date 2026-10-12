@@ -207,6 +207,8 @@ class DefendBase:
         self._release(q, w)
         if tags:
             out.append(command(4, tags))
+            q.action_contexts.append(dict(source='defense_release',task_id=t.id,
+                                          skill=t.skill,request_id=t.request_id))
 
     def summary(self):
         return dict(kind='defend_base', base=self.base_label or self.base_selector, base_tag=self.base_tag,
@@ -372,5 +374,7 @@ class DefendBase:
                 continue
             self.last_orders[u.tag] = key
             out.append(command(ability, [u.tag], pos=target.pos))
+            q.action_contexts.append(dict(source='defense_guard',task_id=t.id,
+                                          skill=t.skill,request_id=t.request_id))
             self.issued += 1
         return bank

@@ -9,18 +9,23 @@
 3. defense_report 必须分别统计到两处受袭,且两处附近都没有己方部队(部队确实在远处)。
 
 机械层(下令→分兵执行)由 test_two_front_defense.py 覆盖;本脚本只观察模型的选择。
+默认通过官方 Codex 的 ChatGPT 订阅请求 gpt-6-luna,不使用 OpenCode,不自动替换。
+使用 --llm_model 指定完整模型标识。
+--scenario_engine linux 可显式使用真实 Linux 引擎,无需原生玩家窗口。
 """
 import json
 import time
-from pathlib import Path
+from contextlib import ExitStack
 
-from absl import app
+from absl import app, flags
 from s2clientprotocol import debug_pb2 as debug
 
 from arena.commander import Commander
 from arena.defense_orders import base_threats
-from arena.deepseek_planner import DeepSeekFlashPlanner
-from arena.native_engine import NativeArena
+from arena.scenario_runtime import (acceptance, read_exchanges, report_exit_code,
+                                    run_directory, scenario_arena, scenario_planner)
+
+FLAGS = flags.FLAGS
 
 MARINE, ENEMY = 48, 4
 HOME_ATTACKERS, SECOND_ATTACKERS = 3, 1
@@ -38,17 +43,21 @@ def spawn(arena, kind, owner, pos, count=1):
 
 
 def main(argv):
-    report = dict(fixture=True, model='deepseek-flash', scenario='two_front_defense',
+    directory = run_directory('two_front_defense', FLAGS.llm_model)
+    report = dict(fixture=True, model=FLAGS.llm_model, scenario='two_front_defense',
+                  engine=FLAGS.scenario_engine, game_started=False, model_calls=0,
                   attackers=dict(home=HOME_ATTACKERS, second=SECOND_ATTACKERS),
                   detached_marines=DETACHED_MARINES,
                   policy='no automatic defence; only the model may order defend_base')
-    destination = Path('logs/two_front_defense_native.json')
+    destination = directory / 'result.json'
+    planner_stack = ExitStack()
+    client = None
     commander, arena = None, None
     try:
-        with NativeArena(names=('TwoFront',), races=['terran'], render=False,
-                         difficulty='easy', game_speed='faster') as arena:
+        with scenario_arena(FLAGS.scenario_engine, 'TwoFront') as arena:
+            report['game_started'] = True
             report['version'] = arena.version
-            report['native_directory'] = str(arena.directory)
+            report['native_directory'] = str(getattr(arena, 'directory', 'Linux SC2Env'))
             worlds = arena.step([[]])
             home = tuple(arena.homes[0])
             enemy_start = tuple(arena.enemy_start(0))
@@ -159,9 +168,10 @@ def main(argv):
                 report['inconclusive'] = 'troops are not detached from the bases: %s' % report['preconditions']
                 raise SystemExit(0)
 
-            commander = Commander(arena, 0, DeepSeekFlashPlanner(reasoning_effort='low'),
+            client = planner_stack.enter_context(scenario_planner(FLAGS.llm_model, directory))
+            commander = Commander(arena, 0, client,
                                   opening=False, tactics_enabled=False,
-                                  feedback_dir='logs/two-front-native-feedback')
+                                  feedback_dir=directory / 'feedback')
             decisions, plans = [], []
             deadline = time.monotonic() + 360
             last_loop = -1
@@ -194,32 +204,9 @@ def main(argv):
                     break
 
             # 权威记录来自反馈审计:任务表会丢历史,commander 也没有 last_plan
-            import glob
-            import os as _os
-            import re
-            audit = sorted(glob.glob('logs/two-front-native-feedback/*.jsonl'),
-                           key=_os.path.getmtime)[-1] if glob.glob('logs/two-front-native-feedback/*.jsonl') else None
-            exchange, order_count = [], 0
-            if audit:
-                pending = None
-                for line in open(audit, encoding='utf-8', errors='replace'):
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        continue
-                    if entry.get('record') == 'request_queued' and isinstance(entry.get('prompt'), dict):
-                        pending = entry['prompt']
-                    elif entry.get('record') == 'request_finished' and entry.get('response') and pending is not None:
-                        response = entry['response']
-                        orders = re.findall(r'\{\s*"skill"\s*:\s*"defend_base".*?\}\s*\}', response)
-                        exchange.append(dict(
-                            attacked=[(r['label'], r['visible_attackers'], r['own_nearby_total'])
-                                      for r in pending.get('defense_report', []) if r['visible_attackers'] > 0],
-                            own=(pending.get('world') or {}).get('own'),
-                            skills=sorted(set(re.findall(r'"skill":"([a-z_]+)"', response))),
-                            defend_orders=[json.loads(o) for o in orders] if orders else []))
-                        order_count += len(orders)
-                        pending = None
+            audit = str(commander.feedback.path)
+            exchange = read_exchanges(audit)
+            order_count = sum(len(entry['defend_orders']) for entry in exchange)
             report['audit'] = audit
             report['exchange'] = exchange
             report['model_defend_order_count'] = order_count
@@ -233,6 +220,7 @@ def main(argv):
             report['usage'] = getattr(commander.client, 'usage', None)
             report['action_errors'] = arena.action_errors
             report['final_world'] = worlds[0].summary()
+            report['acceptance'] = acceptance(exchange, '3轮内防守或明确说明放弃')
     except SystemExit:
         pass
     except BaseException as error:
@@ -242,11 +230,20 @@ def main(argv):
     finally:
         if commander:
             commander.stop()
+        try:
+            planner_stack.close()
+        except Exception as error:
+            report['error'] = 'Planner cleanup failed: ' + str(error)
+        report['model_calls'] = getattr(client, 'calls', 0)
+        report['model_attempts'] = getattr(client, 'attempts', report['model_calls'])
+        report['model_metadata'] = getattr(client, 'last_metadata', None)
         report['cleanup_complete'] = arena is not None and arena.closed
         destination.write_text(json.dumps(report, ensure_ascii=False, indent=2))
         print('TWO_FRONT_NATIVE', json.dumps(
             {k: v for k, v in report.items() if k not in ('traceback', 'final_world', 'exchange')},
             ensure_ascii=False)[:2000], flush=True)
+        print('REPORT', destination, flush=True)
+    return report_exit_code(report)
 
 
 if __name__ == '__main__':

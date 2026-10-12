@@ -1,8 +1,12 @@
 """原生场景运行器:在同一批战场场景里跑真模型,并按 SCENARIOS.md 的口径自动验收。
 
 用法:
-  python verify_scenarios_live.py --scenario single_base_under_attack
-  python verify_scenarios_live.py --scenario two_front_under_attack
+  ./run_sc2.sh .venv311/bin/python verify_scenarios_live.py --scenario single_base_under_attack
+  ./run_sc2.sh .venv311/bin/python verify_scenarios_live.py --scenario two_front_under_attack --llm_model chatgpt/gpt-6-luna
+
+默认通过官方 Codex 的 ChatGPT 订阅登录请求 gpt-6-luna,不使用 OpenCode。
+订阅必须实际支持该模型。Linux SC2 可显式选择
+--scenario_engine linux;不自动替换引擎或模型。每次报告保存在独立 logs/scenario-runs 目录。
 
 每个场景先做**前提校验**(不成立即判无效、不产生结论),然后让真模型决策若干轮,
 再把"模型是否做出合理反应"按可判定的口径给出结论。判定口径只问因果链是否完整,
@@ -10,15 +14,15 @@
 """
 import json
 import time
-from pathlib import Path
+from contextlib import ExitStack
 
 from absl import app, flags
 from s2clientprotocol import debug_pb2 as debug
 
 from arena.commander import Commander
 from arena.defense_orders import base_threats
-from arena.deepseek_planner import DeepSeekFlashPlanner
-from arena.native_engine import NativeArena
+from arena.scenario_runtime import (acceptance, read_exchanges, report_exit_code,
+                                    run_directory, scenario_arena, scenario_planner)
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('scenario', 'single_base_under_attack', '场景名')
@@ -57,12 +61,16 @@ def spawn(arena, kind, owner, pos, count=1):
 
 def main(argv):
     spec = SCENARIOS[FLAGS.scenario]
-    report = dict(fixture=True, scenario=FLAGS.scenario, spec=spec, model='deepseek-flash')
-    destination = Path('logs/scenario_%s.json' % FLAGS.scenario)
+    directory = run_directory(FLAGS.scenario, FLAGS.llm_model)
+    report = dict(fixture=True, scenario=FLAGS.scenario, spec=spec, model=FLAGS.llm_model,
+                  engine=FLAGS.scenario_engine, game_started=False, model_calls=0)
+    destination = directory / 'result.json'
+    planner_stack = ExitStack()
+    client = None
     arena = commander = None
     try:
-        with NativeArena(names=('Scenario',), races=['terran'], render=False,
-                         difficulty='easy', game_speed='faster') as arena:
+        with scenario_arena(FLAGS.scenario_engine, 'Scenario') as arena:
+            report['game_started'] = True
             report['version'] = arena.version
             worlds = arena.step([[]])
             home = tuple(arena.homes[0])
@@ -180,9 +188,10 @@ def main(argv):
                 report['inconclusive'] = 'troops are not detached: %s' % report['preconditions']
                 raise SystemExit(0)
 
-            commander = Commander(arena, 0, DeepSeekFlashPlanner(reasoning_effort='low'),
+            client = planner_stack.enter_context(scenario_planner(FLAGS.llm_model, directory))
+            commander = Commander(arena, 0, client,
                                   opening=False, tactics_enabled=False,
-                                  feedback_dir='logs/scenario-%s-feedback' % FLAGS.scenario)
+                                  feedback_dir=directory / 'feedback')
             deadline = time.monotonic() + 300
             last_loop = -1
             while time.monotonic() < deadline:
@@ -206,28 +215,8 @@ def main(argv):
                     break
 
             # 权威记录来自反馈审计:每轮受袭情况 + 模型回复
-            import glob
-            import os as _os
-            import re
-            pattern = 'logs/scenario-%s-feedback/*.jsonl' % FLAGS.scenario
-            audit = sorted(glob.glob(pattern), key=_os.path.getmtime)[-1] if glob.glob(pattern) else None
-            exchange, pending = [], None
-            for line in (open(audit, encoding='utf-8', errors='replace') if audit else []):
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if entry.get('record') == 'request_queued' and isinstance(entry.get('prompt'), dict):
-                    pending = entry['prompt']
-                elif entry.get('record') == 'request_finished' and entry.get('response') and pending is not None:
-                    response = entry['response']
-                    exchange.append(dict(
-                        attacked=[(r['label'], r['visible_attackers'], r['urgency'])
-                                  for r in pending.get('defense_report', []) if r['visible_attackers'] > 0],
-                        own=(pending.get('world') or {}).get('own'),
-                        skills=sorted(set(re.findall(r'"skill":"([a-z_]+)"', response))),
-                        reason=(re.search(r'"reason"\s*:\s*"([^"]{0,200})"', response) or [None, ''])[1]))
-                    pending = None
+            audit = str(commander.feedback.path)
+            exchange = read_exchanges(audit)
             # 权威记录来自反馈审计:每轮受袭情况 + 模型回复
             report['audit'] = audit
             report['exchange'] = exchange
@@ -238,25 +227,7 @@ def main(argv):
             report['action_errors'] = arena.action_errors
 
             # ---- 验收:只问因果链是否完整 ----
-            economy_only = {'train_worker', 'build_supply', 'build_structure', 'gather_gas',
-                            'research', 'expand', 'gather', 'train_unit', 'morph_unit'}
-            first_defence, streak, worst_streak = None, 0, 0
-            for index, entry in enumerate(exchange, 1):
-                if 'defend_base' in entry['skills']:
-                    if first_defence is None:
-                        first_defence = index
-                    streak = 0
-                elif set(entry['skills']) and set(entry['skills']) <= economy_only:
-                    streak += 1
-                    worst_streak = max(worst_streak, streak)
-                else:
-                    streak = 0
-            report['acceptance'] = dict(
-                first_defence_turn=first_defence,
-                worst_economy_only_streak=worst_streak,
-                requested=spec['accept'],
-                verdict=('pass' if (first_defence is not None and first_defence <= 3)
-                         or worst_streak < 3 else 'fail'))
+            report['acceptance'] = acceptance(exchange, spec['accept'])
     except SystemExit:
         pass
     except BaseException as error:
@@ -266,11 +237,20 @@ def main(argv):
     finally:
         if commander:
             commander.stop()
+        try:
+            planner_stack.close()
+        except Exception as error:
+            report['error'] = 'Planner cleanup failed: ' + str(error)
+        report['model_calls'] = getattr(client, 'calls', 0)
+        report['model_attempts'] = getattr(client, 'attempts', report['model_calls'])
+        report['model_metadata'] = getattr(client, 'last_metadata', None)
         report['cleanup_complete'] = arena is not None and arena.closed
         destination.write_text(json.dumps(report, ensure_ascii=False, indent=2))
         print('SCENARIO_RESULT', json.dumps(
             {k: v for k, v in report.items() if k not in ('traceback', 'exchange')},
             ensure_ascii=False)[:1600], flush=True)
+        print('REPORT', destination, flush=True)
+    return report_exit_code(report)
 
 
 if __name__ == '__main__':

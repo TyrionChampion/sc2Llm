@@ -409,7 +409,8 @@ class TaskQueue:
                 for t in self.tasks if t.active]
     def protected(self):
         return {t.worker for t in self.tasks if t.active and t.worker}|{
-            tag for t in self.tasks if t.active and t.program for tag in t.program.tags}|self.gas_worker_tags|set(self.gas_assignments)|self.defense_tags
+            tag for t in self.tasks if t.active and t.program and getattr(t,'skill',None)!='rally_units'
+            for tag in t.program.tags}|self.gas_worker_tags|set(self.gas_assignments)|self.defense_tags
     def take_defense(self,tags,now):
         from arena.python_skills import PythonSkillRun
         self.defense_tags=set(tags)
@@ -467,7 +468,10 @@ class TaskQueue:
         self.defense_tags_snapshot=None   # first defence order this tick fills it in
         self.economy.observe(w)
         self.economy.refresh(w,self.tasks)
-        used.update(tag for t in self.tasks if t.active and t.program for tag in t.program.tags)
+        # Rally owns only the rally setting; it must not reserve the production queue.
+        # rally_owned_tags() separately protects the setting from automatic rallies.
+        used.update(tag for t in self.tasks if t.active and t.program and getattr(t,'skill',None)!='rally_units'
+                    for tag in t.program.tags)
         self.action_contexts=[]
         # A cancelled defence order still holds its defense_tags reservation until stop_orders
         # runs below. Mark only those tags used, so a same-reply follow-up order does not dispatch

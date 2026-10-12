@@ -106,7 +106,8 @@ class Commander:
             self.system+='\nFailed Python skills can be repaired in a background developer session. Read skill_repairs (current, independent of feedback pagination). Repairing/failed skills are blocked. When state=ready, decide whether to redeploy using a NEW task with complete args. Source replacement does not automatically allocate troops or restart a mission.'
         self.system+=(SURRENDER_PROTOCOL if self.surrender_available else '\nSurrender is unavailable on this backend; do not issue it.')
         if self.compact_battle:
-            self.system=battle_plans.SYSTEM
+            self.system=battle_plans.SYSTEM+(SURRENDER_PROTOCOL if self.surrender_available else
+                '\nSurrender is unavailable on this backend; do not issue it.')
             self.record_feedback('battle_request_policy',history='fresh session per decision',
                 feedback='full events, smaller pages; one oldest event then failures; deferred events retained',
                 soft_timeout_s=client.soft_timeout,hard_timeout_s=client.timeout,
@@ -361,7 +362,7 @@ class Commander:
                         plan=dict(plan,tasks=tasks)
                     if reason is not None:
                         if not self.surrender_available:raise ValueError('surrender is not supported by this backend')
-                        blockers=surrender_blockers(w)
+                        blockers=self._surrender_blockers(w)
                         if blockers:raise ValueError('surrender rejected; still in the game: '+'; '.join(blockers))
                         self.backend.request_surrender(self.index,reason,request_id)
                         self.surrender=dict(state='requested',reason=reason,request_id=request_id)
@@ -423,7 +424,7 @@ class Commander:
             # Conceding is allowed only when the observed position has no recovery path: an early
             # surrender with a live army is a misread, not reasonable behaviour. The blockers are
             # handed to the model so it knows what still keeps it in the game.
-            blockers=surrender_blockers(w)
+            blockers=self._surrender_blockers(w)
             self.control_policy['surrender_allowed']=not blockers
             self.control_policy['surrender_blockers']=blockers
         if (self.client_fatal is None and not self.thinking
@@ -434,7 +435,8 @@ class Commander:
             payload={'world':w.summary(),'intelligence':self.intelligence.public(w),'battlefield':self.battlefield.public(w),'defensive_rally':self.rally.public(),'engagement_log':self.engagements.public(),
                      'strategic_intent':self.strategic_intent,'strategic_intent_policy':self._strategic_intent_status(w),
                      'spatial_reports':[t.program.result(t) for t in self.tasks.tasks if not t.active and t.skill in ('scout','order_units')][-8:],
-                     'defense_orders':[t.program.summary() for t in self.tasks.tasks if t.skill=='defend_base' and t.program][-4:],
+                     'defense_orders':[dict(t.program.summary(),task_id=t.id,task_state=t.status)
+                         for t in self.tasks.tasks if t.skill=='defend_base' and t.active and t.program],
                      'defense_report':base_threats(w,self.backend,self.index,
                          ordered_tags={t.program.base_tag for t in self.tasks.tasks
                                        if t.skill=='defend_base' and t.active and t.program and t.program.base_tag}),
@@ -492,6 +494,9 @@ class Commander:
                 'completed':sum(t.status=='completed' for t in self.tasks.tasks),
                 'failed':sum(t.status=='failed' for t in self.tasks.tasks),
                 'engine_errors':self.engine_errors,'feedback':self.feedback.stats()}
+    def _surrender_blockers(self,w):
+        policy=getattr(self.backend,'surrender_blockers_for',None)
+        return policy(w,self.index) if callable(policy) else surrender_blockers(w)
     def stop(self):
         if self.tactics:self.tactics.close()
         if self.defense:self.defense.close()

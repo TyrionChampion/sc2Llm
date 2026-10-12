@@ -82,6 +82,7 @@ Git 仓库包含代码、技能契约和参考数据；本机游戏及运行工�
 
 ## 进一步阅读
 
+- [CLOUD_HANDOFF.md](CLOUD_HANDOFF.md)：自主困难 bot 对战的最新代码、提示词、复盘和账本续跑说明。
 - [AI_SKILL_MANUAL.md](AI_SKILL_MANUAL.md)：模型技能契约。
 - [SC2_GAME_KNOWLEDGE.md](SC2_GAME_KNOWLEDGE.md)：游戏知识和种族能力。
 - [SCENARIOS.md](SCENARIOS.md)：战场场景覆盖及现有缺口。
