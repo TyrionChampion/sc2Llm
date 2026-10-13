@@ -71,6 +71,59 @@ Git 仓库包含代码、技能契约和参考数据；本机游戏及运行工�
 
 ## 验证
 
+### OpenCode Go DeepSeek 对战困难 bot（Linux 无窗口）
+
+2026-10-13 已完成新的困难 Terran 引擎胜利：原账本第37局使用 Go DeepSeek V4.1 Flash、
+双方 Slower、realtime，531.6游戏秒结束，20次战斗请求，引擎动作错误0。
+[比赛报告](logs/autonomous-bot/20261012-093031-xhnbux9u/match-37-hard/match.json)、
+[回放](logs/autonomous-bot/20261012-093031-xhnbux9u/match-37-hard/match.SC2Replay)及
+[核验记录](logs/autonomous-bot/20261012-093031-xhnbux9u/match-37-hard/victory-validation.json)
+均已保留。战役已自动停止；累计840次，前一轮278次计数保持。
+完整续跑结果见 [CLOUD_PROGRESS.md](CLOUD_PROGRESS.md)。这是一次已核验胜利，尚未评估稳定胜率。
+
+已有交接账本的自主续跑以 [CLOUD_HANDOFF.md](CLOUD_HANDOFF.md) 为准：
+
+```bash
+./run_sc2.sh .venv/bin/python autonomous_bot.py \
+  --resume logs/autonomous-bot/20261012-093031-xhnbux9u \
+  --until-hard-win --game-speed slower
+```
+
+继续原有比赛编号和计数，每局最多24次战斗请求、1800游戏秒、1860墙钟秒。
+模型与复盘均使用 Go，推理强度 low。`--switch-model` 只在首次切换时需要；
+后续续跑沿用账本模型。子进程使用当前 Python 解释器；无需固定 `.venv311`。
+当前账本已切换为 Go。首次切换其他旧账本时加 `--switch-model opencode-go/deepseek-v4.1-flash`。
+Slower 使用已校验的真实引擎速度地图，双方始终同速、保持 realtime；不会通过降低
+观测频率模拟慢速。墙钟上限不变，Slower 下约覆盖 780 游戏秒，模型收到剩余墙钟时间
+及预计游戏截止时间。省略 `--game-speed` 会保留账本已有速度。
+Go 保持已验证的 `json_object` 格式；原生 `json_schema` 在实战被服务端拒绝，默认关闭。
+执行前仅转译模型已明确给出的空间任务人数层级、已观测单位名拼写及空字段；原始响应和
+转译记录分别保存在每次请求目录，数量、单位种类、目的地和攻守意图由模型决定。
+回归测试额外依赖见 `requirements-dev.txt`；运行 Go 不需安装 JSON Schema 验证库。
+
+使用 Go 套餐密钥环境变量 `open_api_key`。主指挥和独立战斗模型均请求
+`https://opencode.ai/zen/go/v1/chat/completions`，默认 `deepseek-v4.1-flash`，
+独立评估入口关闭思考以降低实时延迟；自主续跑入口沿用 low 思考。
+不会自动改用官方 API、Zen 或 mock。自主续跑由同一 DeepSeek 指挥生产、科技、
+侦察、防守和进攻；独立评估入口另有模型小队战术。
+真实模型模式从开局开始由模型下令，不注入脚本开局。
+
+```bash
+./run_sc2.sh .venv/bin/python evaluate_realtime.py \
+  --provider opencode_go --model deepseek-v4.1-flash \
+  --difficulty hard --games 1 --seconds 1800 \
+  --tactics --combat-micro --output logs/go_hard.json
+```
+
+需要 Linux SC2 引擎及 Acropolis 地图，不需要 GPU、Proton 或 OpenCode CLI。
+结果 JSON 每 15 秒保存进度，记录种族、难度、种子、模型、用量和终局；
+同目录 `*_feedback/seed_N/` 保存真实请求、公开回复和执行反馈，录像在
+游戏的 `Replays/`。只有引擎返回 `Victory` 才计为胜利，超时和错误单独记录。
+单局胜利不能代表稳定胜率，可用 `--games 3 --seed 7` 验证不同种子。
+
+云端可用 Python 3.12 创建 `.venv`，安装随仓库的 PySC2 及依赖。
+原生窗口模式仍按上文使用原机器的 Python 3.11 环境。
+
 ```bash
 .venv311/bin/python run_unit_tests.py
 ```

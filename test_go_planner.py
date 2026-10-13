@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import sys
 import unittest
 from unittest.mock import Mock, patch
 
@@ -13,6 +14,18 @@ from arena.autonomous_bot import RequestBudget
 
 
 class GoTests(unittest.TestCase):
+    def test_explicit_pro_uses_same_go_endpoint_and_exact_requested_identity(self):
+        request=self.request();request['requested_model']='opencode-go/deepseek-v4-pro'
+        post=Mock(return_value=self.response(model='deepseek-v4-pro'))
+        with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            result=perform_request(request,post)
+        self.assertEqual(post.call_args.args[0],GO_ENDPOINT+'/chat/completions')
+        self.assertEqual(post.call_args.kwargs['json']['model'],'deepseek-v4-pro')
+        self.assertEqual(result['metadata']['requested_model'],request['requested_model'])
+        with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            mismatch=perform_request(request,Mock(return_value=self.response()))
+        self.assertIn('identity mismatch',mismatch['error'])
+
     def test_readiness_works_in_fresh_checkout_without_log_directory(self):
         import importlib.util
         spec=importlib.util.spec_from_file_location('cloud_go_status',
@@ -48,6 +61,32 @@ class GoTests(unittest.TestCase):
         self.assertNotIn('test-secret',json.dumps(result))
         self.assertNotIn('hidden reasoning',json.dumps(result))
         self.assertEqual(json.loads(result['answer'])['tasks'],[])
+        self.assertEqual(result['metadata']['usage']['input_tokens'],10)
+
+    def test_go_routing_requires_and_preserves_match_session(self):
+        # Actual Go gateway rejected the imported client with HTTP 400 MissingSessionID.
+        sessions=[]
+        def route(url, **kwargs):
+            session=kwargs['headers'].get('x-opencode-session')
+            if not session:
+                return SimpleNamespace(status_code=400)
+            sessions.append(session)
+            return self.response()
+        request=self.request();request['session_id']='sc2-persistent-match'
+        with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            for _ in range(2):
+                result=perform_request(request,route)
+                self.assertIn('answer',result)
+        self.assertEqual(sessions,['sc2-persistent-match']*2)
+
+    def test_review_output_budget_does_not_change_default_battle_budget(self):
+        post=Mock(return_value=self.response())
+        with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            perform_request(self.request(),post)
+            self.assertEqual(post.call_args.kwargs['json']['max_tokens'],8000)
+            request=self.request();request['max_tokens']=12000
+            perform_request(request,post)
+            self.assertEqual(post.call_args.kwargs['json']['max_tokens'],12000)
 
     def test_absent_binding_cannot_use_other_provider_key(self):
         post=Mock()
@@ -97,8 +136,9 @@ class GoTests(unittest.TestCase):
             (folder/'campaign.json').write_text(json.dumps(old))
             worker=SimpleNamespace(returncode=1,wait=lambda **kwargs:None)
             with patch('sys.argv',['autonomous_bot.py','--resume',str(folder),'--until-hard-win',
-                                   '--switch-model',GO_MODEL]),patch.object(runner.subprocess,'Popen',return_value=worker):
+                                   '--switch-model',GO_MODEL]),patch.object(runner.subprocess,'Popen',return_value=worker) as spawn:
                 self.assertEqual(runner.main(),2)
+                self.assertEqual(spawn.call_args.args[0][0],sys.executable)
             state=json.loads((folder/'campaign.json').read_text())
             config=json.loads((folder/'worker-02.json').read_text())
             self.assertEqual(state['matches'],old['matches'])

@@ -8,13 +8,15 @@ import shutil
 import subprocess
 
 from arena.chatgpt_planner import ChatGPTSubscriptionPlanner
-from arena.go_planner import GoPlanner, GO_MODEL
+from arena.go_planner import GoPlanner, GO_MODEL, GO_MODELS
 
 
 REVIEW_RULES = '''你是战后复盘员。用户要求自主迭代至击败easy然后hard bot。
 必须检查真实时间线、完整错误事件、生产确认、损失、进攻与投降情况，而非只看输赢。
 combat_summary中的our_deaths_observed和enemy_deaths_observed是实际阵亡记录；
 enemy_left_vision只是离开视野，不是阵亡。不得忽略这些统计而声称没有损失。
+科技实验室研究与母建筑训练可并行；研究不是停产理由。维京/医疗艇无需科技实验室。
+女妖/幽灵隐身需要探测；维京是对空火力而非探测器，轨道扫描或渡鸦可提供探测。
 只依据本局证据。敌军总兵力未知；引擎只给错误码时不要编造根因。
 campaign_history可用于识别重复失败；历史胜局只作参考，其地图、种子、限时和接口可能不同。
 若同一路线连续失败，重新比较至少两种可执行方案，评估扩张时机、产能与克制阵容，允许
@@ -23,13 +25,15 @@ campaign_history可用于识别重复失败；历史胜局只作参考，其地�
 具体可执行路线的关键兵种、前置、生产吞吐及经济风险后再选择。若仍选失败过的路线，
 说明这次可从观测核验的实质变化，不能仅把原军力目标增大或重述原提示词。
 返回JSON，包含tasks:[]、reason:中文简述、category:"strategy|feature_gap|environment|win"、
-strategy:1800字以内完整的新战术（下一局独立上下文，不是对旧战术的增量）、
+strategy:目标1400字符以内完整新战术（含英文/空格/标点，校验上限1800字符；下一局独立上下文，非旧战术增量）、
 findings:[{evidence_ids:[真实错误事件id],detail:"具体诊断"}]、
 gap:null或{evidence_ids:[真实错误事件id],description:"需要补的能力",reproduction:"可执行的回归场景"}。
 只提出有明确执行器错误证据和可复现失败的功能缺口。缺参数、重复活动命令、取消历史ID、
 没有下达现有接口能执行的命令、造兵时未造前置、贪经济、过晚进攻、忘记撤防，属于计划/提示词问题。
 unknown skill不自动等于缺功能：先检查现有能力是否已经提供等效操作。
 网络/认证失败和旧版游戏不支持的能力属于environment，不应盲改战术或假造胜负。
+time_budget不是战场败势；检查runtime_timing的墙钟/速度，Slower下1860墙钟秒约798游戏秒，
+运营、侦察和出击须在墙钟允许的实际游戏时间内安排，不能假设总能打满1800游戏秒。
 没有可证实功能缺口时category=strategy，优化开局、持续生产、进攻时机、阵容与止损。
 如果获胜，仍检查浪费和非法计划，保留有效战术而非随意重写。
 对扩张经济战略，必须检查扩张预算之外的钱是否及时转成实际战斗部队：资源持续上涨时，
@@ -45,8 +49,10 @@ unknown skill不自动等于缺功能：先检查现有能力是否已经提供�
 已有order_units支持明确数值count，不足人数时等待，够人数后统一attack_move；可用它实现
 一批部队出发的时机。attack_nearest/move_out不等集结，只把当前自由军队立即发出去，反复
 使用可能把零散新兵送入敌军。评估现有指令时请考虑这些语义，不能误报为缺少集结功能。
-scout接口必须使用args.targets（不是target）：可为named place或[x,y]的列表，
-例如targets:["enemy_start"]；全图矿区搜索使用整个字符串targets:"expansion_sites"，
+scout外层count固定1，人数必须在args.count；args必填unit/count/reason/targets。
+合法示例：{"skill":"scout","count":1,"args":{"unit":"marine","count":1,"reason":"侦察","targets":["enemy_start"]}}。
+unit/count/reason不能省略或搬到任务顶层。targets可为named place或[x,y]的列表；
+全图矿区搜索使用整个字符串targets:"expansion_sites"，
 禁止targets:["expansion_sites"]。order_units才使用单个args.target。
 混编可用order_units args.unit="army"选择战斗单位，整数count表示等待足够的自由战斗单位；
 它不是只选陆战队，也不会自动训练缺少的兵种。不要虚构bio等未提供的选择器。
@@ -182,11 +188,13 @@ def campaign_review_history(directory):
 
 
 def review_game(model, directory, budget, diagnostics, strategy, difficulty):
-    budget.reserve('review')
-    client = (GoPlanner if model == GO_MODEL else ChatGPTSubscriptionPlanner)(model, directory)
+    client = (GoPlanner if model in GO_MODELS else ChatGPTSubscriptionPlanner)(model, directory)
     client.response_kind = 'review'
-    client.timeout = 60
-    client.reasoning_effort = 'low' if model == GO_MODEL else 'medium'
+    # Go prefill + low-effort review can exceed a battle request's latency budget.
+    # Reviews run after engine cleanup; this leaves every match/request ceiling intact.
+    client.timeout = 300 if model in GO_MODELS else 60
+    if model in GO_MODELS:client.max_tokens = 24000
+    client.reasoning_effort = 'low' if model in GO_MODELS else 'medium'
     errors = diagnostics['errors']
     selected = []
     seen = set()
@@ -206,19 +214,45 @@ def review_game(model, directory, budget, diagnostics, strategy, difficulty):
                        'macro_plan','cancel_expansion','morph_unit','rally_units',
                        'scan','call_mule','supply_drop'],
                    constraints=budget.report())
+    context_limit=60000
+    if model in GO_MODELS and getattr(client,'native_schema',False):
+        from arena.chatgpt_planner import review_output_schema
+        from arena.go_schema import response_format
+        schema=review_output_schema();client.response_schema=schema
+        context_limit-=len(json.dumps(response_format(schema),ensure_ascii=False,separators=(',',':')))
     try:
         text = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
-        if len(text)>60000:
+        if len(text)>context_limit:
             from arena.autonomous_bot import nested_contact_tables
             payload=nested_contact_tables(payload)
-            payload['lossless_table_encoding']='columns_rows_common_v1: common + dict(zip(columns,row)); key_groups_v1: decode groups, then select [group,row] in order; applies recursively. No observations removed.'
+            payload['lossless_table_encoding']='Recursive columns_rows_common_v1/key_groups_v1; decoding rules in system prompt; no observations removed.'
             text=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
-        if len(text) > 60000:
+        if len(text) > context_limit:
+            from arena.context_tables import object_pool
+            payload=object_pool(payload)
+            text=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
+        if len(text) > context_limit:
+            from arena.context_tables import key_table
+            payload=key_table(payload)
+            text=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
+        if len(text) > context_limit:
             raise ValueError('Review evidence exceeds context limit; full evidence retained on disk')
-        result = json.loads(client.chat(REVIEW_RULES, text))
+        budget.reserve('review')
+        rules=REVIEW_RULES+'\ncolumns_rows_common_v1每行=common合并dict(zip(columns,row))；key_groups_v1先读groups，再按order的[group,row]取行。\nreview_object_pool_v1是无损共享编码：objects存放字典/数组/字符串，data为原始对象；遇到仅有$review_ref的对象时用objects[该整数]替换并递归还原其子项。所有原始观测、决策、任务变化仍保留，不能把引用理解为遗漏。直接查必要引用即可，无需逐项重写标签、坐标或展开整份JSON；集中检查真实产出、战损、非法计划、侦察与出击。'
+        rules+='\nreview_key_table_v1无损共享字段名：keys为字段名表，data中每个对象的数字字符串键k表示keys[int(k)]；递归还原所有对象键，数组和值不变，再按上述共享对象/表格编码读取。没有删除观测或任务。'
+        result = json.loads(client.chat(rules, text))
         if result.get('category') not in ('strategy','feature_gap','environment','win'):
             raise ValueError('Invalid review category')
         revised = result.get('strategy')
+        if isinstance(revised,str) and len(revised)>1800:
+            from arena.plan_representation import compact_strategy_layout
+            formatted=compact_strategy_layout(revised)
+            if len(formatted)<=1800:
+                folder=Path(directory);folder.mkdir(parents=True,exist_ok=True)
+                (folder/'strategy-layout.json').write_text(json.dumps(dict(original_chars=len(revised),
+                    formatted_chars=len(formatted),all_non_whitespace_characters_preserved=True,
+                    content_removed=False,source='original public Go response'),ensure_ascii=False,indent=2))
+                revised=result['strategy']=formatted
         if not isinstance(revised,str) or not revised.strip() or len(revised)>1800:
             raise ValueError('Review must provide a bounded complete strategy')
         if result['category']=='feature_gap':
@@ -271,7 +305,7 @@ def checked_tests(python, directory, modules, log):
 
 def repair_game(root, model, folder, budget, review):
     """Generate a fix; prove regression fails BEFORE and passes AFTER before applying."""
-    if model == GO_MODEL:
+    if model in GO_MODELS:
         return dict(applied=False,reason='Go review identified a gap; operator must reproduce and verify the repair before continuing. No ChatGPT repair fallback.')
     folder=Path(folder);folder.mkdir()
     baseline=folder/'baseline';candidate=folder/'candidate'

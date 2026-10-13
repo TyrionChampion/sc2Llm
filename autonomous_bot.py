@@ -1,5 +1,6 @@
 """Real ChatGPT-vs-bot matches, bounded reviews, verified repairs and curriculum."""
 import argparse
+import hashlib
 from datetime import datetime
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 import tempfile
 import time
 import subprocess
+import sys
 import traceback
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -14,10 +16,10 @@ from absl import flags
 
 from arena.autonomous_bot import (BotPlanner, BudgetExhausted, Curriculum, DefeatGuard,RequestCapIdleGuard,
                                   INITIAL_STRATEGY, RequestBudget, match_diagnostics,
-                                  production_decision_needed)
+                                  production_decision_needed, match_time_policy)
 from arena.autonomous_review import repair_game, review_game
 from arena.chatgpt_planner import ChatGPTSubscriptionPlanner
-from arena.go_planner import GoPlanner, GO_MODEL
+from arena.go_planner import GoPlanner, GO_MODEL, GO_MODELS
 from arena.commander import Commander
 from arena.match_control import surrender_blockers
 from arena.raw_engine import RawArena
@@ -48,17 +50,23 @@ def run_match(root, folder, model, difficulty, strategy, budget, args, number):
     folder.mkdir()
     report=dict(number=number,difficulty=difficulty,model=model,outcome='Unknown',
                 result_source='unverified',termination=None,timeline=[],game_started=False)
+    report['seed']=args.seed+number-1
+    report['game_speed']=getattr(args,'game_speed','faster')
+    report['time_limits']=dict(game_s=args.max_game_seconds,wall_s=args.max_wall_seconds)
+    source_root=Path(__file__).resolve().parent
+    report['code_sha256']={str(path.relative_to(source_root)):hashlib.sha256(path.read_bytes()).hexdigest()
+                           for path in [source_root/'autonomous_bot.py',*sorted((source_root/'arena').glob('*.py'))]}
     arena=commander=client=None
     guard=DefeatGuard()
     started=time.monotonic();loss_noticed=None;last_sample=-30
     try:
-        base=(GoPlanner if model==GO_MODEL else ChatGPTSubscriptionPlanner)(model,folder/'planner')
+        base=(GoPlanner if model in GO_MODELS else ChatGPTSubscriptionPlanner)(model,folder/'planner')
         base.structured_battle=True
-        base.reasoning_effort='low' if model==GO_MODEL else 'medium'
+        base.reasoning_effort='low' if model in GO_MODELS else 'medium'
         client=BotPlanner(base,budget,strategy,args.max_requests,
                           adaptive_cadence=getattr(args,'decision_cadence','fixed')=='adaptive')
         arena=RawArena(render=False,difficulty=difficulty,races=['terran'],
-                       bot_race='terran',seed=args.seed+number-1)
+                       bot_race='terran',seed=args.seed+number-1,game_speed=report['game_speed'])
         report['game_started']=True
         report['engine_version']=arena.controllers[0].ping().game_version
         arena.surrender_blockers_for=lambda world,index: [] if guard.evidence else surrender_blockers(world)
@@ -69,7 +77,9 @@ def run_match(root, folder, model, difficulty, strategy, budget, args, number):
         idle_guard=RequestCapIdleGuard()
         while not arena.ended:
             evidence=guard.observe(world)
-            client.policy=dict(game_s=world.seconds,max_game_s=args.max_game_seconds,max_wall_s=args.max_wall_seconds,
+            client.policy=dict(**match_time_policy(world.seconds,time.monotonic()-started,
+                               args.max_game_seconds,args.max_wall_seconds,report['game_speed']),
+                               match_number=number,
                                clear_disadvantage=evidence,
                                production_decision_due=production_decision_needed(world),
                                decision_urgent=any(enemy.ground_dps>0 and not enemy.hallucination
@@ -141,6 +151,7 @@ def run_match(root, folder, model, difficulty, strategy, budget, args, number):
         except Exception as error:
             report['replay_error']=str(error)
         report['engine_action_errors']=arena.action_errors
+        if hasattr(arena,'clock'):report['timing']=arena.clock.report()
     except BaseException as error:
         report['error']=type(error).__name__+': '+str(error)
         report['traceback']=traceback.format_exc()
@@ -165,6 +176,7 @@ def run_match(root, folder, model, difficulty, strategy, budget, args, number):
         report['model_attempts']=client.attempts if client else 0
         report['usage']=client.usage if client else {}
         report['input_chars']=client.input_chars if client else 0
+        report['schema_transport_chars']=getattr(client,'schema_transport_chars',0) if client else 0
         report['wall_s']=round(time.monotonic()-started,2)
         report['cleanup_complete']=not cleanup_errors
         if cleanup_errors:report['cleanup_errors']=cleanup_errors
@@ -176,7 +188,7 @@ def run_match(root, folder, model, difficulty, strategy, budget, args, number):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model',default='chatgpt/gpt-6-luna')
-    parser.add_argument('--switch-model',choices=['chatgpt/gpt-6-luna',GO_MODEL],
+    parser.add_argument('--switch-model',choices=['chatgpt/gpt-6-luna',*GO_MODELS],
                         help='Explicitly change the provider on a resumed campaign, keeping its ledger')
     parser.add_argument('--max-matches',type=int,default=8)
     parser.add_argument('--until-hard-win',action='store_true',
@@ -185,6 +197,8 @@ def main():
     parser.add_argument('--max-game-seconds',type=float,default=1800)
     parser.add_argument('--max-wall-seconds',type=float,default=1860)
     parser.add_argument('--decision-cadence',choices=['adaptive','fixed'],default='adaptive')
+    parser.add_argument('--game-speed',choices=['slower','normal','faster'],default=None,
+                        help='real engine speed for both players; resume preserves the saved speed')
     parser.add_argument('--start-difficulty',choices=['easy','hard'],default='easy')
     parser.add_argument('--previous-campaign',help='Reference prior experiment without resetting its ledger')
     parser.add_argument('--seed',type=int,default=7)
@@ -195,7 +209,7 @@ def main():
         parser.error('Hard ceilings: 8 matches and 24 battle requests per match')
     if not 1<=args.max_game_seconds<=1800 or not 1<=args.max_wall_seconds<=1860:
         parser.error('Hard ceilings: 1800 game seconds and 1860 wall seconds per match')
-    if args.model not in ('chatgpt/gpt-6-luna',GO_MODEL):
+    if args.model not in ('chatgpt/gpt-6-luna',*GO_MODELS):
         parser.error('Unsupported explicitly selected campaign model')
     if args.switch_model and not args.resume:
         parser.error('--switch-model requires --resume')
@@ -205,7 +219,7 @@ def main():
     os.environ.setdefault('ARENA_CHATGPT_HOME',str(root/'session-runtime/chatgpt-subscription'))
     if args.worker_config:
         config=json.loads(Path(args.worker_config).read_text())
-        if config['args']['model'] not in ('chatgpt/gpt-6-luna',GO_MODEL):
+        if config['args']['model'] not in ('chatgpt/gpt-6-luna',*GO_MODELS):
             parser.error('Unsupported saved worker model')
         budget=RequestBudget(config['budget']['limit'])
         budget.used=config['budget']['attempted'];budget.by_role=config['budget']['by_role']
@@ -222,7 +236,7 @@ def main():
         if not folder.is_relative_to(output.resolve()):parser.error('Resume must refer to a saved bot campaign')
         status=json.loads((folder/'campaign.json').read_text())
         saved=status['limits']
-        if (status['model'] not in ('chatgpt/gpt-6-luna',GO_MODEL) or not 1<=saved['max_matches']
+        if (status['model'] not in ('chatgpt/gpt-6-luna',*GO_MODELS) or not 1<=saved['max_matches']
                 or (saved['max_matches']>8 and not saved.get('until_hard_win'))
                 or not 1<=saved['max_requests']<=24 or not 1<=saved['max_game_seconds']<=1800
                 or not 1<=saved['max_wall_seconds']<=1860):
@@ -236,6 +250,13 @@ def main():
             parser.error('Invalid saved request budget')
         budget.used=usage['attempted'];budget.by_role=usage['by_role']
         matches=status['matches']
+        previous_speed=saved.get('game_speed','faster')
+        args.game_speed=args.game_speed or previous_speed
+        if args.game_speed!=previous_speed:
+            status.setdefault('game_speed_changes',[]).append(dict(before_match=len(matches)+1,
+                previous=previous_speed,game_speed=args.game_speed,previous_attempted=budget.used,
+                source='explicit --game-speed',limits_unchanged=True))
+        saved['game_speed']=args.game_speed
         if args.switch_model and args.switch_model!=status['model']:
             status.setdefault('model_changes',[]).append(dict(before_match=len(matches)+1,
                 previous_model=status['model'],model=args.switch_model,previous_attempted=budget.used,
@@ -250,6 +271,7 @@ def main():
         if curriculum.reached_goal:
             print('CAMPAIGN_REPORT',folder/'campaign.json',flush=True);return 0
     else:
+        args.game_speed=args.game_speed or 'faster'
         folder=Path(tempfile.mkdtemp(prefix=now().strftime('%Y%m%d-%H%M%S-'),dir=output))
         budget=RequestBudget(args.max_matches*(args.max_requests+2))
         curriculum=Curriculum(args.start_difficulty);strategy=INITIAL_STRATEGY;matches=[]
@@ -285,7 +307,7 @@ def main():
         write_json(config,dict(folder=str(match_folder),difficulty=curriculum.difficulty,
                    strategy=strategy,budget=budget.report(),args={k:v for k,v in vars(args).items()
                        if k!='resume'},number=number))
-        process=subprocess.Popen([str(root/'.venv311/bin/python'),str(root/'autonomous_bot.py'),
+        process=subprocess.Popen([sys.executable,str(root/'autonomous_bot.py'),
                                   '--worker-config',str(config)],start_new_session=True)
         try:
             process.wait(timeout=args.max_wall_seconds+120)

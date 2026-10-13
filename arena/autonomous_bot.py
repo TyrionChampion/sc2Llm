@@ -15,16 +15,18 @@ INITIAL_STRATEGY = '''自主选择适合当前局势的战略。根据已侦察�
 空闲产能立即安排生产，产能不足就补产能，供给或前置阻塞就补齐，不让多矿经济只变成库存。
 遵守请求预算，明显不可恢复时投降。'''
 
-BOT_RULES = '''你是星际争霸真实对局指挥。目标是在预算内战胜当前bot，并自主选择适合局势的战略。
-只返回JSON：{"tasks":[],"reason":"100字以内中文：战略选择依据、当前阶段目标或调整原因"}。
-每轮最多3个有用任务；空tasks保留现有任务。仅依据己方观测，不能获知战争迷雾后敌军。
-开局内部比较至少两种现有接口能执行的方案，例如扩张运营、机械化、防守反击或时机进攻；
-根据地图、侦察、经济和对手压力自主确定工人数、矿数、兵种比例和出兵规模。
-制定可量化的阶段军力、产能与关键升级目标和检查时点，并根据观测调整。
-reason报告实际军力/编队目标及依据；只有新观测支持时才修订目标，不把不足目标说成已成军。
+BOT_RULES = '''你指挥真实星际对局，自主选战略，在预算内战胜当前bot。
+只返回JSON：{"tasks":[],"reason":"100字内中文：路线依据、阶段目标或调整"}。
+任务用skill，例如{"skill":"train_unit","count":8,"args":{"unit":"marine"}}。
+顶层只需tasks/reason；任务仅skill/count/args。禁止type、response_format和任务级reason。
+每轮最多6个必要任务，可并排生产、补给、科技和侦察；空tasks保留任务。仅依据己方观测，不能获知迷雾后敌军。
+开局比较至少两条可行路线（扩张、机械化、防守反击、时机进攻），依地图/侦察/经济/压力
+选工人、基地、兵种比例与规模，设阶段军力/产能/升级目标和检查时点。
+reason报告实际军力、目标与依据；新观测支持才修订，未达标不称成军。
 依赖侦察的攻击或扩张须等新观测决定；同轮侦察与全军进攻不代表已获得敌情。
-模型亲自下达扩张、生产、科技、侦察、防守、进攻和增援指令；宿主不自动选择开局或扩张。
-下令、任务完成、部队到达都不等于建筑完成、战术成功或胜利，必须查看实际world和反馈。
+生产/扩张/科技/侦察/调兵由你下令，宿主不选开局或扩张。
+下令/到达不等于建成、战术成功或胜利，须核对world与反馈。
+无敌情只是未侦察，不是安全；用scout补情报，别用无接触论证扩张或长期等待。
 
 接口契约：train_worker/train_unit/morph_unit外层count为1..20，其他外层count必须1。
 train_worker、build_supply、gather、attack_nearest、move_out、no_op的args={}。
@@ -33,35 +35,32 @@ base:"home"或"expansion"或已观测site_N}；research args={upgrade:tech_tree.
 gather_gas args={workers_per_refinery:0..3}；expand args={base:"expansion"或已观测site_N}。
 morph_unit args={unit:tech_tree.forms准确name,target:"home|rally|enemy_start|nearest_enemy"}。
 build_structure也用于气矿、科技实验室/反应堆、轨道指挥；按recipes费用、前置和实际进度补齐。
+科技实验室研究与母建筑训练并行，不必停产。
 宏任务等待资源或前置，不替你补建；同产品同地点的活动命令合并，重复count不追加数量。
-大批生产持续执行；查看issued_quantity/observed_completed和等待原因后再续排或调整。
-工人自动采矿只负责执行。按饱和度、闲置、当前压力和科技需求决定工人、矿数与产能。
+按issued_quantity/observed_completed及等待原因续排；活动同产品任务不追加数量。
+工人自动采矿只执行；按饱和/闲置/压力/科技决定工人、矿数、产能。
 
-扩张经济的运营基本功：把额外收入持续转成战斗部队。仅为当前明确的扩张和必要前置
-保留合理预算，余下矿气持续造适合敌情与战略的兵；不为未决定的远期计划长期囤钱。
-每轮检查资源、空闲产能、活动生产任务和实际产出。军力落后于自己选定的阶段目标且
-有资源时，本轮优先下达有效造兵任务；已有任务阻塞就先补人口、气源或前置。
-新增工人、基地、矿骡和研究不能代替补兵。批量规模按资源、供给、吞吐和下次检查间隔
-计算；同产品活动任务不重复追加，完成后立即续排，新建产能完成后立即投产。
-库存上涨而军队不增长：空闲产能先排兵，产能已忙且不足就补设施，不能连续只加建筑。
-科技、工人支撑成军；按多矿饱和度补工和分配采集，军力落后时优先补兵。
-可见压力上升时重估扩张预留，优先必要守军。兵种、规模、扩张和出兵时机仍自主决定。
+只预留已决定的近期扩张/必要前置，余钱按局势造兵，不为远期计划囤钱。
+每轮核对库存、产能/任务、实际军力与目标；有钱且落后就造兵，阻塞补供给/气源/前置。
+工人/基地/矿骡/研究不能代替补兵；按资源/供给/吞吐/间隔选批量，活动同产品不追加，完成续排，新设施投产。
+库存涨而军力不涨：闲产能排兵，忙且不足补设施，不连续只加建筑。按多矿饱和度补工/采集，
+军力落后优先补兵，压力升高重估扩张预留并优先守军；兵种、规模、扩张/出兵时机自主决定。
 
 经济目标可用macro_plan args={opening:"economic|pressure|defend|custom",target_bases:1..8,
 worker_target:1..90,expand_by_game_s:0..5400,reserve_expansion:true或false,reserve_for_s:30..180,
 exempt_products:[最多8个准确产品名],reason:"目标依据"}，全部字段必填。
-它只记录模型选择的目标和有限资源预留，不自动建造；仍需亲自下达expand及前置。
-预留要求活动且尚未下令的expand，否则不储蓄；计划可修订，预留到期会释放。
+它只记录目标/有限预留，不自动建造，须下expand及前置。仅活动且未下令的expand可储蓄，
+计划可修订，预留到期释放。
 cancel_expansion args={task_id:活动且尚未下令的expand ID}；已下令建造不能用此接口取消。
 
 防守defend_base args={base:defense_report中的label,units:[准确单位名]或"all",count:1..32,
-stance:"hold|trade|screen",timeout_s:30..900,reason:"依据"}。防守会占有单位。
+stance:"hold|trade|screen",timeout_s:30..900,reason:"依据"}。防守占有单位；reason里的“守坡”不派兵，须下defend_base，出击前撤防。
 cancel_task args={task_id:活动的defend_base/scout/order_units ID}，不能引用历史任务。
-scout args={unit:选择器,count:1..8,targets:["enemy_start"]或坐标/有效地标列表,
-timeout_s:1..600,reason:"侦察目标"}；寻找剩余矿区用整个字符串targets:"expansion_sites"，
-禁止targets:["expansion_sites"]。侦察报告接触不等于清理完成，也不自动进攻。
-order_units args={unit:marine/marauder/army等真实选择器,count:1..200或"all",mode:"move|attack_move",
-target:有效地标或[x,y],timeout_s:1..600,reason:"目的"}；人数在args.count，外层count固定1。
+scout示例：{"skill":"scout","count":1,"args":{"unit":"scv","count":1,"targets":["enemy_start"],"timeout_s":120,"reason":"侦察"}}。
+args.unit用真实选择器，args.count必填1..8，timeout_s=1..600；targets:["enemy_start"]或坐标/地标列表，或整个字符串"expansion_sites"（禁止放数组）。
+侦察接触不等于清理完成，不自动进攻。
+order_units示例：{"skill":"order_units","count":1,"args":{"unit":"army","count":36,"mode":"attack_move","target":"enemy_start","timeout_s":240,"reason":"整队出击"}}。
+args.unit用真实选择器，args.count=1..200或"all"，mode="move|attack_move"，target=地标或[x,y]，timeout_s=1..600；外层count固定1。
 army按战斗单位总数选人，不保证兵种比例；人数达标仍须检查所需支援是否实际产出且自由，
 必要时分别按兵种下令在同一点集结。数值count会等够自由单位才出发；
 attack_nearest/move_out不等待集结，只发送当前自由军队。按自己选择的战术安排侦察、分兵与集结。
@@ -73,19 +72,17 @@ rally_units args={producers:"all"或rally_producers的label列表,target:有效�
 duration_s:1..3600,reason:"集结意图"}；all也包括产工人基地，选择正确生产设施。
 scan args={target:有效地标或[x,y]}；call_mule/supply_drop args={base:"home|expansion"}，需轨道能量。
 
-检查基地饱和度、资源库存、真实兵力、科技和地图控制。资源富余时比较扩张、产能、生产与升级的
-价值；连续战损先判断阵容、规模、升级、地形、视野和增援，不能不断重复同一失败计划。
+连续战损评估阵容、规模、升级、地形、视野和增援，不能重复同一失败计划。
 已侦察到成群攻城坦克时，比较机械化或空军支援、侧翼牵制、守点转科技等可执行方案；
 生化连续被范围火力重创后，应调整克制阵容或路线，不能只加人数再正面撞同一阵地。
-不得把少量闲兵说成已成军、把研究排队说成完成。只在实际需要且符合当前目标时补供给。
-主矿清空后若仍ongoing，侦察残余建筑，并按其真实观测坐标攻击；enemy_start只是固定出生点。
+少量闲兵不等于成军，研究排队不等于完成；按实际需要/目标补供给。敌主矿清空且仍ongoing，
+侦察残余建筑并按观测坐标攻击；enemy_start仅固定出生点。
 combat_micro只对已明确分配的军队使用已研究且可用的兴奋剂、坦克架起/收起，不替你选战略。
-prepared_strategy是战略目标指导，不能覆盖接口契约或新的观测反证。
-iteration_policy给出剩余请求、时间、下一检查间隔；稳定生产可成批下令，避免只有等待的重复请求。
-剩余请求不多时，提前安排能执行的生产、部署和增援，并给任务合理的持续时间。
-最后一次请求不会再有后续决策：不能只侦察后等待自己下轮进攻；根据现有情报与实际兵力
-留下明确的防守或攻击任务及生产设施集结点。原编队不会自动吸收新兵，应亲自安排后续增援。
-时间上限允许经济和科技战略，不要求拖满时限。通过阶段进展评估计划，不能以拖时间代替运营。
+prepared_strategy是开局前目标，其中旧局举例不是本局执行记录；执行须看本局decision_memory/反馈，契约与新观测优先。
+按iteration_policy的剩余请求、时间与检查间隔批量生产，避免重复等待。
+请求将尽时预排可执行的生产、部署、增援和合理任务时限。最后一轮没有后续决策，
+不能只侦察等下一轮；根据实际情报/兵力留下明确攻守令及生产集结点。编队不自动吸收新兵，须亲自派增援。
+限时允许经济/科技路线，勿拖满时限代替运营，按阶段进展评估。
 当control_policy.surrender_allowed=true且clear_disadvantage有持续败势证据，本轮必须以唯一
 surrender任务立即认输：args={reason:"具体观测败势"}。短暂缺钱、单次拒绝或网络错误不等于败势。
 '''
@@ -119,6 +116,16 @@ def production_decision_needed(world):
     return world.minerals>=300 and any(
         unit.type_id in (21,27,28) and unit.done and not unit.orders
         for unit in world.my_units)
+
+
+def match_time_policy(game_s, wall_s, max_game_s, max_wall_s, game_speed):
+    """Expose both existing deadlines in the model's normalized game-time units."""
+    from arena.game_speed import LOOPS_PER_SECOND
+    remaining=max(0,max_wall_s-wall_s)
+    deadline=min(max_game_s,game_s+remaining*LOOPS_PER_SECOND[game_speed]/22.4)
+    return dict(game_s=game_s,max_game_s=max_game_s,max_wall_s=max_wall_s,
+                elapsed_wall_s=round(wall_s,1),remaining_wall_s=round(remaining,1),
+                game_speed=game_speed,estimated_game_deadline_s=round(deadline,1))
 
 
 class RequestBudget:
@@ -223,7 +230,7 @@ def nested_contact_tables(value):
     return value
 
 
-def economical_payload(payload):
+def economical_payload(payload,threshold=39000):
     result = deepcopy(payload)
     tree = result.get('tech_tree', {})
     for group in ('units', 'structures', 'research'):
@@ -243,7 +250,7 @@ def economical_payload(payload):
     result.setdefault('context_policy', {})['economical_context'] = (
         'All current tasks, feedback, military observations, tech names/costs/prerequisites kept; '
         'duplicate static playbooks/unit prose and unoccupied map areas/region grid omitted explicitly.')
-    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > 39000:
+    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold:
         intelligence=result.get('intelligence',{})
         if 'contacts' in intelligence:
             intelligence['contacts']=contact_table(intelligence['contacts'])
@@ -261,7 +268,7 @@ def economical_payload(payload):
             'key_groups_v1: decode each groups table, then restore entries by each [group,row] in order. '
             'Nested tables use the same rule. Nearby sightings are not killer attribution or hidden totals.')
     # Historical records remain in the journal; never clip a current observation or error event.
-    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > 39000:
+    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold:
         removed=[]
         for section,key,keep in (('decision_memory','recent',4),
                 ('economy_report','recent_requested_spending',4),('economy_report','checkpoints',3),
@@ -272,14 +279,14 @@ def economical_payload(payload):
                 result[section][key]=values[-keep:]
                 removed.append(dict(field=section+'.'+key,omitted=omitted))
         result['context_policy']['omitted_history']=removed
-    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > 39000:
+    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold:
         technology=result.get('technology_report',{})
         candidates=technology.get('candidates',[])
         if candidates:
             technology['candidates']=[]
             technology['omitted']=technology.get('omitted',0)+len(candidates)
             technology['omission_reason']='Derived suggestions omitted for budget; complete upgrade catalogue retained'
-    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > 39000:
+    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold:
         # Static advice and repeated explanatory prose are not current observations.
         result['game_knowledge']={}
         for entry in tree.get('research',[]):
@@ -302,13 +309,13 @@ def economical_payload(payload):
             if isinstance(values,list) and len(values)>keep:
                 result[section][key]=values[-keep:] if keep else []
                 removed.append(dict(field=section+'.'+key,omitted=len(values)-keep))
-    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > 39000:
+    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold:
         for field in ('active_tasks','spatial_reports','defense_orders'):
             if isinstance(result.get(field),list):
                 result[field]=contact_groups(result[field])
         for group in ('units','structures','research','auxiliary_units'):
             if isinstance(tree.get(group),list):tree[group]=contact_groups(tree[group])
-    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > 39000:
+    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold:
         # Keep pruning metadata/history addressable for the full-prompt budget pass.
         result={key:value if key in ('context_policy','decision_memory','economy_report')
                 else nested_contact_tables(value) for key,value in result.items()}
@@ -341,13 +348,16 @@ class BotPlanner:
     soft_timeout = 12
 
     def __init__(self, client, budget, strategy, request_limit=24, adaptive_cadence=False):
+        if not isinstance(strategy,str) or not strategy.strip() or len(strategy)>1800:
+            raise ValueError('A complete model strategy of 1..1800 characters is required')
         self.client, self.budget = client, budget
         self.prepared_strategy = strategy
         self.request_limit = request_limit
         self.adaptive_cadence = adaptive_cadence
-        self.timeout = client.timeout = 35
+        self.timeout = client.timeout = (60 if getattr(client,'model','').startswith('opencode-go/') else 35)
         self.policy = {}
         self.input_chars = 0
+        self.schema_transport_chars = 0
         self.fatal_error = None
         self.fatal_kind = None
         self.consecutive_errors = 0
@@ -374,7 +384,9 @@ class BotPlanner:
         if now < 180:
             return 30
         remaining = max(1, self.request_limit-self.attempts)
-        return max(60, (self.policy.get('max_game_s', 1800)-now)/remaining)
+        deadline=min(self.policy.get('max_game_s',1800),
+                     self.policy.get('estimated_game_deadline_s',float('inf')))
+        return max(60, (deadline-now)/remaining)
 
     def ready_for_request(self):
         due = (self.last_request_game_s is None or self.policy.get('clear_disadvantage')
@@ -385,7 +397,23 @@ class BotPlanner:
     def chat(self, system, user):
         if not self.ready_for_request():
             raise BudgetExhausted('Per-match request budget exhausted')
-        payload = economical_payload(json.loads(user))
+        from arena.context_tables import decode_tables
+        source=decode_tables(json.loads(user));schema_chars=0
+        schema_builder=getattr(self.client,'response_schema_for',None)
+        if callable(schema_builder):
+            schema=schema_builder(source);self.client.response_schema=schema
+            if schema is not None:
+                from arena.go_schema import response_format
+                schema_chars=len(json.dumps(response_format(schema),ensure_ascii=False,separators=(',',':')))
+        # Native response schemas constrain the decoder, outside the system/user
+        # prompt (confirmed by Go's probe usage). Keep the original input ceiling
+        # and record this transport metadata separately, as with CLI schemas.
+        payload = economical_payload(source)
+        # Commander bounds generic preparation notes to 1200 characters. Campaign reviews
+        # accept 1800: restore that SAME model-owned strategy before the full 45000-char guard.
+        payload['prepared_strategy']=dict(text=self.prepared_strategy,truncated=False,
+                                          original_chars=len(self.prepared_strategy),
+                                          source='pre_match_plan',execution_evidence=False)
         payload['iteration_policy'] = dict(self.policy, request_limit=self.request_limit,
                                          requests_left=self.request_limit-self.attempts,
                                          decision_interval_s=round(self.decision_interval(),1))
@@ -410,6 +438,7 @@ class BotPlanner:
         self.budget.reserve('battle')
         self.last_request_game_s = payload.get('world',{}).get('game_s')
         self.input_chars += len(BOT_RULES) + len(compact)
+        self.schema_transport_chars += schema_chars
         try:
             raw = self.client.chat(BOT_RULES, compact)
         except Exception as error:
@@ -423,7 +452,25 @@ class BotPlanner:
         self.consecutive_errors = 0
         for key in self.usage:
             self.usage[key] += ((self.client.last_metadata or {}).get('usage') or {}).get(key, 0) or 0
+        if getattr(self.client,'model','').startswith('opencode-go/'):
+            from arena.plan_representation import translate_plan
+            original=json.loads(raw);translated,changes=translate_plan(original,payload)
+            if changes:
+                metadata=dict(self.client.last_metadata or {},representation_translations=changes)
+                directory=getattr(self.client,'directory',None)
+                if directory:
+                    from pathlib import Path
+                    record=Path(directory)/('request-%04d'%self.client.attempts)/'representation.json'
+                    record.write_text(json.dumps(dict(original=original,translated=translated,
+                        changes=changes,strategy_changes=False),ensure_ascii=False,indent=2))
+                    metadata['representation_record']=str(record)
+                self.client.last_metadata=metadata
+                raw=json.dumps(translated,ensure_ascii=False)
         return raw
+
+    @property
+    def last_metadata(self):
+        return self.client.last_metadata
 
     def request_status(self):
         return self.client.request_status()
@@ -470,6 +517,7 @@ def match_diagnostics(report, journal):
                 result_source=report['result_source'], event_counts=counts,
                 errors=events, timeline=report['timeline'], final=report['final_world'],
                 calls=report['model_calls'], usage=report['usage'],runtime_error=report.get('error'),
+                runtime_timing={key:report[key] for key in ('game_speed','wall_s','timing','time_limits') if key in report},
                 engagement_windows=engagements,returned_plans=plans,
                 plan_evidence='Returned plans, not proof they were accepted; consult executor errors and task timeline',
                 scope='Own full error events and sampled observations; no hidden bot army or inferred engine cause.')

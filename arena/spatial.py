@@ -347,8 +347,22 @@ class SpatialMission:
                         omitted=self.contact_omitted, handling='mission stops; LLM decides attack/retreat/continue; no strategic takeover')
                 self.finish(w,q,t,out,'completed','visible enemy contact reported; awaiting model decision',stop=True); return
         point = self.route[self.step]
-        if all(u.distance(point) <= 4 for u in units) and len(units) == len(self.tags):
+        exact_arrival=all(u.distance(point)<=4 for u in units)
+        center=tuple(sum(getattr(u,k) for u in units)/len(units) for k in ('x','y'))
+        # A move squad can settle around a crowded local destination. Require the
+        # whole formation nearby, its center inside the original arrival radius,
+        # and every outer member idle. Never extend attack/scout arrival or treat
+        # distant, engaged, or still-moving outer members as having arrived.
+        settled_formation=(self.skill=='order_units' and self.args.get('mode')=='move'
+            and len(units)>1 and math.dist(center,point)<=4
+            and all(u.distance(point)<=4 or (not u.orders and not u.engaged_target
+                    and u.distance(point)<=6+u.radius) for u in units))
+        if (exact_arrival or settled_formation) and len(units) == len(self.tags):
             row = dict(center=list(point), game_s=round(w.seconds,2), **area_visibility(w,point))
+            if not exact_arrival:
+                row['settled_formation']=dict(observed_center=list(center),units=len(units),
+                    max_center_distance=max(u.distance(point) for u in units),
+                    scope='Explicit move only; outer members idle within local approach plus own radius')
             self.arrivals.append(row)
             q.event('spatial_arrival', task_id=t.id, skill=self.skill, observation=row)
             self.step += 1; self.issued = False

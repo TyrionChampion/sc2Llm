@@ -17,7 +17,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from setuptools import setup
+from setuptools import find_packages, setup
 
 description = """PySC2 - StarCraft II Learning Environment
 
@@ -46,16 +46,7 @@ setup(
     license='Apache License, Version 2.0',
     keywords='StarCraft AI',
     url='https://github.com/deepmind/pysc2',
-    packages=[
-        'pysc2',
-        'pysc2.agents',
-        'pysc2.bin',
-        'pysc2.env',
-        'pysc2.lib',
-        'pysc2.maps',
-        'pysc2.run_configs',
-        'pysc2.tests',
-    ],
+    packages=find_packages(),
     install_requires=[
         'absl-py>=0.1.0',
         'deepdiff',
@@ -76,13 +67,6 @@ setup(
         'websocket-client',
         'whichcraft',
     ],
-    entry_points={
-        'console_scripts': [
-            'pysc2_agent = pysc2.bin.agent:entry_point',
-            'pysc2_play = pysc2.bin.play:entry_point',
-            'pysc2_replay_info = pysc2.bin.replay_info:entry_point',
-        ],
-    },
     classifiers=[
         'Development Status :: 4 - Beta',
         'Environment :: Console',

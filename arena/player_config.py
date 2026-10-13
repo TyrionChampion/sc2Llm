@@ -24,7 +24,11 @@ def make_player(index,provider=None,delay=0):
         selected=base;key_env=base.key_env
     if not selected.configured: raise ValueError('%s missing %s; mock fallback prohibited' % (side,key_env))
     model=os.environ.get('ARENA_%s_MODEL' % side) or None
-    client=LivePlanner(selected,model=model,max_tokens=2400,timeout=20)
+    if name=='opencode_go':
+        from arena.opencode_go import OpenCodeGoPlanner
+        client=OpenCodeGoPlanner(provider=selected,model=model)
+    else:
+        client=LivePlanner(selected,model=model,max_tokens=2400,timeout=20)
     identity={'side':side,'provider':name,'model':client.model,'key_source':key_env}
     print('[%s config] %s / %s; key source=%s (value hidden)' % (side,name,client.model,key_env),flush=True)
     return client,identity

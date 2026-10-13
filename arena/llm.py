@@ -60,6 +60,8 @@ PROVIDERS = {
                           "https://api.anthropic.com", "claude-3-5-sonnet-latest"),
     "deepseek": Provider("deepseek", "openai", "DEEPSEEK_API_KEY",
                          "https://api.deepseek.com/v1", "deepseek-chat"),
+    "opencode_go": Provider("opencode_go", "openai", "open_api_key",
+                            "https://opencode.ai/zen/go/v1", "deepseek-v4.1-flash"),
     "moonshot": Provider("moonshot", "openai", "MOONSHOT_API_KEY",
                          "https://api.moonshot.cn/v1", "moonshot-v1-8k"),
     "dashscope": Provider("dashscope", "openai", "DASHSCOPE_API_KEY",

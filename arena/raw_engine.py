@@ -163,8 +163,27 @@ class GameClock:
                 'skipped_observation_loops':self.skipped_loops}
 
 
+_SPEED_MAP_CLASSES = {}
+
+
+def headless_map_for_speed(map_name, speed):
+    from arena.game_speed import map_for_speed, LOOPS_PER_SECOND as SPEEDS
+    if speed not in SPEEDS:raise ValueError('unknown game speed')
+    if speed=='faster':return map_name
+    from pysc2 import maps
+    path=map_for_speed(map_name,speed)
+    key=(map_name,speed)
+    if key not in _SPEED_MAP_CLASSES:
+        _SPEED_MAP_CLASSES[key]=type('Arena'+map_name+speed.title(),(maps.lib.Map,),
+                                    dict(directory='Arena',filename=path.stem,players=2))
+    return _SPEED_MAP_CLASSES[key]()
+
+
 class RawArena:
-    def __init__(self, map_name='Acropolis', render=True, difficulty=None, seed=7, races=None, bot_race='terran'):
+    def __init__(self, map_name='Acropolis', render=True, difficulty=None, seed=7, races=None, bot_race='terran',game_speed='faster'):
+        from arena.game_speed import LOOPS_PER_SECOND as SPEEDS
+        map_name=headless_map_for_speed(map_name,game_speed)
+        self.game_speed=game_speed
         def interface(rgb):
             return features.AgentInterfaceFormat(
                 rgb_dimensions=features.Dimensions(screen=(1024,768), minimap=256) if rgb else None,
@@ -198,7 +217,7 @@ class RawArena:
             self.initial = self.snapshots()
             self.homes = [next(u.pos for u in w.my_units if u.type_id in (18,132,130,59,86,100,101)) for w in self.initial]
             self.configure_start_locations(infos)
-            self.clock = GameClock(self.initial[0].game_loop)
+            self.clock = GameClock(self.initial[0].game_loop,SPEEDS[game_speed])
             self.action_errors = 0
             self._pending_surrender = None
             self._terminal_result = None
