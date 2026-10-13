@@ -75,8 +75,24 @@ class SpatialMissions(unittest.TestCase):
         contacts=[e for e in self.events if e['kind']=='scout_contact']
         self.assertEqual(len(contacts),1)
         self.assertEqual(contacts[0]['contacts'][0]['pos'],[35,35])
+        self.assertTrue(contacts[0]['mission_stopped_on_contact'])
+        self.assertFalse(contacts[0]['goal_arrived'])
+        self.assertEqual(contacts[0]['requested_goal'],[80,80])
+        self.assertEqual(contacts[0]['confirmed_arrivals'],[])
+        self.assertEqual(contacts[0]['remaining_requested_route'],[[80,80]])
         self.assertEqual(self.q.tick(replace(w,game_loop=400),set()),[])
         self.assertEqual(len(self.q.tasks),1)
+
+    def test_contact_at_the_goal_reports_actual_arrival_without_inventing_route_completion(self):
+        self.start(scout([[80,80],[100,100]]))
+        pos=self.q.tasks[0].program.route[0]
+        w=replace(self.w,game_loop=246,units=(replace(self.marine,x=pos[0],y=pos[1]),
+            unit(2,48,pos[0]+1,pos[1]+1,alliance=4)))
+        self.q.tick(w,set())
+        contact=next(e for e in self.events if e['kind']=='scout_contact')
+        self.assertTrue(contact['goal_arrived']);self.assertEqual(contact['resolved_goal'],list(pos))
+        self.assertEqual(contact['confirmed_arrivals'],[])
+        self.assertEqual(contact['remaining_requested_route'],[[80,80],[100,100]])
 
     def test_cancel_then_explicit_redeploy_same_plan(self):
         self.start(scout([[80,80]]))
@@ -86,6 +102,47 @@ class SpatialMissions(unittest.TestCase):
         self.assertEqual(self.q.tasks[0].status,'cancelled')
         self.assertEqual(len(actions),len(self.q.action_contexts))
         self.assertEqual(self.q.tasks[1].program.tags,{1})
+
+    def test_idle_attack_move_formation_near_goal_is_arrival_without_stop_or_victory(self):
+        # Real match3 error2184: all native orders/engagements ended, several
+        # outer members >4 tiles away due to formation spacing.
+        positions=[(146.66,55.17),(145.75,57.31),(144.06,54.07),(146.52,58.96),(151.52,55.48)]
+        troops=[unit(n+1,48,30+n,30,radius=.625,ground_dps=10,attack_range=6) for n in range(len(positions))]
+        self.w=replace(self.w,units=tuple(troops));self.start(
+            dict(skill='order_units',args=dict(unit='army',count='all',mode='attack_move',target=[150,54],reason='显式进攻')))
+        arrived=tuple(replace(u,x=x,y=y) for u,(x,y) in zip(troops,positions))
+        w=replace(self.w,game_loop=246,units=arrived)
+        self.assertEqual(self.q.tick(w,set()),[])
+        self.assertEqual(self.q.tasks[0].status,'completed')
+        self.assertIn('not victory',self.q.tasks[0].reason)
+        self.assertTrue(any(e['kind']=='spatial_arrival' and 'settled_formation' in e['observation'] for e in self.events))
+
+    def test_visible_in_range_enemy_prevents_settled_attack_arrival(self):
+        troops=[unit(1,48,30,30,radius=.375,ground_dps=10,attack_range=5),
+                unit(2,48,31,30,radius=.375,ground_dps=10,attack_range=5)]
+        self.w=replace(self.w,units=tuple(troops));self.start(dict(skill='order_units',args=dict(
+            unit='army',count='all',mode='attack_move',target=[80,80],reason='显式进攻')))
+        arrived=[replace(troops[0],x=79.5,y=79.5),replace(troops[1],x=85,y=79.5)]
+        enemy=unit(3,18,80,80,alliance=4,is_building=True,radius=2.5)
+        self.q.tick(replace(self.w,game_loop=246,units=tuple(arrived+[enemy])),set())
+        self.assertNotEqual(self.q.tasks[0].status,'completed')
+
+    def test_explicit_order_can_target_threatened_entrance_while_automatic_rally_stays_safe(self):
+        from arena.rally import named_rally_point
+        from arena.spatial import resolve_target
+        home=unit(10,18,30,30,is_building=True,radius=2.5)
+        base=unit(11,18,70,70,is_building=True,radius=2.5)
+        w=replace(self.w,units=(self.marine,home,base))
+        grid=self.q._rally_grid();point,_=named_rally_point(grid,self.backend,0,'expansion_entrance',w)
+        enemy=unit(12,48,*point,alliance=4,ground_dps=10,attack_range=5)
+        contested=replace(w,units=w.units+(enemy,))
+        with self.assertRaisesRegex(ValueError,'blocked or threatened'):
+            named_rally_point(grid,self.backend,0,'expansion_entrance',contested)
+        self.assertEqual(resolve_target('expansion_entrance',contested,self.q),point)
+        self.q.enqueue([dict(skill='order_units',args=dict(unit='marine',count=1,mode='attack_move',
+            target='expansion_entrance',reason='模型显式增援受压矿口'))],contested.seconds)
+        actions=self.q.tick(contested,set())
+        self.assertTrue(any(a.action_raw.unit_command.ability_id==ATTACK for a in actions))
 
     def test_duplicate_reason_change_does_not_allocate_twice(self):
         self.start(order())

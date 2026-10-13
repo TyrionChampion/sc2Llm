@@ -24,8 +24,8 @@ BOT_RULES = '''你指挥真实星际对局，自主选战略，在预算内战�
 选工人、基地、兵种比例与规模，设阶段军力/产能/升级目标和检查时点。
 reason报告实际军力、目标与依据；新观测支持才修订，未达标不称成军。
 依赖侦察的攻击或扩张须等新观测决定；同轮侦察与全军进攻不代表已获得敌情。
-生产/扩张/科技/侦察/调兵由你下令，宿主不选开局或扩张。
-下令/到达不等于建成、战术成功或胜利，须核对world与反馈。
+生产/扩张/科技/侦察/调兵由你下令，宿主不选战略。
+下令/到达≠建成/战术成功/胜利；核对world及反馈。
 无敌情只是未侦察，不是安全；用scout补情报，别用无接触论证扩张或长期等待。
 
 接口契约：train_worker/train_unit/morph_unit外层count为1..20，其他外层count必须1。
@@ -36,13 +36,13 @@ gather_gas args={workers_per_refinery:0..3}；expand args={base:"expansion"或�
 morph_unit args={unit:tech_tree.forms准确name,target:"home|rally|enemy_start|nearest_enemy"}。
 build_structure也用于气矿、科技实验室/反应堆、轨道指挥；按recipes费用、前置和实际进度补齐。
 科技实验室研究与母建筑训练并行，不必停产。
-宏任务等待资源或前置，不替你补建；同产品同地点的活动命令合并，重复count不追加数量。
-按issued_quantity/observed_completed及等待原因续排；活动同产品任务不追加数量。
+宏任务等资源/前置，不自动补建；同产品同地点活动命令合并，重复count不追加。
+按issued_quantity/observed_completed及等待原因续排。
 工人自动采矿只执行；按饱和/闲置/压力/科技决定工人、矿数、产能。
 
 只预留已决定的近期扩张/必要前置，余钱按局势造兵，不为远期计划囤钱。
 每轮核对库存、产能/任务、实际军力与目标；有钱且落后就造兵，阻塞补供给/气源/前置。
-工人/基地/矿骡/研究不能代替补兵；按资源/供给/吞吐/间隔选批量，活动同产品不追加，完成续排，新设施投产。
+工人/基地/矿骡/研究不代替补兵；按资源/供给/吞吐/间隔选批量，完成续排，新设施投产。
 库存涨而军力不涨：闲产能排兵，忙且不足补设施，不连续只加建筑。按多矿饱和度补工/采集，
 军力落后优先补兵，压力升高重估扩张预留并优先守军；兵种、规模、扩张/出兵时机自主决定。
 
@@ -58,7 +58,7 @@ stance:"hold|trade|screen",timeout_s:30..900,reason:"依据"}。防守占有单�
 cancel_task args={task_id:活动的defend_base/scout/order_units ID}，不能引用历史任务。
 scout示例：{"skill":"scout","count":1,"args":{"unit":"scv","count":1,"targets":["enemy_start"],"timeout_s":120,"reason":"侦察"}}。
 args.unit用真实选择器，args.count必填1..8，timeout_s=1..600；targets:["enemy_start"]或坐标/地标列表，或整个字符串"expansion_sites"（禁止放数组）。
-侦察接触不等于清理完成，不自动进攻。
+scout遇可见敌军即停，接触不等于到达/清理目标；续行用order_units move或换路线，不自动进攻。
 order_units示例：{"skill":"order_units","count":1,"args":{"unit":"army","count":36,"mode":"attack_move","target":"enemy_start","timeout_s":240,"reason":"整队出击"}}。
 args.unit用真实选择器，args.count=1..200或"all"，mode="move|attack_move"，target=地标或[x,y]，timeout_s=1..600；外层count固定1。
 army按战斗单位总数选人，不保证兵种比例；人数达标仍须检查所需支援是否实际产出且自由，
@@ -113,9 +113,11 @@ class RequestCapIdleGuard:
 
 def production_decision_needed(world):
     """Wake the model for idle military capacity; never choose or issue a product."""
-    return world.minerals>=300 and any(
+    idle_larva=(world.race=='zerg' and any(u.type_id==89 and u.done for u in world.my_units)
+        and any(u.type_id==151 and u.done and not u.orders for u in world.my_units))
+    return world.minerals>=300 and (idle_larva or any(
         unit.type_id in (21,27,28,62,71,67,133) and unit.done and not unit.orders
-        for unit in world.my_units)
+        for unit in world.my_units))
 
 
 def match_time_policy(game_s, wall_s, max_game_s, max_wall_s, game_speed):

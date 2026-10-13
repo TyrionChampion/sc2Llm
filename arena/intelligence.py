@@ -1,6 +1,7 @@
 """Player-local sightings sampled every observation, independent of model latency."""
 from collections import Counter, deque
 from arena.raw_engine import NAMES
+from arena.production_lifecycle import PRODUCTION_INTERMEDIATES,REMOVAL_NOTE
 
 # A pending alert carries a full contact snapshot (own_unit_death_observed adds every
 # nearby sighting), so an unbounded backlog dominates the battle prompt: measured on the
@@ -70,18 +71,22 @@ class Intelligence:
         for tag in w.dead_units:
             if tag in self.enemies:
                 lost = self.enemies.pop(tag)
-                self.alert('enemy_death_observed', w, contact=lost)
+                self.alert('enemy_production_intermediate_removed' if lost['type_id'] in PRODUCTION_INTERMEDIATES
+                    else 'enemy_death_observed', w, contact=lost,
+                    attribution=REMOVAL_NOTE if lost['type_id'] in PRODUCTION_INTERMEDIATES else 'Native death event; killer not established.')
             if tag in self.own:
                 lost = self.own.pop(tag)
                 recent = [dict(r) for r in self.enemies.values()
                           if w.seconds-r['last_seen_game_s'] <= 8
                           and (r['pos'][0]-lost['pos'][0])**2+(r['pos'][1]-lost['pos'][1])**2 <= 18**2]
-                self.alert('own_unit_death_observed', w, unit=lost,
+                self.alert('own_production_intermediate_removed' if lost.get('type_id') in PRODUCTION_INTERMEDIATES
+                    else 'own_unit_death_observed', w, unit=lost,
                            nearby_recent_contacts=recent,
-                           attribution='Nearby shared-vision sightings; not proof this unit alone revealed them.')
+                           attribution=REMOVAL_NOTE if lost.get('type_id') in PRODUCTION_INTERMEDIATES else
+                               'Nearby shared-vision sightings; not proof this unit alone revealed them or an enemy kill.')
         # Absence alone never means death (fog, transports and refineries).
         for u in w.my_units:
-            self.own[u.tag] = dict(tag=u.tag, unit=NAMES.get(u.type_id, str(u.type_id)), pos=list(u.pos))
+            self.own[u.tag] = dict(tag=u.tag,type_id=u.type_id,unit=NAMES.get(u.type_id, str(u.type_id)), pos=list(u.pos))
         if len(self.enemies) > 2048:
             oldest = sorted(self.enemies, key=lambda t:self.enemies[t]['last_seen_game_s'])
             evicted = oldest[:len(self.enemies)-2048]

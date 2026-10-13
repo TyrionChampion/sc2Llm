@@ -123,7 +123,9 @@ class Snapshot:
         enemy = Counter(NAMES.get(u.type_id, str(u.type_id)) for u in self.enemy_units)
         return {'game_s':round(self.seconds,1), 'minerals':self.minerals,
                 'vespene':self.vespene,'race':self.race,
-                'supply':[self.supply_used,self.supply_cap], 'own':dict(own),
+                'supply':[self.supply_used,self.supply_cap],
+                'population':dict(used=self.supply_used,cap=self.supply_cap,free=self.supply_cap-self.supply_used),
+                'own':dict(own),
                 'upgrades':list(self.upgrade_names),
                 'bases':[dict(type=NAMES.get(u.type_id,str(u.type_id)),tag=u.tag,
                     progress=round(u.progress,2),workers=u.assigned_harvesters,ideal_workers=u.ideal_harvesters,

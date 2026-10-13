@@ -389,6 +389,9 @@ class TaskQueue:
                 self.update(t,'completed','macro goal recorded; explicit production tasks still required')
             if self.tech_tree is not None and skill in MACROS:
                 run_type=OrbitalRun if skill in ORBITAL_ABILITIES else MacroRun
+                if skill=='inject_larva':
+                    from arena.queen import InjectLarvaRun
+                    run_type=InjectLarvaRun
                 t.program=run_type(specification(self.tech_tree,self.race,skill,args),args)
             elif skill=='rally_units':
                 grid=self._rally_grid()

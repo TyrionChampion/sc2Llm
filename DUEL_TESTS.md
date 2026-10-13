@@ -15,6 +15,7 @@ Slower realtime、正常迷雾，不用 debug 布场或固定开局。
 
 每次执行一局，分别用己方日志复盘；在局间检查工具后再次恢复。
 两方不共享会话、策略或敌方未侦察数据。观察者总报告不送入战斗模型。
+虫族对神族、人族各两局使用 `--zerg-series`，可续跑账本与实证修复见 [ZERG_DUELS.md](ZERG_DUELS.md)。
 账本验证角色计数总和，恢复时不会清零。`logs/go-duels/current.json`指向当前系列。
 本轮系列：`logs/go-duels/tvp-3kxcuvg_`。
 

@@ -103,7 +103,7 @@ class EngagementLog:
                 own=w.my_units;enemy=w.enemy_units
                 current=dict(our=counts(own),enemy=counts(enemy))
             previous=self.previous;self.previous=current
-            ours={};theirs={};left={};returned={};damage=False
+            ours={};theirs={};left={};returned={};damage=False;own_intermediates={};enemy_intermediates={}
             if self.mode=='raw':
                 visible={u.tag:u for u in enemy};ours_now={u.tag:u for u in own}
                 prior_visible={t:r for t,r in self.known.items() if r['visible'] and r['side']==4}
@@ -113,6 +113,10 @@ class EngagementLog:
                     if known:
                         bucket=ours if known['side']==1 else theirs
                         bucket[known['name']]=bucket.get(known['name'],0)+1
+                        from arena.production_lifecycle import PRODUCTION_INTERMEDIATES
+                        if known['type'] in PRODUCTION_INTERMEDIATES:
+                            subset=own_intermediates if known['side']==1 else enemy_intermediates
+                            subset[known['name']]=subset.get(known['name'],0)+1
                     if len(self.deaths_order)==self.deaths_order.maxlen:self.deaths_seen.discard(self.deaths_order[0])
                     self.deaths_order.append(tag);self.deaths_seen.add(tag)
                 for tag,row in prior_visible.items():
@@ -141,10 +145,13 @@ class EngagementLog:
                     our_before=(previous or current)['our'],our_after=current['our'],
                     enemy_visible_before=(previous or dict(enemy={}))['enemy'],enemy_visible_after=current['enemy'],
                     our_deaths_observed={},enemy_deaths_observed={},enemy_left_vision={},enemy_entered_vision={},
+                    our_production_intermediates_removed={},enemy_production_intermediates_removed={},
                     damage_observed=False,source='raw observations/dead_units' if self.mode=='raw' else 'screen counts only; exact death events unavailable')
             row=self.active;row['end_game_s']=round(now,2);row['our_after']=current['our'];row['enemy_visible_after']=current['enemy']
             row['damage_observed'] |= damage
             for field,values in [('our_deaths_observed',ours),('enemy_deaths_observed',theirs),('enemy_left_vision',left),('enemy_entered_vision',returned)]:
+                for name,n in values.items():row[field][name]=row[field].get(name,0)+n
+            for field,values in [('our_production_intermediates_removed',own_intermediates),('enemy_production_intermediates_removed',enemy_intermediates)]:
                 for name,n in values.items():row[field][name]=row[field].get(name,0)+n
             if self.mode=='screen' and previous and previous['camera']!=current['camera']:
                 row['camera_changed']=True

@@ -10,10 +10,21 @@ from unittest.mock import patch
 from dataclasses import replace
 import test_realtime_runtime as fixtures
 from test_operator_advice import LocalPlanner
-from go_duel_series import play,GO_MODEL
+from go_duel_series import play,GO_MODEL,match_setup,ZERG_SCHEDULE
 
 
 class DuelSeriesTests(unittest.TestCase):
+    def test_four_game_schedule_keeps_opponents_and_strategies_separate_on_resume(self):
+        state=dict(games=4,races=ZERG_SCHEDULE[0],schedule=ZERG_SCHEDULE,
+            strategies_by_race=dict(zerg='own zerg review',protoss='own protoss review',terran='own terran review'))
+        restored=json.loads(json.dumps(state))
+        for number,opponent in enumerate(('protoss','terran','protoss','terran'),1):
+            races,strategies=match_setup(restored,number)
+            self.assertEqual(races,['zerg',opponent])
+            self.assertEqual(strategies,['own zerg review','own '+opponent+' review'])
+        legacy=dict(games=3,races=['terran','protoss'],strategies=['old p1','old p2'])
+        self.assertEqual(match_setup(legacy,3),(['terran','protoss'],['old p1','old p2']))
+
     def test_concurrent_player_attempts_are_durable_and_resume_without_reset(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'budget.json';budget=DurableBudget(path,50)
@@ -42,7 +53,7 @@ class DuelSeriesTests(unittest.TestCase):
     def test_go_runner_publishes_live_chat_window_contract(self):
         class Arena(fixtures.Backend):
             def __init__(self,**kwargs):
-                self.homes=[(30,30),(160,160)];self.initial=[fixtures.world([]),replace(fixtures.world([]),race='protoss')]
+                self.homes=[(30,30),(160,160)];self.initial=[replace(fixtures.world([]),race=race) for race in kwargs['races']]
                 self.controllers=[SimpleNamespace(ping=lambda:SimpleNamespace(game_version='local test fixture'))]
                 self.clock=SimpleNamespace(report=lambda:{'game_s':1,'wall_s':1})
                 self.start_location_report=[];self.surrender_report=None;self.action_errors=0;self.ended=False
@@ -56,9 +67,11 @@ class DuelSeriesTests(unittest.TestCase):
             folder=Path(directory)/'match';budget=DurableBudget(Path(directory)/'budget.json',6)
             with patch('go_duel_series.RawArena',Arena),patch('go_duel_series.GoPlanner',side_effect=client),patch('go_duel_series.subprocess.Popen') as launch:
                 launch.return_value.pid=123
-                report=play(folder,1,['choose own strategy']*2,budget,dict(requests=2,wall_s=2,game_s=10,seed=7),True)
+                report=play(folder,1,['choose own strategy']*2,budget,dict(requests=2,wall_s=2,game_s=10,seed=7),True,races=['zerg','protoss'])
             self.assertEqual(launch.call_args.args[0][-2:],['--run',str(folder)])
             self.assertEqual(len(report['samples'][0]['commanders']),2)
+            self.assertEqual(report['races'],['zerg','protoss'])
+            self.assertEqual([p['race'] for p in report['players']],['zerg','protoss'])
             for i,c in enumerate(report['samples'][0]['commanders']):
                 self.assertEqual(c['operator_advice']['player'],i+1)
                 self.assertTrue(Path(c['feedback']['journal']).is_file())

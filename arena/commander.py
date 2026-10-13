@@ -455,6 +455,9 @@ class Commander:
                      'skill_library':list(self.tasks.library.values())}
             if self.defense:payload['defense_adjutant']=self.defense.public()
             if self.combat_micro:payload['combat_micro']=self.combat_micro.public()
+            if w.race=='zerg' and self.tasks.tech_tree is not None:
+                from arena.queen import report as injection_report
+                payload['zerg_injection']=injection_report(w,self.tasks)
             if self.tactics:payload['army_tactics']=self.tactics.public()
             advice=self.operator_advice.batch()
             if advice['messages']:payload['operator_advice']=advice

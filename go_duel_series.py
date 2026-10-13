@@ -1,4 +1,4 @@
-"""Three bounded Go-vs-Go Linux realtime games. One game per invocation, resumable ledger.
+"""Bounded Go-vs-Go Linux realtime games. One game per invocation, resumable ledger.
 
 Start: ./run_sc2.sh .venv/bin/python go_duel_series.py
 Next:  ./run_sc2.sh .venv/bin/python go_duel_series.py --resume logs/go-duels/<series>
@@ -28,7 +28,26 @@ from arena.tech_tree import TOWNHALLS
 
 ROOT=Path(__file__).resolve().parent
 RACES=('terran','protoss')
+ZERG_SCHEDULE=[['zerg','protoss'],['zerg','terran'],['zerg','protoss'],['zerg','terran']]
 RUNTIME_UPDATES=(
+    'Explicit scout/order_units entrance targets can resolve under observed enemy pressure; automatic production '
+    'rally selection still avoids threats. Geometry, occupancy and bounded reachability checks remain enforced.',
+    'Raw death events may be normal hatching/morphing/cancellation. Production intermediate removals are a subset '
+    'of raw deaths, not extra combat casualties or proof of an enemy kill.',
+    'Idle attack-move formations can confirm local arrival without a watchdog stop; moving/engaged units or '
+    'visible attackable enemies in range prevent this settlement shortcut. Arrival is not area clearance/victory.',
+    'Only an observed matching egg order claims an egg; unconfirmed original larva tags do not block another product. '
+    'Queen casts track actual observed energy spending during travel, with progress/stall checks and a 90-game-second deadline.',
+    'Zerg now has inject_larva count=1 args={base:home|expansion|observed site_N}: one explicit Queen cast, '
+    '25 energy, native energy+buff confirmation, no automatic cycle. zerg_injection reports own Queens/energy/base buffs.',
+    'Townhall upgrades such as lair/hive/orbital_command now restrict their producer to the requested home, '
+    'expansion or observed site, rather than choosing an unrelated idle base.',
+    'Scout contacts now report the requested/resolved goal, arrival evidence and remaining route. '
+    'Scout stops at visible enemy contact; contact does not prove arrival. Explicit order_units move can continue scouting.',
+    'Larva purchases now acknowledge a new unclaimed own egg with the matching native product order, '
+    'even when the engine uses a larva at another owned base; product completion still requires actual own units.',
+    'Available idle Zerg larvae with a completed spawning pool now wake production decisions like other races; '
+    'the host still does not select a product or issue extra model requests beyond the existing limits.',
     'Warp-in candidate selection now excludes occupied unit footprints and pending warp positions; '
     'completion still requires observed units.',
     'Player-observed resource site names persist across neutral tag changes and mineral depletion; '
@@ -75,25 +94,36 @@ def player_snapshot(index,world,commander):
         last_decision=commander.last_decision,defense=commander.control_policy.copy())
 
 
-def play(folder,number,strategies,budget,limits,output_window=False):
+def source_snapshot(folder):
+    """Retain the exact bytes used for the manifest, so later fixes remain reviewable."""
+    hashes={}
+    for p in [Path(__file__),*sorted((ROOT/'arena').glob('*.py'))]:
+        data=p.read_bytes();name=str(p.relative_to(ROOT));hashes[name]=hashlib.sha256(data).hexdigest()
+        target=folder/'source'/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
+    return hashes
+
+
+def play(folder,number,strategies,budget,limits,output_window=False,races=RACES):
+    races=tuple(races)
+    if len(races)!=2 or any(r not in ('terran','zerg','protoss') for r in races):
+        raise ValueError('Exactly two supported player races required')
     folder.mkdir()
-    report=dict(number=number,status='starting',opponent_kind='LLM',races=list(RACES),models=[GO_MODEL]*2,
+    report=dict(number=number,status='starting',opponent_kind='LLM',races=list(races),models=[GO_MODEL]*2,
         seed=limits['seed']+number-1,game_speed='slower',realtime=True,debug_used=False,scripted_opening=False,
         time_limits=dict(game_s=limits['game_s'],wall_s=limits['wall_s']),outcomes={},
         result_source='unverified',termination=None,players=[],cleanup_complete=False,outcome='starting',
-        identities=[dict(side='P'+str(i+1),model=GO_MODEL,race=RACES[i]) for i in range(2)],samples=[],
-        code_sha256={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in [Path(__file__),*sorted((ROOT/'arena').glob('*.py'))]})
+        identities=[dict(side='P'+str(i+1),model=GO_MODEL,race=races[i]) for i in range(2)],samples=[],
+        code_snapshot=str(folder/'source'),code_sha256=source_snapshot(folder))
     commanders=[];clients=[];arena=None;worlds=[];started=time.monotonic()
     guards=[DefeatGuard(),DefeatGuard()]
     sides=[dict(player=i+1,race=race,model=GO_MODEL,outcome='Unknown',result_source='unverified',
-        termination=None,timeline=[],strategy=strategies[i]) for i,race in enumerate(RACES)]
+        termination=None,timeline=[],strategy=strategies[i]) for i,race in enumerate(races)]
     try:
         for i in range(2):
             own=folder/('p'+str(i+1));own.mkdir()
             base=GoPlanner(GO_MODEL,own/'planner')
             clients.append(BotPlanner(base,PlayerBudget(budget,i),strategies[i],limits['requests'],adaptive_cadence=True))
-        arena=RawArena(render=False,races=list(RACES),seed=report['seed'],game_speed='slower')
+        arena=RawArena(render=False,races=list(races),seed=report['seed'],game_speed='slower')
         report.update(status='running',game_started=True,engine_version=arena.controllers[0].ping().game_version,
                       map_targets=arena.start_location_report)
         arena.surrender_blockers_for=lambda w,i: [] if guards[i].evidence else surrender_blockers(w)
@@ -112,7 +142,7 @@ def play(folder,number,strategies,budget,limits,output_window=False):
             for i,(c,w) in enumerate(zip(clients,worlds)):
                 loss=guards[i].observe(w)
                 c.policy=dict(**match_time_policy(w.seconds,elapsed,limits['game_s'],limits['wall_s'],'slower'),
-                    match_number=number,player=i+1,opponent_kind='LLM',own_race=RACES[i],opponent_race=RACES[1-i],
+                    match_number=number,player=i+1,opponent_kind='LLM',own_race=races[i],opponent_race=races[1-i],
                     clear_disadvantage=loss,production_decision_due=production_decision_needed(w),
                     decision_urgent=any(e.ground_dps>0 and not e.hallucination and
                         any(e.distance(u)<(35 if u.type_id in TOWNHALLS else 14) for u in w.my_units
@@ -131,7 +161,7 @@ def play(folder,number,strategies,budget,limits,output_window=False):
                                    for i,s in enumerate(sides)]
                 report['budget']=budget.report();write(folder/'match.json',report)
                 print('DUEL_PROGRESS',json.dumps(dict(match=number,game_s=round(worlds[0].seconds,1),
-                    players=[dict(race=RACES[i],own=w.summary()['own'],minerals=w.minerals,gas=w.vespene,
+                    players=[dict(race=races[i],own=w.summary()['own'],minerals=w.minerals,gas=w.vespene,
                         attempts=clients[i].attempts,accepted=commanders[i].decisions,errors=commanders[i].errors)
                         for i,w in enumerate(worlds)],budget=budget.used),ensure_ascii=False),flush=True)
             if elapsed-last_ui>=5:
@@ -180,6 +210,14 @@ def play(folder,number,strategies,budget,limits,output_window=False):
     return report
 
 
+def match_setup(state,number):
+    """Legacy ledgers retain their limits; new schedules keep strategies by race."""
+    races=state.get('schedule',[state['races']]*state['games'])[number-1]
+    strategies=([state['strategies_by_race'][race] for race in races]
+                if 'strategies_by_race' in state else state['strategies'])
+    return races,strategies
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--resume',type=Path)
@@ -187,6 +225,7 @@ def main():
     parser.add_argument('--wall-seconds',type=float,default=1860)
     parser.add_argument('--game-seconds',type=float,default=1800)
     parser.add_argument('--seed',type=int,default=7)
+    parser.add_argument('--zerg-series',action='store_true',help='Four games: Zerg vs Protoss/Terran, twice each')
     parser.add_argument('--output-window',action='store_true',help='Open decision/chat window; closing it does not stop the game')
     args=parser.parse_args()
     if not 1<=args.requests<=24 or not 1<=args.wall_seconds<=1860 or not 1<=args.game_seconds<=1800:
@@ -194,25 +233,33 @@ def main():
     flags.FLAGS(['go_duel_series'])
     root=ROOT/'logs/go-duels';root.mkdir(exist_ok=True)
     if args.resume:
+        if args.zerg_series:parser.error('Resume uses the saved schedule; do not select a new series')
         folder=args.resume.resolve()
         if not folder.is_relative_to(root):raise ValueError('Resume must be an existing Go duel series')
         state=json.loads((folder/'series.json').read_text())
         if state['state']=='running':raise ValueError('Active/incomplete match cannot be silently restarted')
     else:
-        folder=Path(tempfile.mkdtemp(prefix='tvp-',dir=root)).resolve()
-        state=dict(state='ready',games=3,matches=[],models=[GO_MODEL]*2,races=list(RACES),
+        schedule=ZERG_SCHEDULE if args.zerg_series else [list(RACES)]*3
+        folder=Path(tempfile.mkdtemp(prefix='zerg-' if args.zerg_series else 'tvp-',dir=root)).resolve()
+        state=dict(state='ready',games=len(schedule),schedule=schedule,matches=[],models=[GO_MODEL]*2,races=schedule[0],
             limits=dict(requests=args.requests,wall_s=args.wall_seconds,game_s=args.game_seconds,seed=args.seed),
             strategies=[INITIAL_STRATEGY,INITIAL_STRATEGY],
             historical_campaign_hashes={str(p):hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in (ROOT/'logs/autonomous-bot').glob('*/campaign.json')})
-    limits=state['limits'];budget=DurableBudget(folder/'budget.json',3*(limits['requests']*2+2))
-    if len(state['matches'])>=3:
+        if args.zerg_series:
+            state['strategies_by_race']={r:INITIAL_STRATEGY for r in ('zerg','terran','protoss')}
+            prior=[*root.glob('*/budget.json'),ROOT/'logs/tactical-scenarios/ledger.json']
+            state['historical_campaign_hashes'].update({str(p):hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in prior if p.is_file() and p.parent!=folder})
+    limits=state['limits'];budget=DurableBudget(folder/'budget.json',state['games']*(limits['requests']*2+2))
+    if len(state['matches'])>=state['games']:
         print('DUEL_SERIES_COMPLETE',folder,flush=True);return 0
     number=len(state['matches'])+1
+    races,strategies=match_setup(state,number)
     state.update(state='running',pid=os.getpid(),active_match=number,budget=budget.report())
     write(folder/'series.json',state);write(root/'current.json',dict(series=str(folder)))
     print('DUEL_SERIES',folder,'MATCH',number,flush=True)
-    match=play(folder/('match-%02d'%number),number,state['strategies'],budget,limits,args.output_window)
+    match=play(folder/('match-%02d'%number),number,strategies,budget,limits,args.output_window,races=races)
     state['matches'].append(dict(number=number,report=str(folder/('match-%02d'%number)/'match.json'),
         outcomes=match['outcomes'],termination=match['termination'],result_source=match['result_source']))
     state['state']='reviewing';write(folder/'series.json',state)
@@ -221,16 +268,18 @@ def main():
         own=folder/('match-%02d'%number)/('p'+str(i+1))
         try:
             d=match_diagnostics(s,Path(s['journal']));write(own/'diagnostics.json',d)
-            review=review_game(GO_MODEL,own/'review',PlayerBudget(budget,i),d,state['strategies'][i],
-                'LLM_duel',review_context=dict(mode='LLM_duel',own_race=RACES[i],opponent_race=RACES[1-i],match=number,
+            review=review_game(GO_MODEL,own/'review',PlayerBudget(budget,i),d,strategies[i],
+                'LLM_duel',review_context=dict(mode='LLM_duel',own_race=races[i],opponent_race=races[1-i],match=number,
                     next_match_runtime_updates=list(RUNTIME_UPDATES)))
-            write(own/'review.json',review);state['strategies'][i]=review['strategy']
+            write(own/'review.json',review)
+            if 'strategies_by_race' in state:state['strategies_by_race'][races[i]]=review['strategy']
+            else:state['strategies'][i]=review['strategy']
             state['matches'][-1].setdefault('reviews',{})[str(i+1)]=dict(category=review['category'],path=str(own/'review.json'))
             print('DUEL_REVIEW',i+1,review['category'],review['reason'],flush=True)
         except Exception as e:
             state['matches'][-1].setdefault('review_errors',{})[str(i+1)]=type(e).__name__+': '+str(e)
         write(folder/'series.json',state)
-    state.update(state='finished' if number==3 else 'paused_after_match',budget=budget.report())
+    state.update(state='finished' if number==state['games'] else 'paused_after_match',budget=budget.report())
     assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest()==h for p,h in state['historical_campaign_hashes'].items())
     write(folder/'series.json',state)
     print('DUEL_MATCH_COMPLETE',json.dumps(dict(match=number,outcomes=match['outcomes'],termination=match['termination'],

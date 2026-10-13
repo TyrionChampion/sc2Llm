@@ -127,7 +127,7 @@ class GroundMap:
         path.reverse();self.cache[key]=path
         return path
 
-    def candidates(self, base, enemy, expansion, units):
+    def candidates(self, base, enemy, expansion, units,allow_threatened=False):
         path=self.route(base,enemy)
         initial=int(self.height[path[0][1],path[0][0]])
         ramp=next((i for i,p in enumerate(path[:45]) if int(self.height[p[1],p[0]])<initial-4),None)
@@ -141,7 +141,7 @@ class GroundMap:
         for i in range(desired,max(-1,desired-10),-1):
             x,y=path[i];p=(x+.5,y+.5)
             if any((u.is_building or u.mineral or u.geyser) and u.distance(p)<u.radius+1.5 for u in units):continue
-            if any(u.alliance==4 and (u.ground_dps>0 or u.air_dps>0) and u.distance(p)<max(9,u.attack_range+3) for u in units):continue
+            if not allow_threatened and any(u.alliance==4 and (u.ground_dps>0 or u.air_dps>0) and u.distance(p)<max(9,u.attack_range+3) for u in units):continue
             result.append(p)
         if not result:raise ValueError('defensive entrance blocked or threatened; no rally change issued')
         return kind,result,path[0]
@@ -151,7 +151,7 @@ def my_townhalls(world):
     return [u for u in world.my_units if u.type_id in TOWNHALLS and u.done and not u.flying]
 
 
-def named_rally_point(grid, backend, index, name, world):
+def named_rally_point(grid, backend, index, name, world,allow_threatened=False):
     """Resolve one named place to a concrete point, or raise ValueError.
 
     Single source of truth for the names the commander may pass to rally_units, so no
@@ -196,7 +196,8 @@ def named_rally_point(grid, backend, index, name, world):
         else:
             base = min(halls, key=lambda u: u.distance(home))
             expansion = True
-        kind, points, _ = grid.candidates(base.pos, enemy, expansion, world.units)
+        kind, points, _ = (grid.candidates(base.pos,enemy,expansion,world.units,allow_threatened=True)
+            if allow_threatened else grid.candidates(base.pos,enemy,expansion,world.units))
         if kind != name:
             raise ValueError('map topology reports ' + kind + ', not ' + name)
         return points[0], name

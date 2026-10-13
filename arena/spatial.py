@@ -124,7 +124,9 @@ def resolve_target(value, w, q):
         if value not in sites: raise ValueError('resource site no longer present in own observation: ' + value)
         return sites[value]
     from arena.rally import named_rally_point
-    point, _ = named_rally_point(q._rally_grid(), q.backend, q.index, value, w)
+    # Explicit movement/scouting may deliberately enter enemy pressure. Keep
+    # geography/occupancy checks, but don't inherit automatic production-rally safety.
+    point, _ = named_rally_point(q._rally_grid(), q.backend, q.index, value, w,allow_threatened=True)
     return point
 
 
@@ -408,16 +410,27 @@ class SpatialMission:
                 self.contacts=[dict(unit=NAMES.get(e.type_id,str(e.type_id)),pos=list(e.pos),game_s=round(w.seconds,2)) for e in contacts[:16]]
                 self.contact_omitted=max(0,len(contacts)-16)
                 q.event('scout_contact', task_id=t.id, contacts=self.contacts,
-                        omitted=self.contact_omitted, handling='mission stops; LLM decides attack/retreat/continue; no strategic takeover')
+                        omitted=self.contact_omitted,mission_stopped_on_contact=True,
+                        requested_goal=list(self.requested_route[self.step]),
+                        resolved_goal=list(self.route[self.step]),
+                        goal_arrived=all(u.distance(self.route[self.step])<=4 for u in units),
+                        confirmed_arrivals=list(self.arrivals),
+                        remaining_requested_route=[list(p) for p in self.requested_route[self.step:]],
+                        handling='mission stops; contact alone does not confirm target arrival; LLM decides attack/retreat/continue; no strategic takeover')
                 self.finish(w,q,t,out,'completed','visible enemy contact reported; awaiting model decision',stop=True); return
         point = self.route[self.step]
         exact_arrival=all(u.distance(point)<=4 for u in units)
         center=tuple(sum(getattr(u,k) for u in units)/len(units) for k in ('x','y'))
         # A move squad can settle around a crowded local destination. Require the
         # whole formation nearby, its center inside the original arrival radius,
-        # and every outer member idle. Never extend attack/scout arrival or treat
-        # distant, engaged, or still-moving outer members as having arrived.
-        settled_formation=(self.skill=='order_units' and self.args.get('mode')=='move'
+        # and every outer member idle. An attack-move formation may also settle
+        # after native orders end, but never while moving/engaged or in range of
+        # a visible attackable target. Arrival is not victory or area clearance.
+        attack_settled=(self.args.get('mode')=='attack_move'
+            and all(not u.orders and not u.engaged_target for u in units)
+            and not any(u.can_attack(e) and u.distance(e)<=u.attack_range+u.radius+e.radius+.1
+                for u in units for e in w.enemy_units))
+        settled_formation=(self.skill=='order_units' and (self.args.get('mode')=='move' or attack_settled)
             and len(units)>1 and math.dist(center,point)<=4
             and all(u.distance(point)<=4 or (not u.orders and not u.engaged_target
                     and u.distance(point)<=6+u.radius) for u in units))
@@ -426,7 +439,7 @@ class SpatialMission:
             if not exact_arrival:
                 row['settled_formation']=dict(observed_center=list(center),units=len(units),
                     max_center_distance=max(u.distance(point) for u in units),
-                    scope='Explicit move only; outer members idle within local approach plus own radius')
+                    scope='Local formation arrival; outer members idle within approach plus own radius. Attack-move requires all idle/unengaged and no visible attackable target in range. Not victory/area clearance.')
             self.arrivals.append(row)
             q.event('spatial_arrival', task_id=t.id, skill=self.skill, observation=row)
             self.step += 1; self.issued = False

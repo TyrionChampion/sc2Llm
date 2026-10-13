@@ -79,7 +79,7 @@ def revalidate(plan, before, w, tasks, home, age, max_age=70):
                 reason='visible enemy information changed'
             elif any(u.distance(old.by_tag(u.tag))>8 for u in w.enemy_units):
                 reason='visible enemy positions changed materially'
-            elif spec['kind']=='orbital':reason='late orbital energy/scan decision requires fresh observation'
+            elif spec['kind'] in ('orbital','inject_larva'):reason='late energy/ability decision requires fresh observation'
             elif spec['kind']=='form':reason='late unit transformation requires a fresh tactical decision'
             elif spec['kind']=='gas':
                 if {u.tag for u in old.my_units if u.type_id in GAS_BUILDINGS}!={u.tag for u in w.my_units if u.type_id in GAS_BUILDINGS}:
@@ -222,6 +222,8 @@ def output_schema(payload):
             task(['morph_unit'],obj({'unit':{'type':'string','enum':tree['forms']},'target':{'type':'string','enum':['home','rally','enemy_start','nearest_enemy']}},['unit']),training=True),
             task(['gather_gas'],obj({'workers_per_refinery':{'type':'integer','minimum':0,'maximum':3}},['workers_per_refinery'])),
             task(['expand'],obj({'base':{'type':'string'}}))]
+        if tree.get('race')=='zerg':
+            variants.append(task(['inject_larva'],obj({'base':{'type':'string'}},['base'])))
         from arena.economy import plan_schema
         macro_branch=task(['macro_plan'],plan_schema([e['name'] for e in tree['units']+tree['structures']]))
         macro_branch['required'].append('args')

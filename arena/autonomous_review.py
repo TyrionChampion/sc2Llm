@@ -13,7 +13,8 @@ from arena.go_planner import GoPlanner, GO_MODEL, GO_MODELS
 
 REVIEW_RULES = '''你是战后复盘员。用户要求自主迭代至击败easy然后hard bot。
 必须检查真实时间线、完整错误事件、生产确认、损失、进攻与投降情况，而非只看输赢。
-combat_summary中的our_deaths_observed和enemy_deaths_observed是实际阵亡记录；
+combat_summary中的our_deaths_observed和enemy_deaths_observed是原生移除事件，可能包括正常孵化、变异、取消，不能一概当被敌击杀。
+*_production_intermediates_removed是其中幼虫/虫卵/茧的子集，不是额外阵亡；其消失不能证明被击杀，需核对出生/生产/伤害证据。
 enemy_left_vision只是离开视野，不是阵亡。不得忽略这些统计而声称没有损失。
 科技实验室研究与母建筑训练可并行；研究不是停产理由。维京/医疗艇无需科技实验室。
 女妖/幽灵隐身需要探测；维京是对空火力而非探测器，轨道扫描或渡鸦可提供探测。
@@ -52,6 +53,8 @@ time_budget不是战场败势；检查runtime_timing的墙钟/速度，Slower下
 scout外层count固定1，人数必须在args.count；args必填unit/count/reason/targets。
 合法示例：{"skill":"scout","count":1,"args":{"unit":"marine","count":1,"reason":"侦察","targets":["enemy_start"]}}。
 unit/count/reason不能省略或搬到任务顶层。targets可为named place或[x,y]的列表；
+scout遇到可见敌军即停止，接触不证明到达目标；反复同路线可能只见同一哨兵。
+检查实际arrivals/contacts；继续前进可由模型显式下order_units move或选择另一条侦察路线。
 全图矿区搜索使用整个字符串targets:"expansion_sites"，
 禁止targets:["expansion_sites"]。order_units才使用单个args.target。
 混编可用order_units args.unit="army"选择战斗单位，整数count表示等待足够的自由战斗单位；
@@ -85,7 +88,8 @@ def compact_review_evidence(diagnostics, selected):
     windows=diagnostics.get('engagement_windows',[])
     if windows:
         summary={}
-        for field in ('our_deaths_observed','enemy_deaths_observed','enemy_left_vision','enemy_entered_vision'):
+        for field in ('our_deaths_observed','enemy_deaths_observed','enemy_left_vision','enemy_entered_vision',
+                      'our_production_intermediates_removed','enemy_production_intermediates_removed'):
             totals={}
             for window in windows:
                 for name,count in window.get(field,{}).items():totals[name]=totals.get(name,0)+count

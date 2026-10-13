@@ -32,7 +32,7 @@ def battle_output_schema(payload):
                'research', 'gather_gas', 'expand', 'gather', 'attack_nearest',
                'move_out', 'no_op', 'defend_base', 'cancel_task', 'scout',
                'order_units', 'cancel_unit_order', 'surrender', 'macro_plan',
-               'cancel_expansion', 'morph_unit', 'rally_units', 'scan', 'call_mule', 'supply_drop'}
+               'cancel_expansion', 'morph_unit', 'rally_units', 'scan', 'call_mule', 'supply_drop','inject_larva'}
     variants = []
     for branch in known['properties']['tasks']['items']['anyOf']:
         names = [name for name in branch['properties']['skill']['enum'] if name in allowed]

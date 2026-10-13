@@ -6,10 +6,13 @@ from arena.raw_engine import command,GATHER,ATTACK,MOVE
 from arena.tech_tree import WORKERS,TOWNHALLS,GAS_BUILDINGS,RACE_INFO,ADDONS
 
 MACROS={'train_worker','train_unit','build_structure','research','morph_unit','build_supply',
-        'gather_gas','supply_depot','barracks','expand'} | set(ORBITAL_ABILITIES)
+        'gather_gas','supply_depot','barracks','expand','inject_larva'} | set(ORBITAL_ABILITIES)
 
 def specification(tree,race,skill,args):
     if not isinstance(args,dict):raise ValueError('macro args must be an object')
+    if skill=='inject_larva':
+        from arena.queen import specification as inject_specification
+        return inject_specification(tree,race,args)
     if skill in ORBITAL_ABILITIES:return orbital_specification(tree,race,skill,args)
     allowed={'train_unit':{'unit'},'build_structure':{'structure','base'},'research':{'upgrade'},
              'morph_unit':{'unit','target'},'gather_gas':{'workers_per_refinery'},'expand':{'base'}}.get(skill,set())
@@ -48,6 +51,7 @@ def intent_key(spec):
         # Scan accepts an explicit [x, y]; the dedup key must stay hashable/comparable.
         return tuple(target) if isinstance(target,(list,tuple)) else target
     if spec['kind']=='orbital':return ('orbital',spec['name'],hashable(spec['target']))
+    if spec['kind']=='inject_larva':return ('inject_larva',spec['base'])
     if spec['kind']=='gas':return ('gas',spec['per_refinery'])
     return (spec['kind'],spec['entry']['id'],spec.get('base','home'),spec.get('target','home'))
 
@@ -112,6 +116,14 @@ class MacroRun:
                     for u in w.my(self.spec.get('entry',{}).get('id'))
                     if self.spec['kind']!='research' and u.tag not in (self.baseline or set())],
                 observed_dead_tags=list(w.dead_units),
+                observed_own_eggs=[dict(tag=u.tag,position=list(u.pos),orders=list(u.orders)) for u in w.my(103)],
+                observed_requested_actors=[dict(tag=tag,type_id=u.type_id if u else None,
+                    position=list(u.pos) if u else None,orders=list(u.orders) if u else [])
+                    for tag in sorted(self.tags) for u in [w.by_tag(tag)]],
+                pending_actor_claims=[dict(task_id=other.id,product=other.program.spec.get('entry',{}).get('name'),
+                    tags=list(p['tags']),ability=p['ability'],seen=p['seen'])
+                    for other in q.tasks if other.active and isinstance(other.program,MacroRun)
+                    for p in other.program.pending],
                 source='current own observation; no unseen spawn or completion inferred')
         q.event('macro_failed',task_id=t.id,skill=t.skill,error=reason,operation=self.summary(),
                 observation_evidence=evidence)
@@ -253,6 +265,29 @@ class MacroRun:
         for p in self.pending:
             actors=[w.by_tag(tag) for tag in p['tags']]
             order=any(a and any(tree.canonical_ability(x)==tree.canonical_ability(p['ability']) for x in a.orders) for a in actors)
+            if p.get('larva_purchase') and not order:
+                # Native larva purchases can select a DIFFERENT larva, even at
+                # another owned base. Bind only a newly observed own egg with this product's
+                # actual order, never an arbitrary larva disappearance or egg count.
+                claimed=set()
+                for task in q.tasks:
+                    if not task.active or not isinstance(task.program,MacroRun):continue
+                    for pending in task.program.pending:
+                        for tag in pending['tags']:
+                            egg=w.by_tag(tag)
+                            if egg is not None and egg.type_id==103 and any(
+                                tree.canonical_ability(a)==tree.canonical_ability(pending['ability']) for a in egg.orders):
+                                claimed.add(tag)
+                eggs=[u for u in w.my(103) if u.tag not in p['eggs_before'] and u.tag not in claimed and any(
+                        tree.canonical_ability(a)==tree.canonical_ability(p['ability']) for a in u.orders)]
+                if eggs:
+                    egg=min(eggs,key=lambda u:u.distance(p['producer_pos']))
+                    q.event('macro_larva_egg_observed',task_id=t.id,product=entry['name'],
+                        requested_producer_tags=p['tags'],observed_egg_tag=egg.tag,
+                        ability_id=p['ability'],requested_producer_pos=p['producer_pos'],observed_egg_pos=egg.pos,
+                        association='new unclaimed own egg with matching product order; native action may choose another base; original larva identity not assumed',
+                        execution='production in progress; completion still requires the requested product')
+                    p['tags']=[egg.tag];actors=[egg];order=True
             transformed=any(a and a.type_id==product for a in actors) if kind!='research' else False
             building=next((u for u in w.my(product) if p.get('pos') and u.distance(p['pos'])<2 and u.tag not in (self.baseline or set())),None) if kind!='research' else None
             if order or transformed or building:p['seen']=True
@@ -320,6 +355,16 @@ class MacroRun:
             producer=r['producer'];actor_types=r.get('actor_types',[producer]);required=r.get('required_upgrade')
             if required and required not in w.upgrades:hints.append('need upgrade '+tree.upgrade_names[required]);continue
             actors=[u for u in w.my_units if u.type_id in actor_types and u.done and u.tag not in used and u.tag not in (q.protected()-self.tags)]
+            if kind=='production' and entry.get('structure') and product in TOWNHALLS and producer in TOWNHALLS:
+                base=self.spec.get('base','home');home=q.backend.homes[q.index]
+                if base=='home':actors=[u for u in actors if u.distance(home)<15]
+                elif base=='expansion':actors=[u for u in actors if u.distance(home)>=15]
+                else:
+                    from arena.spatial import resource_sites
+                    point=resource_sites(w).get(base)
+                    actors=[u for u in actors if point is not None and u.distance(point)<15]
+                if not actors:
+                    hints.append('need eligible '+tree.names[producer]+' at requested base '+base);continue
             actors=[u for u in actors if u.type_id in WORKERS or not u.orders]
             if producer in WORKERS:
                 gas_tags={u.tag for u in w.my_units if u.gas_building}
@@ -420,6 +465,8 @@ class MacroRun:
                 # Retain the reservation until a real spawned unit/order is observed.
                 ack_timeout_s=30 if producer==133 else 8,
                 warp_in=producer==133,
+                **(dict(larva_purchase=True,producer_pos=actor.pos,
+                    eggs_before=[u.tag for u in w.my(103)]) if producer==151 else {}),
                 consumes_actor=r.get('consumes_actor',False),scv_build=producer==45 and entry.get('structure',False)))
             bank-=minerals;q.gas_bank-=gas;q.supply_bank-=supply;t.spot=pos;t.sent=w.seconds
             q.event('macro_order_issued',task_id=t.id,skill=t.skill,product=entry['name'],producer_tags=tags,
