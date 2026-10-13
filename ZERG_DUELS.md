@@ -169,4 +169,5 @@ Commander输入包含真实己方女王能量及基地buff，JSON任务被接受
 本轮243项完整相关回归通过：`logs/zerg-complete-regressions.log`；末局入口修复的
 相关回归另68项通过、2项既有跳过：`logs/zerg-contested-landmark-regressions.log`。
 最终合并全部相关检查共269项：267通过、2项既有跳过，
-记录在 `logs/zerg-final-all-checks.log`。不存在真实模型测试请求，旧账本哈希未变。
+记录在 `logs/zerg-final-all-checks.log`。上述回归和执行器阳性验收未额外发送真实模型请求；
+四局真实DeepSeek对战及复盘仍按195次尝试计数，旧账本哈希未变。
