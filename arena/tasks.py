@@ -285,8 +285,8 @@ class TaskQueue:
             elif skill=='cancel_unit_order':
                 task_id=args.get('task_id')
                 target=next((t for t in self.tasks if t.id==task_id),None)
-                if set(args)!={'task_id'} or type(task_id) is not int or not target or not target.active or target.skill not in ('scout','order_units'):
-                    invalid(field+'.args',args,'task_id of an active scout/order_units mission owned by this player')
+                if set(args)!={'task_id'} or type(task_id) is not int or not target or target.skill not in ('scout','order_units'):
+                    invalid(field+'.args',args,'task_id of a known scout/order_units mission owned by this player')
                 else:cancellations.add(task_id)
             elif skill=='defend_base':
                 try:args=self._validate_defend_args(args)
@@ -306,10 +306,10 @@ class TaskQueue:
             elif skill=='cancel_task':
                 task_id=args.get('task_id')
                 target=next((t for t in self.tasks if t.id==task_id),None)
-                if set(args)!={'task_id'} or type(task_id) is not int or not target or not target.active \
+                if set(args)!={'task_id'} or type(task_id) is not int or not target \
                         or target.skill not in ('defend_base','scout','order_units'):
                     invalid(field+'.args',args,
-                            'task_id of an active defend_base/scout/order_units mission owned by this player')
+                            'task_id of a known defend_base/scout/order_units mission owned by this player')
                 else:cancellations.add(task_id)
             elif skill in ('scout','order_units'):
                 try:args=spatial_args(skill,args,self.backend.size)
@@ -358,6 +358,11 @@ class TaskQueue:
         if len((remaining|incoming)&python_names)>4: raise ValueError('at most 4 active Python tactics per player')
         for t in self.tasks:
             if t.id in cancellations:
+                if not t.active:
+                    self.event('task_cancel_noop',task_id=t.id,skill=t.skill,state=t.status,
+                               reason='Owned mission already ended; no stop order or state rewrite',
+                               request_id=request_id)
+                    continue
                 if t.skill in python_names or t.skill in ('scout','order_units','defend_base'):
                     self.pending_stops.append(t)
                     self.update(t,'cancelled',

@@ -51,7 +51,7 @@ def intent_key(spec):
     if spec['kind']=='gas':return ('gas',spec['per_refinery'])
     return (spec['kind'],spec['entry']['id'],spec.get('base','home'),spec.get('target','home'))
 
-def expansion_clusters(w):
+def mineral_groups(w):
     patches=[u for u in w.units if u.mineral]
     groups=[];remaining=set(u.tag for u in patches);bytag={u.tag:u for u in patches}
     while remaining:
@@ -59,9 +59,29 @@ def expansion_clusters(w):
         while front:
             tag=front.pop();neighbors=[t for t in remaining if bytag[t].distance(bytag[tag])<8]
             for t in neighbors:remaining.remove(t);front.append(t);group.append(bytag[t])
-        if len(group)>=4:groups.append(group)
+        if group:groups.append(group)
     groups.sort(key=lambda group:(round(sum(u.x for u in group)/len(group),1),round(sum(u.y for u in group)/len(group),1)))
-    return [('site_'+str(min(u.tag for u in group)),group) for group in groups]  # Never reuse another cluster's ordinal after mineral depletion.
+    return groups
+
+def remember_resource_sites(w,history=()):
+    """Keep player-observed site identities across neutral tag changes/depletion."""
+    records=[(name,set(points)) for name,points in history]
+    for group in mineral_groups(w):
+        positions={u.pos for u in group}
+        match=next((points for _,points in records if points & positions),None)
+        if match is not None:match.update(positions)
+        elif len(group)>=4:records.append(('site_'+str(min(u.tag for u in group)),positions))
+    return tuple((name,tuple(sorted(points))) for name,points in records)
+
+def expansion_clusters(w):
+    history=getattr(w,'resource_site_memory',())
+    result=[]
+    for group in mineral_groups(w):
+        positions={u.pos for u in group}
+        name=next((name for name,points in history if positions.intersection(points)),None)
+        if name is not None or len(group)>=4:
+            result.append((name or 'site_'+str(min(u.tag for u in group)),group))
+    return result
 
 def site_summary(w,home):
     result=[]
@@ -77,12 +97,24 @@ class MacroRun:
         self.spec=deepcopy(spec);self.args=deepcopy(args);self.tags=set();self.pending=[]
         self.issued=0;self.born=set();self.baseline=None;self.next_at=0;self.last_issue=0
         self.gas_before=None;self.gas_tags=set();self.research_unconfirmed_since=None;self.failure=None;self.retries=0;self.relocation=None;self.relocations=0
+        self.placement_feedback=None
     def close(self):self.tags.clear()
     def summary(self):
-        return dict(kind='macro',operation=self.spec['kind'],product=self.spec.get('entry',{}).get('name'),
+        result=dict(kind='macro',operation=self.spec['kind'],product=self.spec.get('entry',{}).get('name'),
                     args=self.args,unit_tags=sorted(self.tags),issued_quantity=self.issued,observed_completed=len(self.born),relocation=self.relocation)
-    def fail(self,q,t,reason):
-        q.event('macro_failed',task_id=t.id,skill=t.skill,error=reason,operation=self.summary())
+        if self.placement_feedback:result['placement_feedback']=self.placement_feedback
+        return result
+    def fail(self,q,t,reason,w=None):
+        evidence={}
+        if w is not None:
+            evidence=dict(game_s=w.seconds,pending_orders=deepcopy(self.pending),
+                observed_new_products=[dict(tag=u.tag,position=list(u.pos),progress=u.progress)
+                    for u in w.my(self.spec.get('entry',{}).get('id'))
+                    if self.spec['kind']!='research' and u.tag not in (self.baseline or set())],
+                observed_dead_tags=list(w.dead_units),
+                source='current own observation; no unseen spawn or completion inferred')
+        q.event('macro_failed',task_id=t.id,skill=t.skill,error=reason,operation=self.summary(),
+                observation_evidence=evidence)
         q.update(t,'failed',reason)
     def _landmark(self,w,q,name):
         home=q.backend.homes[q.index]
@@ -120,6 +152,12 @@ class MacroRun:
                     point=(math.floor(anchor[0]+radius*math.cos(theta))+offset,math.floor(anchor[1]+radius*math.sin(theta))+offset)
                     if not all(2<=point[k]<q.backend.size[k]-2 for k in (0,1)):continue
                     if any(u.is_building and u.distance(point)<max(2,size+u.radius+.75) for u in w.units):continue
+                    if recipe.get('producer')==133:
+                        # Placement queries permit colliding warp points. Each pending
+                        # warp needs its own footprint, including this task's prior casts.
+                        if any(u.distance(point)<size+u.radius+.25 for u in w.units if not u.is_building):continue
+                        if any(p.get('warp_in') and p.get('pos') and math.dist(point,p['pos'])<2
+                               for p in self.pending):continue
                     if any(u.mineral and u.distance(point)<(6 if product in TOWNHALLS else size+1.5) for u in w.units):continue
                     if any(other is not t and other.active and other.spot and math.dist(point,other.spot)<6 for other in q.tasks):continue
                     if point in t.excluded:continue
@@ -145,7 +183,7 @@ class MacroRun:
         return bank
     def tick(self,w,q,t,used,bank,out):
         try:return self._tick(w,q,t,used,bank,out)
-        except Exception as e:self.fail(q,t,type(e).__name__+': '+str(e));return bank
+        except Exception as e:self.fail(q,t,type(e).__name__+': '+str(e),w);return bank
     def _tick(self,w,q,t,used,bank,out):
         if w.seconds-t.created>900:raise TimeoutError('macro 900 game-second deadline exceeded')
         if self.spec['kind']=='gas':return self._gas(w,q,t,used,bank,out)
@@ -218,7 +256,9 @@ class MacroRun:
             transformed=any(a and a.type_id==product for a in actors) if kind!='research' else False
             building=next((u for u in w.my(product) if p.get('pos') and u.distance(p['pos'])<2 and u.tag not in (self.baseline or set())),None) if kind!='research' else None
             if order or transformed or building:p['seen']=True
-            if not p['seen'] and w.seconds-p['sent']>8:raise RuntimeError('macro order was not observed within 8 seconds; no success assumed')
+            grace=p.get('ack_timeout_s',8)
+            if not p['seen'] and w.seconds-p['sent']>grace:
+                raise RuntimeError('macro order was not observed within %s seconds; no success assumed'%grace)
             if p['seen'] and not order and not (building and not building.done and p.get('scv_build')):
                 if not transformed and any(a is None for a in actors) and not p.get('consumes_actor'):raise RuntimeError('macro producer died before observed completion')
                 if kind=='research':self.research_unconfirmed_since=w.seconds
@@ -288,7 +328,10 @@ class MacroRun:
             if len(actors)<r.get('actor_count',1):hints.append('need idle '+tree.names[producer]);continue
             minerals=entry.get('minerals',r.get('minerals',0));gas=entry.get('gas',r.get('gas',0));supply=r.get('supply',0)
             if bank<minerals or q.gas_bank<gas or (supply>0 and q.supply_bank<supply):
-                hints.append('need %d minerals/%d gas/%.1f free supply'%(minerals,gas,supply));continue
+                deficits=[('%s required %g, available %g'%(name,need,have))
+                    for name,need,have in (('minerals',minerals,bank),('gas',gas,q.gas_bank),
+                                          ('free supply',supply,q.supply_bank)) if need>0 and have<need]
+                hints.append('resource shortage: '+'; '.join(deficits));continue
             available=q.backend.available_abilities(q.index,[u.tag for u in actors])
             legal=[u for u in actors if tree.ability_available(r['ability'],available.get(u.tag,set()))]
             if kind=='production' and not entry.get('structure') and not r.get('requires_techlab'):
@@ -355,7 +398,15 @@ class MacroRun:
                 candidates=self._positions(w,q,t,actor,r)
                 if not candidates:hints.append('no candidate sites; need vision, power/creep or another expansion');continue
                 pos=(q.backend.placement_with_addon(q.index,r['ability'],actor.tag,candidates) if product in (21,27,28) else q.backend.placement(q.index,r['ability'],actor.tag,candidates))
-                if pos is None:hints.append('engine rejected placement candidates; check creep/power/terrain/visibility');continue
+                if pos is None:
+                    evidence=getattr(q.backend,'placement_evidence',None)
+                    self.placement_feedback=(evidence(q.index,r['ability'])
+                        if callable(evidence) and product not in (21,27,28) else None)
+                    if self.placement_feedback and self.placement_feedback.get('failure_counts'):
+                        hints.append('engine rejected placement: '+', '.join(self.placement_feedback['failure_counts']))
+                    else:hints.append('engine rejected placement candidates; check creep/power/terrain/visibility')
+                    continue
+                self.placement_feedback=None
                 if producer in WORKERS:chosen=[min(legal,key=lambda u:u.distance(pos))];actor=chosen[0]
             if r.get('actor_count',1)==2:
                 q.event('multi_actor_ability_check',task_id=t.id,product=entry['name'],method='eligible owned pair; individual query cannot represent merge; raw engine result and new unit will confirm')
@@ -365,6 +416,10 @@ class MacroRun:
             q.issue(t,action,out);used.update(tags);self.tags.update(tags)
             amount=r.get('quantity',1);self.issued+=amount;self.last_issue=w.seconds
             self.pending.append(dict(tags=tags,ability=r['ability'],sent=w.seconds,seen=False,pos=pos,quantity=amount,
+                # A slow-power warp may take >8s and expose no order on the gate.
+                # Retain the reservation until a real spawned unit/order is observed.
+                ack_timeout_s=30 if producer==133 else 8,
+                warp_in=producer==133,
                 consumes_actor=r.get('consumes_actor',False),scv_build=producer==45 and entry.get('structure',False)))
             bank-=minerals;q.gas_bank-=gas;q.supply_bank-=supply;t.spot=pos;t.sent=w.seconds
             q.event('macro_order_issued',task_id=t.id,skill=t.skill,product=entry['name'],producer_tags=tags,

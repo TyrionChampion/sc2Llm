@@ -65,7 +65,11 @@ def producer_inventory(backend, world, index):
         label = '%s#%d' % (kind, counters[kind])
         labels[unit_.tag] = label
         records.append(dict(label=label, kind=kind, tag=unit_.tag, type_id=unit_.type_id,
-                            pos=[round(unit_.x, 1), round(unit_.y, 1)]))
+                            pos=[round(unit_.x, 1), round(unit_.y, 1)],
+                            rally_targets=[[round(x, 1), round(y, 1), tag]
+                                           for x, y, tag in unit_.rally_targets]))
+        from arena.tactical_facts import point_rally_routes
+        records[-1]['point_rally_routes']=point_rally_routes(backend,world,index,unit_)
     return records, labels
 
 

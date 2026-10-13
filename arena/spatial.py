@@ -32,7 +32,8 @@ approach within 6 tiles when the exact point is blocked; requested/actual points
 Missing points or no reachable local approach fail visibly, never substitute enemy_start.
 order_units finishes on observed
 arrival (not victory), may be interrupted by combat. Cancel an active scout/order_units
-with cancel_unit_order args={task_id:ID}; then dispatch a new task. Read active_tasks,
+with cancel_unit_order args={task_id:ID}; then dispatch a new task. A known owned mission
+that already ended is a reported no-op, with no stop/state rewrite; unknown IDs are rejected. Read active_tasks,
 spatial_reports (last 8 terminal missions, independent of feedback pagination) and
 spatial mission feedback. Coordinates are allowed for these spatial tasks, scan and rallies;
 never invent enemy unit tags. This contract does not change Python/JSON skill target enums.
@@ -109,8 +110,11 @@ def validate_args(skill, args, size):
 
 def resource_sites(w):
     from arena.macro import expansion_clusters
-    return {name: (sum(u.x for u in group) / len(group), sum(u.y for u in group) / len(group))
-            for name, group in expansion_clusters(w)}
+    memory=getattr(w,'resource_site_memory',())
+    return ({name:(sum(p[0] for p in points)/len(points),sum(p[1] for p in points)/len(points))
+             for name,points in memory} if memory else
+            {name: (sum(u.x for u in group) / len(group), sum(u.y for u in group) / len(group))
+             for name, group in expansion_clusters(w)})
 
 
 def resolve_target(value, w, q):
@@ -177,10 +181,22 @@ class Battlefield:
         self.evicted_observations = 0
         self.site_key=None
         self.site_positions={}
+        self.previous_health = {}
+        self.recent_damage = []
+        self.terrain_grid = None
+        self.terrain_checked = False
 
     def update(self, w):
         if w.game_loop <= self.last_loop: return
         self.last_loop = w.game_loop
+        for u in w.my_units:
+            previous = self.previous_health.get(u.tag)
+            if previous and previous[0] == u.type_id and previous[1] > u.health:
+                self.recent_damage.append(dict(tag=u.tag, unit=NAMES.get(u.type_id, str(u.type_id)),
+                    pos=[round(u.x, 1), round(u.y, 1)], game_s=round(w.seconds, 2),
+                    health_lost=round(previous[1]-u.health, 2)))
+        self.previous_health = {u.tag: (u.type_id, u.health) for u in w.my_units}
+        self.recent_damage = [d for d in self.recent_damage if w.seconds-d['game_s'] <= 30][-16:]
         # Clustering is quadratic in mineral count. Coordinates change only when
         # the actual observed resource set changes; visibility still updates each frame.
         site_key=tuple(sorted((u.tag,u.x,u.y) for u in w.units if u.mineral))
@@ -201,6 +217,53 @@ class Battlefield:
         if len(self.last_seen)>1024:
             self.evicted_observations += len(self.last_seen)-1024
             self.last_seen = dict(sorted(self.last_seen.items(),key=lambda item:item[1],reverse=True)[:1024])
+
+    def terrain_public(self, w):
+        """Static nearby elevation and own damage; never locate an unseen attacker."""
+        if not self.terrain_checked:
+            self.terrain_checked = True
+            self.terrain_grid = getattr(self.backend, 'grid', None)
+            if self.terrain_grid is None:
+                infos = getattr(self.backend, 'map_info_by_player', None)
+                if infos:
+                    try:
+                        from arena.rally import GroundMap
+                        self.terrain_grid = GroundMap(infos[self.index].start_raw)
+                    except (ValueError, AttributeError, TypeError, IndexError):
+                        pass
+        grid = self.terrain_grid
+        facts = dict(available=grid is not None, recent_own_damage=list(self.recent_damage),
+                     nearby_higher_ground=[], combat_contacts=[])
+        if grid is None:
+            return facts
+        from arena.tactical_facts import combat_contacts
+        facts['combat_contacts']=combat_contacts(w,grid,self.recent_damage)
+        # Bounded samples around own combat locations, with no enemy query or recommendation.
+        anchors = {}
+        for u in w.my_units:
+            if not u.flying and not u.is_building and u.ground_dps > 0:
+                anchors.setdefault((int(u.x//8), int(u.y//8)), u.pos)
+        candidates = {}
+        for pos in list(anchors.values())[:16]:
+            x, y = map(int, pos)
+            if not (0 <= x < grid.w and 0 <= y < grid.h):
+                continue
+            height = int(grid.height[y, x])
+            for radius in (4, 8, 12):
+                for dx, dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)):
+                    a, b = x+dx*radius, y+dy*radius
+                    if not grid.free(a, b) or int(grid.height[b, a]) <= height+4:
+                        continue
+                    visibility = (int(w.visibility[b, a]) if w.visibility is not None
+                                  and b < w.visibility.shape[0] and a < w.visibility.shape[1] else None)
+                    candidates.setdefault((a//8, b//8), dict(pos=[a+.5, b+.5],
+                        height=int(grid.height[b, a]), own_reference_pos=list(pos),
+                        own_reference_height=height, visibility=visibility))
+        facts['nearby_higher_ground'] = list(candidates.values())[:12]
+        facts['meaning'] = ('Static height samples near own ground combat units; higher is relative, '
+            'not proof of an attacker. visibility: 0 unexplored, 1 fog, 2 currently visible, null unavailable. '
+            'Health loss does not identify its cause. Samples are incomplete, not full terrain coverage.')
+        return facts
 
     def public(self, w):
         self.update(w)
@@ -231,6 +294,7 @@ class Battlefield:
             regions=regions[:256], region_format=['x','y','currently_visible_fraction','ever_seen_fraction','last_fully_visible_game_s'],
             region_radius=6,
             visibility_available=w.visibility is not None,
+            terrain_context=self.terrain_public(w),
             evicted_observation_records=self.evicted_observations,
             own_unit_groups=groups[:64], omitted_unit_groups=max(0,len(groups)-64),
             unit_selectors=sorted(selectors()),

@@ -8,6 +8,7 @@ import math
 import time
 from pathlib import Path
 from collections import Counter
+from copy import deepcopy
 from pysc2.env import sc2_env
 from pysc2.lib import features
 from s2clientprotocol import sc2api_pb2 as pb, query_pb2 as query
@@ -107,6 +108,7 @@ class Snapshot:
     upgrade_names: tuple = ()
     effects: tuple = ()  # (effect_id, alliance, x, y, radius), current own observation only
     visibility: object = field(default=None, compare=False, repr=False)  # own raw map_state, 0 hidden/1 fog/2 visible
+    resource_site_memory: tuple = ()  # locations already observed by this player, never enemy state
 
     @property
     def seconds(self): return self.game_loop / LOOPS_PER_SECOND
@@ -270,6 +272,14 @@ class RawArena:
                                    effects=tuple((e.effect_id,e.alliance,pos.x,pos.y,e.radius) for e in o.raw_data.effects for pos in e.pos),
                                    visibility=features.Feature.unpack_layer(o.raw_data.map_state.visibility),
                                    upgrade_names=tuple(self.tech_tree.upgrade_names.get(uid,str(uid)) for uid in o.raw_data.player.upgrade_ids)))
+        from arena.macro import remember_resource_sites
+        if not hasattr(self,'_resource_site_cache'):self._resource_site_cache={}
+        for i,w in enumerate(result):
+            key=tuple(sorted(u.pos for u in w.units if u.mineral))
+            previous=self._resource_site_cache.get(i,(None,()))
+            memory=previous[1] if key==previous[0] else remember_resource_sites(w,previous[1])
+            self._resource_site_cache[i]=(key,memory)
+            result[i]=replace(w,resource_site_memory=memory)
         return result
     def register_action_context(self,index,bindings):
         if not hasattr(self,'_action_bindings'): self._action_bindings={}
@@ -380,7 +390,22 @@ class RawArena:
             p.target_pos.x=x; p.target_pos.y=y
         results=self.controllers[index].query(q).placements
         if len(results)!=len(candidates): raise RuntimeError('incomplete placement query response')
-        return next((xy for xy,r in zip(candidates,results) if r.result==1),None)
+        accepted=next((xy for xy,r in zip(candidates,results) if r.result==1),None)
+        failures=Counter();samples=[]
+        for xy,r in zip(candidates,results):
+            if r.result==1:continue
+            try:name=error_pb2.ActionResult.Name(r.result)
+            except ValueError:name='UnknownPlacementResult_'+str(r.result)
+            failures[name]+=1
+            if len(samples)<3:samples.append(dict(pos=list(xy),result=name))
+        if not hasattr(self,'_placement_evidence'):self._placement_evidence={}
+        self._placement_evidence[(index,ability)]=dict(source='native placement query',
+            ability=ability,worker_tag=worker,candidate_count=len(candidates),failure_counts=dict(failures),
+            rejection_samples=samples,accepted=list(accepted) if accepted is not None else None)
+        return accepted
+
+    def placement_evidence(self,index,ability):
+        return deepcopy(getattr(self,'_placement_evidence',{}).get((index,ability)))
     def placement_with_addon(self,index,ability,worker,candidates):
         """Reserve a real 2x2 addon tile along with the production footprint.
         Addon abilities' placement queries use landing semantics in this engine;

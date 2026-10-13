@@ -187,7 +187,7 @@ def campaign_review_history(directory):
     return result
 
 
-def review_game(model, directory, budget, diagnostics, strategy, difficulty):
+def review_game(model, directory, budget, diagnostics, strategy, difficulty, review_context=None):
     client = (GoPlanner if model in GO_MODELS else ChatGPTSubscriptionPlanner)(model, directory)
     client.response_kind = 'review'
     # Go prefill + low-effort review can exceed a battle request's latency budget.
@@ -214,6 +214,8 @@ def review_game(model, directory, budget, diagnostics, strategy, difficulty):
                        'macro_plan','cancel_expansion','morph_unit','rally_units',
                        'scan','call_mule','supply_drop'],
                    constraints=budget.report())
+    if review_context is not None:
+        payload['review_context']=review_context
     context_limit=60000
     if model in GO_MODELS and getattr(client,'native_schema',False):
         from arena.chatgpt_planner import review_output_schema
@@ -240,6 +242,8 @@ def review_game(model, directory, budget, diagnostics, strategy, difficulty):
         budget.reserve('review')
         rules=REVIEW_RULES+'\ncolumns_rows_common_v1每行=common合并dict(zip(columns,row))；key_groups_v1先读groups，再按order的[group,row]取行。\nreview_object_pool_v1是无损共享编码：objects存放字典/数组/字符串，data为原始对象；遇到仅有$review_ref的对象时用objects[该整数]替换并递归还原其子项。所有原始观测、决策、任务变化仍保留，不能把引用理解为遗漏。直接查必要引用即可，无需逐项重写标签、坐标或展开整份JSON；集中检查真实产出、战损、非法计划、侦察与出击。'
         rules+='\nreview_key_table_v1无损共享字段名：keys为字段名表，data中每个对象的数字字符串键k表示keys[int(k)]；递归还原所有对象键，数组和值不变，再按上述共享对象/表格编码读取。没有删除观测或任务。'
+        if review_context is not None:
+            rules+='\n本次为LLM对LLM的跨种族实战，以review_context为准，不适用easy/hard升级目标。只看本方观察和执行证据，下一局仍使用本方种族；提出本族战术改进，并严格区分模型缺参数/选错任务与真实工具缺陷。'
         result = json.loads(client.chat(rules, text))
         if result.get('category') not in ('strategy','feature_gap','environment','win'):
             raise ValueError('Invalid review category')

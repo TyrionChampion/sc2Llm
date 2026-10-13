@@ -32,7 +32,7 @@ def main():
     parser.add_argument('--no-skill-library',action='store_true',help='explicitly disable persistent loading/saving for an isolated run')
     parser.add_argument('--skill-library-root',help='explicit persistent library directory; default skill-library/')
     parser.add_argument('--no-live-repair',action='store_true',help='explicitly disable background source repair')
-    parser.add_argument('--no-output-window',action='store_true',help='disable the separate read-only player output window')
+    parser.add_argument('--no-output-window',action='store_true',help='disable the separate player decision/chat window')
     parser.add_argument('--qualify',action='store_true',help='require actual Python dispatch and five consecutive real decisions <=22s before game')
     parser.add_argument('--prepare-only',action='store_true',help='author and validate files, no game')
     args=parser.parse_args()
@@ -141,7 +141,7 @@ def main():
             finally:viewer_log.close()
             time.sleep(.5)
             if viewer.poll() is not None:raise RuntimeError('Output window exited during startup; see '+str(root/'output-window.log'))
-            report['output_window']={'pid':viewer.pid,'log':str(root/'output-window.log'),'scope':'read-only public output viewer; closing it does not stop match'}
+            report['output_window']={'pid':viewer.pid,'log':str(root/'output-window.log'),'scope':'public output and per-player next-round advice; closing it does not stop match'}
             (root/'run.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
             print('[output window] launched; log='+str(root/'output-window.log'),flush=True)
         print('[opencode match] both preparations passed; opening two native player windows; realtime=True',flush=True)

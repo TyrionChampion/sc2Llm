@@ -139,8 +139,15 @@ Go 保持已验证的 `json_object` 格式；原生 `json_schema` 在实战被�
 - [AI_SKILL_MANUAL.md](AI_SKILL_MANUAL.md)：模型技能契约。
 - [SC2_GAME_KNOWLEDGE.md](SC2_GAME_KNOWLEDGE.md)：游戏知识和种族能力。
 - [SCENARIOS.md](SCENARIOS.md)：战场场景覆盖及现有缺口。
+- [TACTICAL_SCENARIOS.md](TACTICAL_SCENARIOS.md)：虫族三矿集结、人族高地扫描的工具观测/执行验收及独立 Go 决策实测。
 - [BATTLE_AGENT.md](BATTLE_AGENT.md)、[TACTICAL_CONTROL.md](TACTICAL_CONTROL.md)、
   [SPATIAL_CONTROL.md](SPATIAL_CONTROL.md)：战斗、战术和空间控制。
 - [THIRD_PARTY.md](THIRD_PARTY.md)：第三方源码、参考数据和许可证。
 
 `STATUS.md` 和 `HANDOFF.md` 保留开发记录，其中旧路径和验证日志位置为历史记录。
+
+双 DeepSeek Go 人族对神族三场实战、工具修复证据与回放记录见 [DUEL_TESTS.md](DUEL_TESTS.md)。
+
+战斗中可以在双方决策窗口下方给 P1/P2 输入建议。点击“发送”或按 Enter；Shift+Enter 换行，Ctrl+V 粘贴。建议随该玩家下一轮主指挥决策读取，公开回复显示在对话区和决策记录中。正在思考的请求不插入新内容，发送不增加模型调用或重置预算。
+
+Go 对局用 `./run_sc2.sh .venv/bin/python go_duel_series.py --output-window` 打开窗口；也可用 `./run_sc2.sh .venv/bin/python llm_output_window.py --run <当前对局目录>` 打开已有活动对局。说明及验收见 [BATTLE_CHAT.md](BATTLE_CHAT.md)。

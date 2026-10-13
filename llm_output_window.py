@@ -1,4 +1,4 @@
-"""Read-only native Chinese viewer for both players' public outputs and errors.
+"""Native Chinese viewer with next-round advice below each player's decisions.
 
 ./run_sc2.sh .venv311/bin/python llm_output_window.py --run opencode-runtime/match-...
 Closing this window never stops the game. No model calls or reasoning traces.
@@ -11,6 +11,8 @@ import subprocess
 import time
 import pygame
 from arena.lifecycle import read_match_status, match_status_label
+from arena.chat_input import ChatInput
+from arena.operator_advice import mailbox_path, read_status, submit_advice, MAX_TEXT
 
 BG='#0d1420';PANEL='#151f2e';CARD='#1c2a3c';TEXT='#e6edf7';MUTED='#9babc1'
 COLORS=['#72c9ff','#c6a1ff'];RED='#ff9498';GREEN='#85dfb4'
@@ -31,7 +33,7 @@ def game_time(value):
 
 class Feed:
     def __init__(self):
-        self.path=None;self.offset=0;self.entries=[];self.requests={};self.plans={};self.pending=None;self.error=''
+        self.path=None;self.offset=0;self.entries=[];self.requests={};self.plans={};self.pending=None;self.error='';self.advice_entries={}
     def poll(self,path):
         if self.path is None:self.path=Path(path)
         if self.path!=Path(path):raise ValueError('Player journal changed unexpectedly')
@@ -50,7 +52,18 @@ class Feed:
         except (OSError,ValueError) as error:self.error='无法读取日志：'+str(error)
     def consume(self,row):
         kind=row.get('record');rid=row.get('request_id')
-        if kind=='tactical_request_finished':
+        if kind=='operator_advice_queued':
+            m=row['message'];entry=dict(title='你给 P%d 的建议'%row['player'],body=m['text'],
+                raw=json.dumps(m,ensure_ascii=False),error=m['state'] in ('closed','rejected'),
+                status={'closed':'模型已停止，未确认送达','rejected':'建议队列已满'}.get(m['state'],'等待后续决策读取'))
+            self.entries.append(entry);self.advice_entries[m['id']]=entry
+        elif kind in ('operator_advice_sent','operator_advice_received','operator_advice_retry'):
+            label={'operator_advice_sent':'已加入第%s轮，等待回复'%rid,
+                'operator_advice_received':'模型已收到；采纳／执行情况见回复',
+                'operator_advice_retry':'请求失败，建议保留等待下一轮'}[kind]
+            for mid in row['ids']:
+                if mid in self.advice_entries:self.advice_entries[mid]['status']=label
+        elif kind=='tactical_request_finished':
             error=row.get('error');raw=row.get('response');body=''
             try:
                 plan=json.loads(raw) if raw else {}
@@ -179,13 +192,23 @@ class Window:
     def __init__(self,run):
         self.run=Path(run).resolve();self.feeds=[Feed(),Feed()];self.data=None;self.notice='等待对局数据…';self.offsets=[0,0]
         self.raw=False;self.only_errors=False;self.follow=True;self.buttons=[];self.last_poll=0
-        pygame.init();self.screen=pygame.display.set_mode((1320,840),pygame.RESIZABLE)
+        self.inputs=[ChatInput(),ChatInput()];self.focus=None;self.input_rects={}
+        self.chats=[[],[]];self.chat_status=[{},{}];self.chat_notices=['','']
+        pygame.init();self.screen=pygame.display.set_mode((1320,960),pygame.RESIZABLE)
+        pygame.key.stop_text_input()
         pygame.display.set_caption('星际 AI 对战 · 双方输出')
         result=subprocess.run(['fc-match',':lang=zh-cn','-f','%{file}'],capture_output=True,text=True,check=True)
-        path=result.stdout.strip()
-        if not Path(path).is_file():raise RuntimeError('未找到中文字体：'+path)
+        candidates=['/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+                    '/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc',result.stdout.strip()]
+        for path in candidates:
+            try:
+                font=pygame.font.Font(path,20)
+                if (all(x is not None for x in font.metrics('双方决策输出中文'))
+                        and pygame.image.tostring(font.render('中',True,'white'),'RGBA') !=
+                            pygame.image.tostring(font.render('文',True,'white'),'RGBA')):break
+            except (pygame.error,OSError):pass
+        else:raise RuntimeError('未找到支持中文的字体')
         self.fonts={n:pygame.font.Font(path,n) for n in (16,18,20,24,28)}
-        if not all(x is not None for x in self.fonts[20].metrics('双方决策输出中文')):raise RuntimeError('当前字体缺少中文字符：'+path)
         print('[output window] Chinese font='+path+'; run='+str(self.run),flush=True)
     def poll(self):
         now=time.monotonic()
@@ -198,7 +221,75 @@ class Window:
         except FileNotFoundError:self.notice='等待原生游戏启动，尚未产生对局数据…'
         except json.JSONDecodeError:self.notice='状态文件正在更新，暂时保留上次画面…'
         except (OSError,KeyError,TypeError,ValueError) as error:self.notice='读取对局状态失败：'+str(error)
+        for i,feed in enumerate(self.feeds):
+            if feed.path:
+                try:
+                    self.chat_status[i]=read_status(mailbox_path(feed.path))
+                    known={m['id']:m for m in self.chat_status[i]['messages']}
+                    local={m['id']:m for m in self.chats[i]}
+                    local.update(known)
+                    self.chats[i]=sorted(local.values(),key=lambda m:(m['submitted_at'],m['id']))[-32:]
+                    if self.chats[i] and self.chats[i][-1]['state']!='queued':self.chat_notices[i]=''
+                except (OSError,ValueError,KeyError,TypeError):
+                    self.chat_status[i]={}
         if self.follow:self.offsets=[0,0]
+
+    def send_advice(self,i):
+        if self.inputs[i].composition:return
+        try:
+            if not self.feeds[i].path:raise ValueError('等待该玩家的指挥进程启动')
+            m=submit_advice(mailbox_path(self.feeds[i].path),self.inputs[i].text,player=i+1)
+            self.chats[i].append(dict(m,state='queued',request_id=None))
+            self.inputs[i].clear();self.chat_notices[i]='已排队，将在下一轮决策发送'
+        except (OSError,ValueError,KeyError) as e:self.chat_notices[i]=str(e)
+
+    def focus_input(self,i):
+        if self.focus is not None:self.inputs[self.focus].composition=''
+        self.focus=i
+        if i is None:pygame.key.stop_text_input()
+        else:
+            pygame.key.start_text_input()
+            pygame.key.set_text_input_rect(self.input_rects[i])
+
+    def draw_chat(self,i,x,top,width):
+        editor=self.inputs[i];status=self.chat_status[i];color=COLORS[i]
+        self.text('给 P%d 的建议 · 下一轮决策读取'%(i+1),x+16,top+5,color,18)
+        labels={'queued':'等待下一轮','sent':'已加入决策，等待回复','retry':'请求失败，下一轮重试',
+                'received':'模型已收到，采纳情况见上方决策','closed':'未确认送达，模型已停止','rejected':'建议队列已满'}
+        message=self.chats[i][-1] if self.chats[i] else None
+        if message:
+            self.text(labels.get(message['state'],message['state']),x+16,top+32,GREEN if message['state']=='received' else MUTED,16)
+            lines=self.wrap('你：'+message['text'],width-40,16)
+            for n,line in enumerate(lines[:2]):self.text(line,x+16,top+55+n*20,size=16)
+            reply=self.feeds[i].plans.get(message.get('request_id')) if message['state']=='received' else None
+            if reply:
+                for n,line in enumerate(self.wrap('模型：'+reply['body'].split('\n')[0],width-40,16)[:2]):
+                    self.text(line,x+16,top+100+n*20,RED if reply['error'] else GREEN,16)
+        else:self.text('输入战术建议或问题，模型会在下一轮决策说明中回应。',x+16,top+40,MUTED,16)
+        rect=pygame.Rect(x+16,top+150,width-132,64);self.input_rects[i]=rect
+        pygame.draw.rect(self.screen,CARD,rect,border_radius=7)
+        pygame.draw.rect(self.screen,color if self.focus==i else '#34465e',rect,width=1,border_radius=7)
+        self.screen.set_clip(rect.inflate(-10,-8))
+        display=editor.text[:editor.cursor]+editor.composition+editor.text[editor.cursor:]
+        if not display:self.text('例如：先守住二矿，暂缓进攻',rect.x+8,rect.y+7,MUTED,16)
+        lines=self.wrap(display,rect.w-16,16)
+        before=self.wrap(editor.text[:editor.cursor]+editor.composition,rect.w-16,16)
+        if display.endswith('\n'):lines.append('')
+        if (editor.text[:editor.cursor]+editor.composition).endswith('\n'):before.append('')
+        start=max(0,len(before)-2)
+        if editor.selected:pygame.draw.rect(self.screen,'#304c70',rect.inflate(-12,-12))
+        for n,line in enumerate(lines[start:start+3]):self.text(line,rect.x+8,rect.y+6+n*21,size=16)
+        if self.focus==i:
+            cy=rect.y+6+(len(before)-1-start)*21
+            cx=rect.x+8+self.fonts[16].size(before[-1])[0]
+            pygame.draw.line(self.screen,color,(cx,cy),(cx,cy+18))
+            pygame.key.set_text_input_rect(pygame.Rect(cx,cy,1,21))
+        self.screen.set_clip(None)
+        enabled=bool(status.get('accepting') and time.time()-status.get('updated_at',0)<=15)
+        self.button('发送',x+width-104,top+164,88,('send',i),enabled)
+        tip=editor.error or self.chat_notices[i] or status.get('reason') or ('Enter发送 · Shift+Enter换行 · Ctrl+V粘贴' if enabled else '等待该玩家的指挥进程更新')
+        self.text(self.wrap(tip,width-100,16)[0],x+16,top+223,MUTED,16)
+        self.text('%d/%d'%(len(editor.text),MAX_TEXT),x+width-90,top+223,MUTED,16)
     def text(self,text,x,y,color=TEXT,size=18):
         surf=self.fonts[size].render(str(text),True,color);self.screen.blit(surf,(x,y))
     def wrap(self,value,width,size=18):
@@ -230,9 +321,10 @@ class Window:
         for i,feed in enumerate(self.feeds):
             x=24+i*(pw+gap);color=COLORS[i];area=pygame.Rect(x,top,pw,bottom-top)
             pygame.draw.rect(self.screen,PANEL,area,border_radius=12)
-            identity=(data.get('identities') or [{},{}])[i];model=identity.get('model','等待模型')
+            identities=data.get('identities') or []
+            identity=identities[i] if i<len(identities) else {};model=identity.get('model','等待模型')
             self.text('P%d  '%(i+1)+model,x+16,top+13,color,24)
-            commanders=sample.get('commanders') or [{},{}];c=commanders[i]
+            commanders=sample.get('commanders') or [];c=commanders[i] if i<len(commanders) else {}
             thinking='正在生成回复' if feed.pending is not None and outcome=='running' else '等待下一次决策' if outcome=='running' else '历史记录'
             self.text(thinking+'   ·   已接收 %d   错误 %d'%(c.get('decisions',0),c.get('errors',0)),x+16,top+52,MUTED,16)
             d=c.get('defense_adjutant',{})
@@ -247,7 +339,8 @@ class Window:
                           ' · 分配 %d · 回复 %d · 错误 %d'%(len(d.get('unit_tags',[])),d.get('accepted',0),d.get('errors',0)),
                           x+16,top+78,MUTED,16)
             if feed.error:self.text(feed.error[:60],x+16,top+78,RED,16)
-            view=pygame.Rect(x+8,top+104,pw-16,max(1,bottom-top-115));self.screen.set_clip(view)
+            chat_top=bottom-254
+            view=pygame.Rect(x+8,top+104,pw-16,max(1,chat_top-top-115));self.screen.set_clip(view)
             entries=[e for e in reversed(feed.entries) if not self.only_errors or e['error']]
             y=view.y-self.offsets[i]
             if not entries:self.text('暂无错误记录' if self.only_errors else '等待模型的第一条回复…',x+18,view.y+15,MUTED)
@@ -270,23 +363,33 @@ class Window:
             if total>view.h:
                 bar=max(24,view.h*view.h/total);by=view.y+(view.h-bar)*self.offsets[i]/max(1,total-view.h)
                 pygame.draw.rect(self.screen,color,pygame.Rect(x+pw-7,by,3,bar),border_radius=2)
-        self.text(self.run.name+'  ·  正文最多每 0.5 秒更新；游戏状态每 10 秒更新',24,h-26,MUTED,16)
+            self.draw_chat(i,x,chat_top,pw)
+        self.text(self.run.name+'  ·  决策与建议状态每 0.5 秒更新；关闭窗口不停止对局',24,h-26,MUTED,16)
         pygame.display.flip()
+    def handle_event(self,event):
+        if event.type==pygame.QUIT:return False
+        elif event.type==pygame.VIDEORESIZE:self.screen=pygame.display.set_mode((max(1000,event.w),max(720,event.h)),pygame.RESIZABLE)
+        elif event.type in (pygame.TEXTINPUT,pygame.TEXTEDITING,pygame.KEYDOWN) and self.focus is not None:
+            if self.inputs[self.focus].handle(event):self.send_advice(self.focus)
+        elif event.type==pygame.MOUSEWHEEL:
+            i=int(pygame.mouse.get_pos()[0]>=self.screen.get_width()/2)
+            self.offsets[i]=max(0,self.offsets[i]-event.y*90);self.follow=False
+        elif event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
+            selected=next((i for i,rect in self.input_rects.items() if rect.collidepoint(event.pos)),None)
+            if selected is not None:self.focus_input(selected)
+            for rect,key in self.buttons:
+                if rect.collidepoint(event.pos):
+                    if isinstance(key,tuple):self.send_advice(key[1])
+                    elif key=='raw':self.raw=not self.raw;self.offsets=[0,0]
+                    elif key=='errors':self.only_errors=not self.only_errors;self.offsets=[0,0]
+                    else:self.follow=True;self.offsets=[0,0]
+        return True
+
     def loop(self,snapshot=None):
         clock=pygame.time.Clock();running=True
         while running:
             for event in pygame.event.get():
-                if event.type==pygame.QUIT:running=False
-                elif event.type==pygame.VIDEORESIZE:self.screen=pygame.display.set_mode((max(1000,event.w),max(560,event.h)),pygame.RESIZABLE)
-                elif event.type==pygame.MOUSEWHEEL:
-                    i=int(pygame.mouse.get_pos()[0]>=self.screen.get_width()/2)
-                    self.offsets[i]=max(0,self.offsets[i]-event.y*90);self.follow=False
-                elif event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
-                    for rect,key in self.buttons:
-                        if rect.collidepoint(event.pos):
-                            if key=='raw':self.raw=not self.raw;self.offsets=[0,0]
-                            elif key=='errors':self.only_errors=not self.only_errors;self.offsets=[0,0]
-                            else:self.follow=True;self.offsets=[0,0]
+                if not self.handle_event(event):running=False;break
             self.draw()
             if snapshot:
                 pygame.image.save(self.screen,str(snapshot));print('[output window] snapshot='+str(snapshot),flush=True);break

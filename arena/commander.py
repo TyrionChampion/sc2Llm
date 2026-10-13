@@ -16,6 +16,7 @@ from arena.rally import DefensiveRally, RALLY_NAMES
 from arena.defense_orders import base_threats
 from arena.context import battle_payload, DecisionMemory, EngagementLog
 from arena.spatial import Battlefield
+from arena.operator_advice import OperatorAdvice
 
 SYSTEM = battle_plans.SYSTEM
 OPENING=[{'skill':'train_worker','count':2},{'skill':'supply_depot'},
@@ -58,6 +59,8 @@ class Commander:
         if repair:repair.bind(self)
         self.game_loop=backend.initial[index].game_loop
         self.feedback=FeedbackJournal(index+1,feedback_dir)
+        self.operator_advice=OperatorAdvice(self.feedback.path,index+1,self.feedback.audit)
+        self.request_advice_ids={}
         self._seen_feedback_world=None; self.engine_errors=0
         self.intelligence=Intelligence(self.record_feedback); self.request_intel_revisions={}
         self.battlefield=Battlefield(backend,index)
@@ -275,6 +278,8 @@ class Commander:
 
     def tick(self,w):
         self.ingest_feedback(w)
+        accepting,reason=self._advice_availability()
+        self.operator_advice.poll(accepting,reason)
         if self.repair:self.repair.poll()
         if self.development:self.development.poll()
         if self.surrender or getattr(self.backend,'match_control_pending',False):return []
@@ -301,6 +306,7 @@ class Commander:
             if delivered:
                 self.feedback.acknowledge(feedback_ids,request_id)
                 self.intelligence.acknowledge(intel_revision)
+            self.operator_advice.finish(self.request_advice_ids.pop(request_id,[]),request_id,delivered)
             if error:
                 self.errors+=1; self.emit('[planner-error] '+error)
                 self.record_feedback('model_response_invalid' if delivered else 'model_request_failed',
@@ -450,6 +456,8 @@ class Commander:
             if self.defense:payload['defense_adjutant']=self.defense.public()
             if self.combat_micro:payload['combat_micro']=self.combat_micro.public()
             if self.tactics:payload['army_tactics']=self.tactics.public()
+            advice=self.operator_advice.batch()
+            if advice['messages']:payload['operator_advice']=advice
             if self.tasks.tech_tree is not None:
                 from arena.knowledge import model_knowledge
                 from arena.macro import site_summary
@@ -471,11 +479,15 @@ class Commander:
             self.feedback.audit(dict(record='request_queued',request_id=request_id,game_loop=w.game_loop,
                 feedback_ids=ids,system=self.system,prompt=payload))
             if self.compact_battle:self.request_observations[request_id]=battle_plans.capture(w,self.tasks)
+            advice_ids=[m['id'] for m in advice['messages']]
+            self.request_advice_ids[request_id]=advice_ids
+            if advice_ids:self.operator_advice.sent(advice_ids,request_id)
             self.inbox.put_nowait((w.seconds,prompt,request_id,ids))
             self.thinking=True; self.last_request=w.seconds
         return batch
     def stats(self):
         return {'army_tactics':self.tactics.public() if self.tactics else {'enabled':False},
+                'operator_advice':self.operator_advice.public(),
                 'combat_micro':self.combat_micro.public() if self.combat_micro else {'enabled':False},
                 'defense_adjutant':self.defense.public() if self.defense else {'enabled':False},
                 'economy_report':self.tasks.economy.public(self.tasks.tasks),
@@ -497,7 +509,18 @@ class Commander:
     def _surrender_blockers(self,w):
         policy=getattr(self.backend,'surrender_blockers_for',None)
         return policy(w,self.index) if callable(policy) else surrender_blockers(w)
+    def _advice_availability(self):
+        if self.surrender or self.client_fatal or getattr(self.client,'closed',False) or getattr(self.client,'fatal_error',None):
+            return False,'模型已停止，无法接收下一轮建议'
+        limit=getattr(self.client,'request_limit',None)
+        budget=getattr(self.client,'budget',None)
+        if ((limit is not None and getattr(self.client,'attempts',0)>=limit)
+                or (budget is not None and budget.used>=budget.limit)):
+            return False,'本局模型请求已用完，没有下一轮决策'
+        return True,''
+
     def stop(self):
+        self.operator_advice.close()
         if self.tactics:self.tactics.close()
         if self.defense:self.defense.close()
         if self.repair:self.repair.close()

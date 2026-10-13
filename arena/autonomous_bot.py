@@ -15,7 +15,7 @@ INITIAL_STRATEGY = '''自主选择适合当前局势的战略。根据已侦察�
 空闲产能立即安排生产，产能不足就补产能，供给或前置阻塞就补齐，不让多矿经济只变成库存。
 遵守请求预算，明显不可恢复时投降。'''
 
-BOT_RULES = '''你指挥真实星际对局，自主选战略，在预算内战胜当前bot。
+BOT_RULES = '''你指挥真实星际对局，自主选战略，在预算内战胜当前对手。
 只返回JSON：{"tasks":[],"reason":"100字内中文：路线依据、阶段目标或调整"}。
 任务用skill，例如{"skill":"train_unit","count":8,"args":{"unit":"marine"}}。
 顶层只需tasks/reason；任务仅skill/count/args。禁止type、response_format和任务级reason。
@@ -114,7 +114,7 @@ class RequestCapIdleGuard:
 def production_decision_needed(world):
     """Wake the model for idle military capacity; never choose or issue a product."""
     return world.minerals>=300 and any(
-        unit.type_id in (21,27,28) and unit.done and not unit.orders
+        unit.type_id in (21,27,28,62,71,67,133) and unit.done and not unit.orders
         for unit in world.my_units)
 
 
@@ -432,6 +432,19 @@ class BotPlanner:
                          reason='Full system and iteration metadata included in budget'))
                 compact=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
         if len(BOT_RULES) + len(compact) > 45000:
+            # Share repeated values/field names before refusing dense current combat.
+            # Unlike history pruning this retains every current fact and its order.
+            from arena.context_tables import object_pool, key_table
+            payload['context_policy']['shared_encoding'] = (
+                'review_object_pool_v1: recursively replace {$review_ref:N} with objects[N]. '
+                'review_key_table_v1: recursively replace numeric dictionary keys with keys[N]. '
+                'Decode these wrappers before nested columns/rows tables; all values retained.')
+            payload = object_pool(payload)
+            compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+            if len(BOT_RULES) + len(compact) > 45000:
+                payload = key_table(payload)
+                compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+        if len(BOT_RULES) + len(compact) > 45000:
             self.fatal_error = 'Battle context exceeds 45,000-character hard limit'
             self.fatal_kind = 'context_budget'
             raise BudgetExhausted('Battle context exceeds 45,000-character hard limit')
@@ -454,7 +467,7 @@ class BotPlanner:
             self.usage[key] += ((self.client.last_metadata or {}).get('usage') or {}).get(key, 0) or 0
         if getattr(self.client,'model','').startswith('opencode-go/'):
             from arena.plan_representation import translate_plan
-            original=json.loads(raw);translated,changes=translate_plan(original,payload)
+            original=json.loads(raw);translated,changes=translate_plan(original,decode_tables(payload))
             if changes:
                 metadata=dict(self.client.last_metadata or {},representation_translations=changes)
                 directory=getattr(self.client,'directory',None)
