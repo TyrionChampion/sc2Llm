@@ -3,7 +3,7 @@ import copy
 from arena.raw_engine import CC, SCV, MARINE, DEPOT, BARRACKS
 from arena.tasks import SPECS
 
-SYSTEM = """Command the race in world.race. Return JSON only: {"tasks":[{"skill":"train_worker","count":2}],"reason":"brief strategy"}. No source/prose. Use only the supplied answer-format tool if present. Decide strategy; scripts select units/coordinates/placement and wait for resources/prerequisites. <=16 tasks. Counts 1..20 only train_worker/train_unit/morph_unit; other outer counts=1. Use tech_tree for EXACT own-race unit/structure/upgrade/form names and prerequisites. train_unit args={"unit":name}; build_structure args={"structure":name,"base":"home|expansion|site_N"}; research args={"upgrade":name}; morph_unit args={"unit":form,"target":"home|rally|enemy_start|nearest_enemy"}; gather_gas args={"workers_per_refinery":0..3}. train_worker/build_supply adapt to your race. expand builds an additional town hall at a mineral cluster; gather redistributes surplus mineral workers. Other macro args={}. Macros: train_worker,train_unit,build_structure,build_supply,research,morph_unit,gather_gas,expand,attack_nearest,move_out,gather,no_op; supply_depot/barracks aliases are Terran only. Macro prerequisites WAIT; you must explicitly order the prerequisites (including tech labs, gas buildings, gas workers and supply). Research must be observed completed before relying on its effects. morph_unit is ONLY free reversible forms in tech_tree.forms (siege/unsiege, gateway/warp_gate, burrow, lift/land). Paid unit morphs (ravager, lurker, brood_lord, overseer) use train_unit; lair/hive/greater_spire/orbital_command use build_structure. Never morph into hatchery. nuke/interceptor are ammo restocking tasks with count=1 only, not observable troop-count batches; a Nuke is confirmed through an owned Ghost nuclear-strike ability, carrier full stock is inferred from an idle capacity query. Building/research outer count MUST equal 1; train_worker/train_unit/morph_unit count may exceed 1. No coordinates/tags in commands. Tasks persist: don't repeat active tasks; tasks=[] waits without clearing them. Use current world, active_tasks, control_policy, feedback and libraries. Grow economy/supply/army and defeat enemy. Return a short reason preserving strategic intent for the next stateless decision. Previous chat is NOT retained; explicit payload is authoritative. Feedback events are complete but paginated; deferred events remain pending. Failure is not recovery; command dispatch/script completion is not victory. Unknown engine cause remains unknown.
+SYSTEM = """Command the race in world.race. Return JSON only: {"tasks":[{"skill":"train_worker","count":2}],"reason":"brief strategy"}. No source/prose. Use only the supplied answer-format tool if present. Decide strategy; scripts select units/coordinates/placement and wait for resources/prerequisites. <=16 tasks. Counts 1..200 for training/forms/construction/expansion; other outer counts=1. Use tech_tree for EXACT own-race unit/structure/upgrade/form names and prerequisites. train_unit args={"unit":name}; build_structure args={"structure":name,"base":"home|expansion|site_N"}; research args={"upgrade":name}; morph_unit args={"unit":form,"target":"home|rally|enemy_start|nearest_enemy"}; gather_gas args={"workers_per_refinery":0..3}. train_worker/build_supply adapt to your race. expand builds an additional town hall at a mineral cluster; gather redistributes surplus mineral workers. Other macro args={}. Macros: train_worker,train_unit,build_structure,build_supply,research,morph_unit,gather_gas,expand,attack_nearest,move_out,gather,no_op; supply_depot/barracks aliases are Terran only. Macro prerequisites WAIT; you must explicitly order the prerequisites (including tech labs, gas buildings, gas workers and supply). Research must be observed completed before relying on its effects. morph_unit is ONLY free reversible forms in tech_tree.forms (siege/unsiege, gateway/warp_gate, burrow, lift/land). Paid unit morphs (ravager, lurker, brood_lord, overseer) use train_unit; lair/hive/greater_spire/orbital_command use build_structure. Never morph into hatchery. nuke/interceptor are ammo restocking tasks with count=1 only, not observable troop-count batches; a Nuke is confirmed through an owned Ghost nuclear-strike ability, carrier full stock is inferred from an idle capacity query. Building batches wait for observed completion before the next purchase. Research outer count=1. Coordinates/tags are allowed only in fields that explicitly accept them. Tasks persist: don't repeat active tasks; tasks=[] waits without clearing them. Use current world, active_tasks, control_policy, feedback and libraries. Grow economy/supply/army and defeat enemy. Return a short reason preserving strategic intent for the next stateless decision. Previous chat is NOT retained; explicit payload is authoritative. Feedback events are complete but paginated; deferred events remain pending. Failure is not recovery; command dispatch/script completion is not victory. Unknown engine cause remains unknown.
 Optional skills defines <=8 JSON skills/reply, <=24 total: {"name":"letter_then_alnum_underscore_max40","select":{"unit":"scv|marine|siege_tank","count":1..32},"steps":[...],"timeout_s":1..300}. SCV count=1. <=12 steps; each has action, optional queue:bool and timeout_s:1..180. Actions/fields: build structure=supply_depot|barracks|expand (SCV); gather target=nearest_mineral (SCV); move/attack_move target=home|rally|enemy_start|nearest_enemy; stim (Marine, researched, health>10); siege/unsiege (tank); wait condition=enemy_near,radius=1..30. No extra fields. queue:true only for gather after build or siege after move. Invoke defined name with outer count=1,args={}. Never redefine active skills. JSON workflows retain their listed selectors; Python selectors and macro catalogue support all three races.
 python_skill_library lists callable frozen tactics, not JSON definitions. Invoke name with ALL args: {"count":1..32,"target":"home|rally|enemy_start|nearest_enemy","retreat_target":"home|rally","timeout_s":1..300,"params":{documented scalar parameters}}; outer count=1. Allocated squads may retreat locally even with global combat reflex OFF. Cancel via {"skill":"cancel_python_task","args":{"task_id":ID}} then optionally reassign in same plan. Check skill_repairs: repairing/failed names blocked; ready means YOU may issue a new task, never automatic redeployment. Don't submit Python source.
 Surrender only if control_policy.surrender_available: sole task {"skill":"surrender","args":{"reason":"1..500 chars"}}, no skills definitions. Never specify opponent. Late plans are checked against changed observations; rejected plans leave existing tasks running. Replan from fresh evidence."""
@@ -11,7 +11,9 @@ Surrender only if control_policy.surrender_available: sole task {"skill":"surren
 
 LANGUAGE_RULES = "所有面向观众的自然语言说明使用简体中文，包括 reason、strategy、修复解释及新技能描述。每个战斗计划包含非空 reason，用100字以内中文简述行动意图，不输出内部推理过程。JSON字段名、技能/API名、参数键、枚举值、代码标识符、文件路径保持协议原样；原始错误保留原文，解释用中文。"
 SYSTEM += "\n" + LANGUAGE_RULES
+SYSTEM += '\nProduction quantities: train_worker args may include queue_mode="append"; train_unit args={"unit":name,"queue_mode":"append"} explicitly ADDS count units to the active batch or starts a finite batch. Omit queue_mode (or coalesce) to keep an existing batch WITHOUT adding units. At most one append per product per reply; each append count=1..200, outstanding remaining<=200. Completed products free queue capacity; requested retains cumulative history. Ammo, forms and buildings do not support append. Read active_tasks.production_quantity (requested/issued/observed_completed/unissued/awaiting_completion/remaining) and blocking reason. Repeating a statement in reason does not issue a command. No automatic batch repetition after completion or after request exhaustion; supply, prerequisites, further capacity and finite replenishment remain your explicit choices. Invalid task parameters reject the ENTIRE plan, including otherwise valid production; correct and resubmit commands you still want.'
 SYSTEM += "\nProduction rallies are automatic by default (main ramp, then an exposed owned expansion entrance) and the automatic path never overwrites an explicit order. You control them per building: rally_units args={\"producers\":[\"barracks#1\",\"hatchery#2\"] or \"all\",\"target\":one name from rally_landmarks or [x,y],\"duration_s\":1..3600 optional,\"reason\":\"short Chinese note\"}; read rally_producers for the exact type#N inventory and rally_orders for current confirmed points. Coordinates are accepted but deliberately given: name the place when a name exists. Read defensive_rally and rally_orders for actual confirmation; rally orders never recall existing squads or set worker rallies. Warp-ins/morphs need your own positioning tasks. Read intelligence on every decision: it retains sightings between model requests, including before scout death. visible means current sight; last_seen/old_unconfirmed are historical and may have moved. Do not treat remembered tags/positions as visible attack targets. Pending alerts are independent of paginated execution feedback."
+SYSTEM += "\nExplicit rally landmarks may anchor to owned grounded town halls at least 25% constructed, while selected producers must still be completed. An explicit entrance accepts visible enemy pressure; collision/terrain checks remain. Automatic rally threat avoidance is unchanged."
 
 
 def bounded_note(value, limit):
@@ -32,8 +34,12 @@ def compact_payload(payload, previous_strategy=None):
 
 
 def capture(w, tasks):
+    from arena.rally import producer_inventory
+    producers,_=producer_inventory(tasks.backend,w,tasks.index,include_routes=False)
     return dict(world=w,active={t.id:(t.skill,copy.deepcopy(t.program.summary()) if t.program else None)
                                for t in tasks.tasks if t.active},
+                rally_producers={p['label']:p['tag'] for p in producers},
+                known={t.id:t.skill for t in tasks.tasks},
                 protected=set(tasks.protected()),
                 python_versions={k:v['sha256'] for k,v in tasks.python_catalog.entries.items()} if tasks.python_catalog else {},
                 library=copy.deepcopy(tasks.library),gas_policy=getattr(tasks,'gas_workers_per_refinery',None))
@@ -65,6 +71,10 @@ def revalidate(plan, before, w, tasks, home, age, max_age=70):
             if type(target) is not int or target not in before['active'] or not any(t.id==target and t.active for t in tasks.tasks):
                 reason='cancellation target no longer matches original active task'
         elif new_threat!=old_threat:reason='visible threats near home changed'
+        elif name in ('cancel_native_building','cancel_native_queue','cancel_native_morph'):
+            task_id=args.get('task_id')
+            if task_id not in before.get('known',{}):reason='native cancellation target was not owned/known in the original request'
+        elif name=='use_ability':reason='late native ability requires fresh energy, cooldown, ownership and target observations'
         elif getattr(tasks,'tech_tree',None) is not None and name in __import__('arena.macro',fromlist=['MACROS']).MACROS:
             from arena.macro import specification
             from arena.tech_tree import WORKERS,GAS_BUILDINGS,TOWNHALLS
@@ -126,11 +136,11 @@ def revalidate(plan, before, w, tasks, home, age, max_age=70):
             halls=[u for u in w.my_units if u.type_id in TOWNHALLS and not u.flying]
             requested=args.get('base')
             if requested=='home':
-                point=tuple(tasks.backend.homes[0])
+                point=tuple(home)
             else:
                 point=None
             if requested!='home':
-                labels=base_labels(w,tuple(tasks.backend.homes[0]))
+                labels=base_labels(w,tuple(home))
                 if isinstance(requested,str) and not any(l==requested for l in labels.values()):
                     reason='requested base is no longer owned: '+str(requested)
                 elif isinstance(requested,(list,tuple)) and not any(
@@ -141,27 +151,30 @@ def revalidate(plan, before, w, tasks, home, age, max_age=70):
                            if not u.is_building and (u.ground_dps>0 or u.air_dps>0)}
                 missing=sorted(set(args.get('units') or ())-available)
                 if missing:reason='ordered unit kind(s) not present: '+', '.join(missing)
+        elif name=='stop_production':
+            target=next((t for t in tasks.tasks if t.id==args.get('task_id')),None)
+            if not target or target.id not in before.get('known',before['active']) or not tasks.stoppable_production(target):
+                reason='production goal not owned/known in the original request'
         elif name=='cancel_task':
-            if not any(t.active and t.skill=='defend_base' for t in tasks.tasks):
-                reason='no active defend_base order to cancel'
+            target=next((t for t in tasks.tasks if t.id==args.get('task_id')),None)
+            known=before.get('known',before['active'])
+            if not target or target.id not in known:
+                reason='cancellation target not owned/known in original observation'
+            elif target.skill not in ('defend_base','scout','order_units','rally_units') and not tasks.unissued_macro(target):
+                reason='macro already issued an order/relocation; cannot cancel native work here'
         elif name=='rally_units':
             # Revalidate has no backend handle, so it checks the requested type#N selector
             # against the buildings observed in this snapshot. Binding to real tags happens
             # at execution (RallyOrder), which reports a missing building explicitly.
-            from arena.rally import PRODUCERS, RALLY_NAMES, parse_producer_selector
+            from arena.rally import RALLY_NAMES, producer_inventory
             requested=args.get('producers')
             if isinstance(requested,list):
-                observed={}
-                for unit_ in w.my_units:
-                    if unit_.type_id not in PRODUCERS:continue
-                    meta=getattr(tasks.backend,'types',{}).get(unit_.type_id)
-                    kind=getattr(meta,'name','')
-                    if kind:observed.setdefault(''.join(ch for ch in kind if ch.isalnum()).lower(),[]).append(unit_.tag)
-                missing=[]
-                for selector in requested:
-                    try:kind,ordinal=parse_producer_selector(selector)
-                    except ValueError:missing.append(str(selector));continue
-                    if len(observed.get(kind,()))<ordinal:missing.append(str(selector))
+                inventory,_=producer_inventory(tasks.backend,w,tasks.index,include_routes=False)
+                observed={p['label']:p['tag'] for p in inventory}
+                original=before.get('rally_producers')
+                missing=[str(selector) for selector in requested if not isinstance(selector,str)
+                    or selector not in observed or original is not None
+                    and original.get(selector)!=observed[selector]]
                 if missing:reason='requested production building not observed: '+','.join(sorted(missing))
             target=args.get('target')
             if isinstance(target,list) and len(target)==2:
@@ -195,7 +208,7 @@ def revalidate(plan, before, w, tasks, home, age, max_age=70):
 OUTPUT_SCHEMA={
     'type':'object','properties':{
         'tasks':{'type':'array','maxItems':16,'items':{'type':'object',
-            'properties':{'skill':{'type':'string'},'count':{'type':'integer','minimum':1,'maximum':20},
+            'properties':{'skill':{'type':'string'},'count':{'type':'integer','minimum':1,'maximum':200},
                           'args':{'type':'object','additionalProperties':True}},
             'required':['skill'],'additionalProperties':False}},
         'reason':{'type':'string','description':'Short strategic intention, preferably under 100 characters'},
@@ -208,28 +221,35 @@ def output_schema(payload):
     import copy
     def obj(properties,required=()):
         return {'type':'object','properties':properties,'required':list(required),'additionalProperties':False}
-    count={'type':'integer','minimum':1,'maximum':20}
+    count={'type':'integer','minimum':1,'maximum':200}
+    queue_mode={'type':'string','enum':['coalesce','append']}
     def task(names,args=None,training=False):
         return obj({'skill':{'type':'string','enum':names},'count':count if training else {'type':'integer','enum':[1]},
                     'args':args or obj({})},['skill'])
     tree=payload.get('tech_tree')
     if tree:
         def named(field,items):return obj({field:{'type':'string','enum':items}},[field])
-        variants=[task(['train_worker'],training=True),task(['build_supply','attack_nearest','move_out','gather','no_op']),
-            task(['train_unit'],named('unit',[e['name'] for e in tree['units'] if e['name'] not in ('nuke','interceptor')]),training=True),
-            task(['build_structure'],obj({'structure':{'type':'string','enum':[e['name'] for e in tree['structures']]},'base':{'type':'string'}},['structure'])),
+        train_args={'unit':{'type':'string','enum':[e['name'] for e in tree['units'] if e['name'] not in ('nuke','interceptor')]},'queue_mode':queue_mode}
+        if tree.get('race')=='protoss':train_args['warp_target']={'type':'array','items':{'type':'number'},'minItems':2,'maxItems':2}
+        variants=[task(['train_worker'],obj({'queue_mode':queue_mode}),training=True),task(['build_supply'],training=True),task(['attack_nearest','move_out','gather','no_op']),
+            task(['train_unit'],obj(train_args,['unit']),training=True),
+            task(['build_structure'],obj({'structure':{'type':'string','enum':[e['name'] for e in tree['structures']]},'base':{'type':'string'}},['structure']),training=True),
             task(['research'],named('upgrade',[e['name'] for e in tree['research']])),
             task(['morph_unit'],obj({'unit':{'type':'string','enum':tree['forms']},'target':{'type':'string','enum':['home','rally','enemy_start','nearest_enemy']}},['unit']),training=True),
             task(['gather_gas'],obj({'workers_per_refinery':{'type':'integer','minimum':0,'maximum':3}},['workers_per_refinery'])),
-            task(['expand'],obj({'base':{'type':'string'}}))]
+            task(['expand'],obj({'base':{'type':'string'}}),training=True)]
         if tree.get('race')=='zerg':
-            variants.append(task(['inject_larva'],obj({'base':{'type':'string'}},['base'])))
+            variants.append(task(['inject_larva'],obj({'base':{'type':'string'},'timeout_s':{'type':'integer','minimum':1,'maximum':300}},['base'])))
         from arena.economy import plan_schema
         macro_branch=task(['macro_plan'],plan_schema([e['name'] for e in tree['units']+tree['structures']]))
         macro_branch['required'].append('args')
         variants.append(macro_branch)
         cancel_branch=task(['cancel_expansion'],obj({'task_id':{'type':'integer','minimum':1}},['task_id']))
         cancel_branch['required'].append('args');variants.append(cancel_branch)
+        macro_cancel=task(['cancel_task'],obj({'task_id':{'type':'integer','minimum':1}},['task_id']))
+        macro_cancel['required'].append('args');variants.append(macro_cancel)
+        stop=task(['stop_production'],obj({'task_id':{'type':'integer','minimum':1}},['task_id']))
+        stop['required'].append('args');variants.append(stop)
         # rally_units was described in the system prompt but missing from this schema, so the
         # provider's argument validation rejected it before the queue ever saw it.
         producers={'anyOf':[{'type':'string','enum':['all']},
@@ -252,14 +272,32 @@ def output_schema(payload):
             variants.append(task(['call_mule','supply_drop'],obj({'base':{'type':'string','enum':['home','expansion']}})))
     else:
         variants=[task(['supply_depot','barracks','expand','attack_nearest','move_out','gather','no_op']),
-                  task(['train_worker'],training=True),
-                  task(['train_unit'],obj({'unit':{'type':'string','enum':['marine']}}),training=True)]
+                  task(['train_worker'],obj({'queue_mode':queue_mode}),training=True),
+                  task(['train_unit'],obj({'unit':{'type':'string','enum':['marine']},'queue_mode':queue_mode}),training=True)]
+    if payload.get('native_abilities',{}).get('enabled'):
+        ability_args=obj({'caster':{'type':'integer','minimum':1},
+            'ability':{'type':'string','enum':sorted({entry['name'] for entry in payload['native_abilities'].get('catalogue',{}).values()}) or ['stop_stop']},
+            'target':{'anyOf':[{'type':'null'},{'type':'integer','minimum':1},
+                             {'type':'array','minItems':2,'maxItems':2,'items':{'type':'number'}}]},
+            'timeout_s':{'type':'number','minimum':1,'maximum':120}},['caster','ability','target'])
+        ability_branch=task(['use_ability'],ability_args)
+        ability_branch['required'].append('args');variants.append(ability_branch)
+    if payload.get('native_building_cancellation',{}).get('enabled'):
+        cancel_native=task(['cancel_native_building'],obj({'task_id':{'type':'integer','minimum':1}},['task_id']))
+        cancel_native['required'].append('args');variants.append(cancel_native)
+    if payload.get('native_queue_cancellation',{}).get('enabled'):
+        cancel_queue=task(['cancel_native_queue'],obj({'task_id':{'type':'integer','minimum':1}},['task_id']))
+        cancel_queue['required'].append('args');variants.append(cancel_queue)
+    if payload.get('native_morph_cancellation',{}).get('enabled'):
+        cancel_morph=task(['cancel_native_morph'],obj({'task_id':{'type':'integer','minimum':1}},['task_id']))
+        cancel_morph['required'].append('args');variants.append(cancel_morph)
     if payload.get('control_policy',{}).get('spatial_missions_available'):
         from arena.spatial import task_schemas
         variants.extend(task_schemas(payload))
     if payload.get('control_policy',{}).get('defense_orders_available'):
         from arena.defense_orders import task_schemas as defense_schemas
-        variants.extend(defense_schemas(payload))
+        variants.extend(branch for branch in defense_schemas(payload)
+            if not tree or 'cancel_task' not in branch['properties']['skill']['enum'])
     scalar={'type':['number','boolean','string','null']}
     for entry in payload.get('python_skill_library',[]):
         params=obj({k:{**scalar,'description':v} for k,v in entry['parameters'].items()})
@@ -291,6 +329,11 @@ def output_schema(payload):
     return {'type':'object','anyOf':[known,custom]}
 
 SYSTEM += "\nRead engagement_log for bounded observation windows: enemy_left_vision is not a death, and death events do not prove you killed them. decision_memory stores prior model intentions and periodic milestones, not guaranteed execution. Use it to avoid repeating failed or obsolete strategies; keep current observation authoritative."
+SYSTEM += '\nWhen native_abilities.enabled, use_ability args={caster:owned_tag,ability:exact_name,target:null|unit_tag|[x,y],timeout_s:1..120} accepts explicit observed tags and coordinates. One order per caster per reply; no automatic recast. Read live availability/ownership and feedback. Purchases/research use macros; release allocated missions before casting, except Nexus chrono boost can coexist with production.'
+SYSTEM += '\nWhen native_building_cancellation.enabled, cancel_native_building args={task_id:owned building macro ID} stops that goal and cancels its linked unfinished worker-built building/approach. Completed buildings cannot be undone; refunds are not assumed. Not unit queues, research or townhall upgrades.'
+SYSTEM += '\nWhen native_queue_cancellation.enabled, cancel_native_queue args={task_id:owned unit/research macro ID} stops its goal and cancels only linked observed building queues. Completed products remain. Unrelated orders/owners are rejected; refunds and causal cancellation are not inferred. Not construction, eggs, mobile morphs, ammo or townhall upgrades.'
+SYSTEM += '\nWhen native_morph_cancellation.enabled, cancel_native_morph args={task_id:owned paid building-upgrade macro ID} stops the goal and cancels its bound observed morph once. Lair/Hive, Orbital/Planetary and Greater Spire upgrades qualify; completed forms remain. No refund inferred. Not unit cocoons, ordinary construction or research.'
+SYSTEM += '\nProtoss train_unit may specify warp_target=[x,y] for a warp-capable unit. Only ready WarpGates are used; native placement stays within3 tiles of that centre. No power/vision/legal point means wait, never substitute a home Gateway purchase. Different destinations keep separate purchase/confirmation bindings.'
 
 SYSTEM += """
 Terran command-center choices: build_structure structure=orbital_command upgrades an existing grounded idle CommandCenter after Barracks; it cannot train SCVs while upgrading. Consider upgrading economic bases early, rather than permanently filling every CommandCenter with training tasks. build_structure structure=planetary_fortress requires EngineeringBay and gas, gives static ground defense but NO scans/MULEs. You choose which upgrade; the executor never upgrades automatically.
@@ -308,6 +351,8 @@ SYSTEM = SYSTEM.replace('scripts select units/coordinates/placement',
     'scripts allocate units, resolve your spatial goals, and handle placement')
 SYSTEM += '\n' + SPATIAL_PROTOCOL
 SYSTEM += '\n' + DEFENSE_PROTOCOL
+SYSTEM += '\ncancel_task also cancels an owned macro that has issued_quantity=0, no pending native order and no relocation. It stops waiting work, never native construction/training/research already sent, and never refunds spent resources. Re-read active_tasks before changing production or build location.'
+SYSTEM += '\nstop_production args={task_id:owned worker/unit production goal} stops only unpurchased quantity. Paid eggs, morphs and queues continue and remain tracked. Original requested/cancelled_unissued counts stay visible; no refund. A later explicit append buys only its new quantity. Not buildings, research, free forms or ammo.'
 SYSTEM += '''\nDECISION PRIORITY when your own bases are under attack (read defense_report each decision):
 1. A base with visible_attackers is a DEFENCE decision, not an economy decision. If urgency is
    critical or urgent, a matching defend_base order goes in THIS reply.

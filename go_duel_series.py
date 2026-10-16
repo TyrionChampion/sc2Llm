@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -28,32 +29,64 @@ from arena.tech_tree import TOWNHALLS
 
 ROOT=Path(__file__).resolve().parent
 RACES=('terran','protoss')
+PLAYABLE_RACES=('terran','zerg','protoss')
 ZERG_SCHEDULE=[['zerg','protoss'],['zerg','terran'],['zerg','protoss'],['zerg','terran']]
 RUNTIME_UPDATES=(
+    'cancel_native_building args={task_id:owned building macro ID} now stops its macro goal and cancels '
+    'the linked unfinished worker-built native building/approach. Already-completed buildings are no-ops, '
+    'not destroyed or refunded. This interface does not cancel unit queues, research or townhall upgrades.',
+    'Linux SC2Env immediate action responses are now captured and merged with observation action errors, '
+    'with exact source/task/batch attribution and duplicate suppression. Previously, zero observation errors '
+    'did not establish that every action was accepted. Rejected purchases reach the existing bounded retry logic.',
+    'Direct native_abilities now exposes own caster tags, energy, cargo, allocation and current native availability. '
+    'use_ability args={caster:owned_tag,ability:exact_name,target:null|unit_tag|[x,y],timeout_s:1..120} '
+    'issues one explicit order, no auto-recast; purchases/research remain macros. Release allocated missions first '
+    '(Nexus chrono boost can coexist with production). Native acknowledgement is not proof of the full tactical effect.',
+    'Unacknowledged native purchases now reserve minerals/gas/supply across potentially lagging realtime frames; '
+    'the reserve is not a spend/completion claim. cancel_task can cancel wholly unissued production/research/form '
+    'macros, never pending native orders or relocations. Form workflows expose form_sources; paid ravager/lurker/'
+    'brood_lord/overseer purchases use train_unit. build_supply/build_structure/expand count1..200 makes a finite '
+    'batch. Buildings finish one by one; supply adapts to the race. Repeated active goals still coalesce, no append.',
+    'Explicit finite replenishment: train_worker/train_unit args.queue_mode=append adds count units to '
+    'an active batch (or starts one), preserving in-flight orders; default coalesce adds zero. Read '
+    'active_tasks.production_quantity and task_coalesced evidence. One append/product/reply, count1..200, '
+    'outstanding total<=200 (completed products free queue capacity), no automatic production cycle. Ordinary idle-capacity cadence now spreads remaining '
+    'requests over the real wall/game horizon; urgent combat retains 25 seconds and all request ceilings remain.',
     'Explicit scout/order_units entrance targets can resolve under observed enemy pressure; automatic production '
     'rally selection still avoids threats. Geometry, occupancy and bounded reachability checks remain enforced.',
+    'Active spatial workflows now report native_paths for each owned ground actor, sampled every3 game seconds. '
+    'Zero outside the arrival radius means no current native path; own nearby structures are context, not proven '
+    'blockers. Query failures are unavailable. Decide whether to lower a Depot, lift/relocate a building, change '
+    'form or renew the mission using existing tools; no clearing or alternate goal is selected automatically.',
     'Raw death events may be normal hatching/morphing/cancellation. Production intermediate removals are a subset '
     'of raw deaths, not extra combat casualties or proof of an enemy kill.',
     'Idle attack-move formations can confirm local arrival without a watchdog stop; moving/engaged units or '
     'visible attackable enemies in range prevent this settlement shortcut. Arrival is not area clearance/victory.',
     'Only an observed matching egg order claims an egg; unconfirmed original larva tags do not block another product. '
-    'Queen casts track actual observed energy spending during travel, with progress/stall checks and a 90-game-second deadline.',
-    'Zerg now has inject_larva count=1 args={base:home|expansion|observed site_N}: one explicit Queen cast, '
+    'Queen casts track actual observed energy spending during travel, with progress/stall checks; '
+    'total deadline defaults to90 game seconds, explicit timeout_s1..300 allows distant travel.',
+    'Zerg now has inject_larva count=1 args={base:home|expansion|observed site_N,timeout_s:optional1..300}: one explicit Queen cast, '
     '25 energy, native energy+buff confirmation, no automatic cycle. zerg_injection reports own Queens/energy/base buffs.',
     'Townhall upgrades such as lair/hive/orbital_command now restrict their producer to the requested home, '
     'expansion or observed site, rather than choosing an unrelated idle base.',
     'Scout contacts now report the requested/resolved goal, arrival evidence and remaining route. '
-    'Scout stops at visible enemy contact; contact does not prove arrival. Explicit order_units move can continue scouting.',
+    'Scout defaults to stopping at visible enemy contact, including workers; contact does not prove arrival. '
+    'Explicit scout stop_on_contact:false reports contacts and continues the selected move route; order_units move is also available.',
     'Larva purchases now acknowledge a new unclaimed own egg with the matching native product order, '
     'even when the engine uses a larva at another owned base; product completion still requires actual own units.',
     'Available idle Zerg larvae with a completed spawning pool now wake production decisions like other races; '
     'the host still does not select a product or issue extra model requests beyond the existing limits.',
     'Warp-in candidate selection now excludes occupied unit footprints and pending warp positions; '
     'completion still requires observed units.',
+    'Protoss train_unit may set warp_target:[x,y] for warp-capable units. Only WarpGates may buy these '
+    'units, within3 tiles of the selected centre. No power/vision/legal placement means wait; no home '
+    'Gateway fallback. Purchases at different destinations have independent completion bindings.',
     'Player-observed resource site names persist across neutral tag changes and mineral depletion; '
     'remembered positions are geography, not current enemy observations.',
     'Macro resource waiting feedback reports only actual shortages and available unreserved resources.',
-    'Current battle observations can use reversible object/key sharing within the unchanged 45000-character limit.',
+    'Go battle input is capped at 90000 characters for the full system and observation (previous local guard: 45000). '
+    'Current facts, errors and user advice remain available; actual size is recorded. Per-player requests and '
+    'wall/game deadlines are unchanged. Context-budget termination is Unknown, not a tactical loss.',
     'Cancelling a known owned already-ended scout/order/defense mission is now an observable no-op; '
     'unknown IDs remain rejected, other valid orders in the reply can proceed.',
     'Macro failure feedback now retains pending order positions and currently observed new own products '
@@ -125,7 +158,8 @@ def play(folder,number,strategies,budget,limits,output_window=False,races=RACES)
             clients.append(BotPlanner(base,PlayerBudget(budget,i),strategies[i],limits['requests'],adaptive_cadence=True))
         arena=RawArena(render=False,races=list(races),seed=report['seed'],game_speed='slower')
         report.update(status='running',game_started=True,engine_version=arena.controllers[0].ping().game_version,
-                      map_targets=arena.start_location_report)
+                      map_targets=arena.start_location_report,
+                      action_error_channels=list(getattr(arena,'action_error_channels',('observation_action_errors',))))
         arena.surrender_blockers_for=lambda w,i: [] if guards[i].evidence else surrender_blockers(w)
         commanders=[Commander(arena,i,c,opening=False,interval=25,feedback_dir=folder/('p'+str(i+1))/'feedback',
                               combat_micro=True) for i,c in enumerate(clients)]
@@ -192,6 +226,7 @@ def play(folder,number,strategies,budget,limits,output_window=False,races=RACES)
             s=sides[i];s.update(outcome=report['outcomes'].get(i+1,'Unknown'),
                 result_source=report['result_source'],termination=report['termination'],
                 final_world=worlds[i].summary() if worlds else {},model_calls=clients[i].calls,
+                input_char_limit=getattr(clients[i],'context_limit',45000),
                 model_attempts=clients[i].attempts,usage=clients[i].usage,wall_s=round(time.monotonic()-started,2),
                 fatal_kind=clients[i].fatal_kind,fatal_error=clients[i].fatal_error,
                 game_speed='slower',time_limits=report['time_limits'],timing=report.get('timing'),
@@ -213,9 +248,33 @@ def play(folder,number,strategies,budget,limits,output_window=False,races=RACES)
 def match_setup(state,number):
     """Legacy ledgers retain their limits; new schedules keep strategies by race."""
     races=state.get('schedule',[state['races']]*state['games'])[number-1]
-    strategies=([state['strategies_by_race'][race] for race in races]
+    strategies=([state['strategies_by_player_race'][i][race] for i,race in enumerate(races)]
+                if 'strategies_by_player_race' in state else
+                [state['strategies_by_race'][race] for race in races]
                 if 'strategies_by_race' in state else state['strategies'])
     return races,strategies
+
+
+def selected_schedule(zerg_series=False,races=None,games=None,random_races=False,seed=7):
+    if random_races:
+        if zerg_series or races is not None:
+            raise ValueError('Random races cannot be combined with an explicit schedule')
+        count=3 if games is None else games
+        if type(count) is not int or not 1<=count<=4:
+            raise ValueError('Series must contain 1..4 games')
+        rng=random.Random(seed)
+        return [[rng.choice(PLAYABLE_RACES),rng.choice(PLAYABLE_RACES)] for _ in range(count)]
+    if zerg_series:
+        if races is not None or games is not None:
+            raise ValueError('The four-game Zerg schedule cannot be overridden')
+        return [list(pair) for pair in ZERG_SCHEDULE]
+    pair=list(RACES if races is None else races)
+    if len(pair)!=2 or any(r not in ('terran','zerg','protoss') for r in pair):
+        raise ValueError('Exactly two supported player races required')
+    count=3 if games is None else games
+    if type(count) is not int or not 1<=count<=4:
+        raise ValueError('Series must contain 1..4 games')
+    return [list(pair) for _ in range(count)]
 
 
 def main():
@@ -226,31 +285,42 @@ def main():
     parser.add_argument('--game-seconds',type=float,default=1800)
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--zerg-series',action='store_true',help='Four games: Zerg vs Protoss/Terran, twice each')
+    parser.add_argument('--races',nargs=2,choices=('terran','zerg','protoss'),help='Explicit new-series P1 and P2 races')
+    parser.add_argument('--random-races',action='store_true',help='Independently draw each player race per game; save draws for resume')
+    parser.add_argument('--games',type=int,choices=range(1,5),help='Explicit new-series length; default 3')
     parser.add_argument('--output-window',action='store_true',help='Open decision/chat window; closing it does not stop the game')
+    parser.add_argument('--skip-model-reviews',action='store_true',help='Keep local diagnostics and skip external post-game reviews; saved for resume')
     args=parser.parse_args()
     if not 1<=args.requests<=24 or not 1<=args.wall_seconds<=1860 or not 1<=args.game_seconds<=1800:
         parser.error('Original per-player request and match time ceilings must be retained')
     flags.FLAGS(['go_duel_series'])
     root=ROOT/'logs/go-duels';root.mkdir(exist_ok=True)
     if args.resume:
-        if args.zerg_series:parser.error('Resume uses the saved schedule; do not select a new series')
+        if args.zerg_series or args.races is not None or args.games is not None or args.random_races:
+            parser.error('Resume uses the saved schedule; do not select a new series')
         folder=args.resume.resolve()
         if not folder.is_relative_to(root):raise ValueError('Resume must be an existing Go duel series')
         state=json.loads((folder/'series.json').read_text())
         if state['state']=='running':raise ValueError('Active/incomplete match cannot be silently restarted')
     else:
-        schedule=ZERG_SCHEDULE if args.zerg_series else [list(RACES)]*3
-        folder=Path(tempfile.mkdtemp(prefix='zerg-' if args.zerg_series else 'tvp-',dir=root)).resolve()
+        try:schedule=selected_schedule(args.zerg_series,args.races,args.games,args.random_races,args.seed)
+        except ValueError as e:parser.error(str(e))
+        prefix='random-' if args.random_races else 'zerg-' if args.zerg_series else 'tvp-' if args.races is None else ''.join(r[0] for r in schedule[0])+'-'
+        folder=Path(tempfile.mkdtemp(prefix=prefix,dir=root)).resolve()
         state=dict(state='ready',games=len(schedule),schedule=schedule,matches=[],models=[GO_MODEL]*2,races=schedule[0],
             limits=dict(requests=args.requests,wall_s=args.wall_seconds,game_s=args.game_seconds,seed=args.seed),
             strategies=[INITIAL_STRATEGY,INITIAL_STRATEGY],
             historical_campaign_hashes={str(p):hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in (ROOT/'logs/autonomous-bot').glob('*/campaign.json')})
-        if args.zerg_series:
+        if args.zerg_series or (args.races is not None and len(set(args.races))==2):
             state['strategies_by_race']={r:INITIAL_STRATEGY for r in ('zerg','terran','protoss')}
-            prior=[*root.glob('*/budget.json'),ROOT/'logs/tactical-scenarios/ledger.json']
-            state['historical_campaign_hashes'].update({str(p):hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in prior if p.is_file() and p.parent!=folder})
+        if args.random_races:
+            state['race_selection']=dict(mode='independent_seeded_draws',seed=args.seed,mirrors_allowed=True)
+            state['strategies_by_player_race']=[{r:INITIAL_STRATEGY for r in PLAYABLE_RACES} for _ in range(2)]
+        prior=[*root.glob('*/budget.json'),ROOT/'logs/tactical-scenarios/ledger.json']
+        state['historical_campaign_hashes'].update({str(p):hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in prior if p.is_file() and p.parent!=folder})
+    if args.skip_model_reviews:state['skip_model_reviews']=True
     limits=state['limits'];budget=DurableBudget(folder/'budget.json',state['games']*(limits['requests']*2+2))
     if len(state['matches'])>=state['games']:
         print('DUEL_SERIES_COMPLETE',folder,flush=True);return 0
@@ -268,11 +338,15 @@ def main():
         own=folder/('match-%02d'%number)/('p'+str(i+1))
         try:
             d=match_diagnostics(s,Path(s['journal']));write(own/'diagnostics.json',d)
+            if state.get('skip_model_reviews'):
+                state['matches'][-1]['model_reviews_skipped']=True
+                continue
             review=review_game(GO_MODEL,own/'review',PlayerBudget(budget,i),d,strategies[i],
                 'LLM_duel',review_context=dict(mode='LLM_duel',own_race=races[i],opponent_race=races[1-i],match=number,
                     next_match_runtime_updates=list(RUNTIME_UPDATES)))
             write(own/'review.json',review)
-            if 'strategies_by_race' in state:state['strategies_by_race'][races[i]]=review['strategy']
+            if 'strategies_by_player_race' in state:state['strategies_by_player_race'][i][races[i]]=review['strategy']
+            elif 'strategies_by_race' in state:state['strategies_by_race'][races[i]]=review['strategy']
             else:state['strategies'][i]=review['strategy']
             state['matches'][-1].setdefault('reviews',{})[str(i+1)]=dict(category=review['category'],path=str(own/'review.json'))
             print('DUEL_REVIEW',i+1,review['category'],review['reason'],flush=True)

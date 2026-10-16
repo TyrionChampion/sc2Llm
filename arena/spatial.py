@@ -19,12 +19,15 @@ You can explicitly dispatch generic missions (outer count=1):
 order_units args={unit:selector,count:1..200 or "all",mode:"move|attack_move",
 target:named place/site_N/[x,y],timeout_s:1..600,reason:short Chinese intent}.
 scout args={unit:selector,count:1..8,targets:[named places/site_N/[x,y],...]
-or "expansion_sites",timeout_s:1..600,reason:short Chinese intent}.
+or "expansion_sites",stop_on_contact:true|false optional(default true),timeout_s:1..600,reason:short Chinese intent}.
 scout only runs after YOUR command. With expansion_sites it visits known resource
 clusters without an owned base, ordered by distance from the selected squad. With
 an explicit list it follows YOUR order. Both use move, report actual arrivals/current
-visibility, and stop the mission at visible enemy contact; YOU decide whether to attack,
-retreat or continue. Neither starts another search or transfers the main army by itself.
+visibility, and by default stop the mission at visible enemy contact, including workers.
+Set stop_on_contact:false to report contacts and continue YOUR route using move, even
+past enemies; this does not attack or retreat automatically. Repeating a default scout
+may stop at the same worker again. YOU decide whether to attack, retreat or continue.
+Neither starts another search or transfers the main army by itself.
 All selectors are listed in battlefield.unit_selectors. Units already owned by custom
 skills/defense/other missions remain unavailable; requested unavailable squads wait with a
 visible reason until the deadline. Ground movement may use a reachable
@@ -61,6 +64,7 @@ def task_schemas(payload):
             {'type': 'string', 'enum': ['all']}]}, mode={'type': 'string', 'enum': ['move', 'attack_move']},
             target=target), ['unit', 'count', 'reason', 'mode', 'target']),
         'scout': obj(dict(common, count={'type': 'integer', 'minimum': 1, 'maximum': 8},
+            stop_on_contact={'type': 'boolean', 'default': True},
             targets={'anyOf': [{'type': 'string', 'enum': ['expansion_sites']},
                 {'type': 'array', 'minItems': 1, 'maxItems': 16, 'items': target}]}),
             ['unit', 'count', 'reason', 'targets']),
@@ -85,8 +89,9 @@ def validate_target(value, size):
 
 def validate_args(skill, args, size):
     required = {'unit', 'count', 'reason', 'target', 'mode'} if skill == 'order_units' else {'unit', 'count', 'reason', 'targets'}
-    if not required <= set(args) or set(args) - required - {'timeout_s'}:
-        raise ValueError('required fields: ' + str(sorted(required)) + '; optional timeout_s')
+    optional={'timeout_s'}|({'stop_on_contact'} if skill=='scout' else set())
+    if not required <= set(args) or set(args) - required - optional:
+        raise ValueError('required fields: ' + str(sorted(required)) + '; optional '+', '.join(sorted(optional)))
     if not isinstance(args['unit'], str) or args['unit'] not in selectors(): raise ValueError('unknown unit selector')
     count = args['count']
     if not ((skill == 'order_units' and count == 'all') or (type(count) is int and 1 <= count <= (200 if skill == 'order_units' else 8))):
@@ -101,6 +106,9 @@ def validate_args(skill, args, size):
         if args['mode'] not in ('move', 'attack_move'): raise ValueError('mode must be move or attack_move')
         result['target'] = validate_target(args['target'], size)
     else:
+        if type(args.get('stop_on_contact',True)) is not bool:
+            raise ValueError('stop_on_contact requires a boolean')
+        result['stop_on_contact']=args.get('stop_on_contact',True)
         targets = args['targets']
         if targets != 'expansion_sites':
             if not isinstance(targets, list) or not 1 <= len(targets) <= 16: raise ValueError('targets requires 1..16 points or expansion_sites')
@@ -312,15 +320,47 @@ class SpatialMission:
         self.arrivals = []; self.started = None; self.last_pos = None; self.changed_at = None
         self.stop_tags=set();self.stance_pending={}
         self.contacts=[];self.contact_omitted=0;self.allocated_count=0
+        self.contact_tags=set()
         self.requested_route=None
         self.engaged_target_health={}
+        self.native_paths=None;self.path_query_next_at=0;self.reported_blocked=set()
+        self.native_ability_wait=None;self.ability_query_next_at=0
 
     def close(self): self.stop_tags=set(self.tags); self.tags.clear()
     def summary(self):
         return dict(kind='spatial_mission', skill=self.skill, args=self.args, unit_tags=sorted(self.tags),
             route=[list(p) for p in self.route] if self.route is not None else None,
             requested_route=[list(p) for p in self.requested_route] if self.requested_route is not None else None,
-            route_index=self.step, visited=list(self.arrivals), strategic_decision='explicit LLM dispatch only')
+            route_index=self.step, visited=list(self.arrivals), strategic_decision='explicit LLM dispatch only',
+            **({'native_paths':self.native_paths} if self.native_paths is not None else {}),
+            **({'native_ability_wait':dict(self.native_ability_wait)} if self.native_ability_wait is not None else {}))
+
+    def observe_native_paths(self,w,q,t,units,point):
+        query=getattr(q.backend,'unit_path_distances',None)
+        if not callable(query) or w.seconds<self.path_query_next_at:return
+        self.path_query_next_at=w.seconds+3
+        ground=[u for u in units if not u.flying]
+        try:
+            distances=query(q.index,[u.tag for u in ground],point) if ground else []
+            if len(distances)!=len(ground) or any(not math.isfinite(d) or d<0 for d in distances):
+                raise ValueError('incomplete/invalid native path response')
+        except Exception as error:
+            self.native_paths=dict(game_s=w.seconds,status='unavailable',error=type(error).__name__)
+            return
+        blocked=[u for u,d in zip(ground,distances) if d==0 and u.distance(point)>4]
+        self.native_paths=dict(game_s=w.seconds,status='observed',target=list(point),
+            rows=[dict(tag=u.tag,unit=NAMES.get(u.type_id,str(u.type_id)),distance=d)
+                  for u,d in zip(ground,distances)],blocked_tags=[u.tag for u in blocked],
+            own_nearby_structures=[dict(tag=u.tag,unit=NAMES.get(u.type_id,str(u.type_id)),
+                pos=list(u.pos),radius=u.radius,completed=u.done)
+                for u in w.my_units if u.is_building and any(u.distance(actor)<=12 for actor in blocked)],
+            scope='Native owned-unit path query. Zero outside arrival radius means no current path; '
+                  'nearby own structures are context, not proven blockers. Immobile forms may also return zero. '
+                  'No lowering, relocation, alternate route or replacement selected automatically.')
+        tags={u.tag for u in blocked}
+        if tags!=self.reported_blocked:
+            q.event('spatial_path_state',task_id=t.id,blocked_tags=sorted(tags),report=self.native_paths)
+            self.reported_blocked=tags
 
     def result(self,t):
         return dict(task_id=t.id,skill=t.skill,state=t.status,reason=t.reason,
@@ -406,17 +446,23 @@ class SpatialMission:
             q.update(t,'waiting','part of allocated squad not observed; no replacement or partial dispatch');return
         if self.skill == 'scout':
             contacts = [e for e in w.enemy_units if any(u.distance(e) <= 15 for u in units)]
+            contact_tags={e.tag for e in contacts}
+            stop_on_contact=self.args.get('stop_on_contact',True)
             if contacts:
                 self.contacts=[dict(unit=NAMES.get(e.type_id,str(e.type_id)),pos=list(e.pos),game_s=round(w.seconds,2)) for e in contacts[:16]]
                 self.contact_omitted=max(0,len(contacts)-16)
+            if contacts and (stop_on_contact or contact_tags!=self.contact_tags):
                 q.event('scout_contact', task_id=t.id, contacts=self.contacts,
-                        omitted=self.contact_omitted,mission_stopped_on_contact=True,
+                        omitted=self.contact_omitted,mission_stopped_on_contact=stop_on_contact,
                         requested_goal=list(self.requested_route[self.step]),
                         resolved_goal=list(self.route[self.step]),
                         goal_arrived=all(u.distance(self.route[self.step])<=4 for u in units),
                         confirmed_arrivals=list(self.arrivals),
                         remaining_requested_route=[list(p) for p in self.requested_route[self.step:]],
-                        handling='mission stops; contact alone does not confirm target arrival; LLM decides attack/retreat/continue; no strategic takeover')
+                        handling=('mission stops; contact alone does not confirm target arrival; LLM decides attack/retreat/continue; no strategic takeover'
+                            if stop_on_contact else 'explicit stop_on_contact=false; contact reported, continuing requested move route; no automatic attack, retreat or replacement'))
+            self.contact_tags=contact_tags
+            if contacts and stop_on_contact:
                 self.finish(w,q,t,out,'completed','visible enemy contact reported; awaiting model decision',stop=True); return
         point = self.route[self.step]
         exact_arrival=all(u.distance(point)<=4 for u in units)
@@ -447,6 +493,7 @@ class SpatialMission:
                 self.finish(w,q,t,out,'completed','observed route arrivals; not victory or proof every area is clear'); return
             point = self.route[self.step]
         if self.issued:
+            self.observe_native_paths(w,q,t,units,point)
             errors = [(tag,a,code) for tag,a,code in w.errors if tag in self.tags and a in (MOVE,ATTACK)]
             if errors: raise ValueError('engine rejected spatial order: '+str(errors))
             center = tuple(sum(getattr(u,k) for u in units)/len(units) for k in ('x','y'))
@@ -467,12 +514,15 @@ class SpatialMission:
             if self.changed_at is not None and w.seconds-self.changed_at > 20:
                 raise ValueError('no observed movement progress for 20 game seconds; combat/obstruction cause unknown')
             return
+        if self.native_ability_wait is not None and w.seconds<self.ability_query_next_at:
+            q.update(t,'waiting','allocated squad native control not ready; no partial dispatch or replacement');return
         if any(not u.flying for u in units):
             requested=self.requested_route[self.step]
             point = ground_destination(w,q,units,requested); self.route[self.step] = point
             if point != requested:
                 q.event('spatial_target_resolved',task_id=t.id,requested=list(requested),actual=list(point),
                     reason='walkable tile/local reachable approach; no strategic target substitution')
+        self.observe_native_paths(w,q,t,units,point)
         mode = self.args.get('mode','move')
         # Mechanical stance change required by an explicit movement order, not strategy.
         from arena.combat_micro import UNSIEGE
@@ -490,8 +540,18 @@ class SpatialMission:
         ability=ATTACK if mode=='attack_move' else MOVE
         available=q.backend.available_abilities(q.index,sorted(self.tags))
         if q.tech_tree is None:raise ValueError('spatial mission requires engine ability catalogue')
-        if any(not q.tech_tree.ability_available(ability,available.get(tag,set())) for tag in self.tags):
-            raise ValueError('requested movement ability unavailable for allocated squad')
+        missing=sorted(tag for tag in self.tags if not q.tech_tree.ability_available(ability,available.get(tag,set())))
+        if missing:
+            if self.native_ability_wait is None:
+                self.native_ability_wait=dict(ability_id=ability,since_game_s=w.seconds,
+                    deadline_game_s=min(w.seconds+8,t.created+self.args['timeout_s']))
+            self.native_ability_wait['missing_tags']=missing
+            if w.seconds>=self.native_ability_wait['deadline_game_s']:
+                raise ValueError('requested movement ability unavailable after bounded control-readiness grace')
+            self.ability_query_next_at=w.seconds+.5
+            q.update(t,'waiting','allocated squad native control not ready; wait at most8 game seconds within original deadline; no partial dispatch or replacement')
+            return
+        self.native_ability_wait=None;self.ability_query_next_at=0
         if q.issue(t,command(ability,sorted(self.tags),pos=point),out):
             self.issued = True; self.sent = w.seconds; self.last_pos = None; self.changed_at = w.seconds
             self.engaged_target_health = {e.tag: e.health for e in w.enemy_units

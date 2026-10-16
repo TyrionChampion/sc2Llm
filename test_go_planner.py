@@ -8,7 +8,8 @@ import sys
 import unittest
 from unittest.mock import Mock, patch
 
-from arena.go_planner import GO_MODEL, GO_ENDPOINT, GoPlanner, perform_request
+from arena.go_planner import (GO_MODEL, GO_ENDPOINT, GoPlanner, GoRequestError,
+                              perform_request, transport_failure)
 from arena.autonomous_review import repair_game
 from arena.autonomous_bot import RequestBudget
 
@@ -83,7 +84,7 @@ class GoTests(unittest.TestCase):
         post=Mock(return_value=self.response())
         with patch.dict(os.environ,{'open_api_key':'test-secret'}):
             perform_request(self.request(),post)
-            self.assertEqual(post.call_args.kwargs['json']['max_tokens'],8000)
+            self.assertEqual(post.call_args.kwargs['json']['max_tokens'],16000)
             request=self.request();request['max_tokens']=12000
             perform_request(request,post)
             self.assertEqual(post.call_args.kwargs['json']['max_tokens'],12000)
@@ -99,19 +100,88 @@ class GoTests(unittest.TestCase):
         post=Mock(return_value=SimpleNamespace(status_code=429,text='echoed secret'))
         with patch.dict(os.environ,{'open_api_key':'test-secret'}):
             result=perform_request(self.request(),post)
-        self.assertIn('quota',result['error']);self.assertEqual(post.call_count,1)
+        self.assertEqual(result['error_kind'],'transient_http')
+        self.assertNotIn('quota',result['error']);self.assertEqual(post.call_count,1)
         self.assertNotIn('secret',json.dumps(result))
+
+    def test_confirmed_quota_and_account_rejection_are_permanent(self):
+        for code,body,kind in (
+                (429,{'error':{'type':'insufficient_quota','message':'test-secret'}},'quota_exhausted'),
+                (429,{'error':{'type':'rate_limit_error','message':'request quota per minute'}},'transient_http'),
+                (503,{},'transient_http'),(401,{},'account_rejected')):
+            post=Mock(return_value=SimpleNamespace(status_code=code,json=lambda:body))
+            with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+                result=perform_request(self.request(),post)
+            self.assertEqual(result['error_kind'],kind)
+            self.assertNotIn('test-secret',json.dumps(result))
+            self.assertEqual(post.call_count,1)
+
+    def test_transport_error_exports_type_without_sensitive_message(self):
+        import requests
+        for error in (requests.exceptions.ReadTimeout('test-secret'),
+                      requests.exceptions.ConnectionError('test-secret')):
+            result=transport_failure(error)
+            self.assertEqual(result['error_kind'],'transient_transport')
+            self.assertNotIn('test-secret',json.dumps(result))
+
+    def test_parent_worker_deadline_is_recorded_as_transient(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory,patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            planner=GoPlanner(GO_MODEL,directory)
+            process=Mock()
+            process.wait.side_effect=subprocess.TimeoutExpired('worker',63)
+            with patch('arena.go_planner.subprocess.Popen',return_value=process), \
+                 patch('arena.go_planner.ChatGPTSubscriptionPlanner._stop') as stop:
+                with self.assertRaises(GoRequestError) as failure:planner.chat('x','{}')
+                self.assertEqual(failure.exception.error_kind,'transient_transport')
+                self.assertTrue(stop.called)
+            record=json.loads((Path(directory)/'request-0001/result.json').read_text())
+            self.assertEqual(record['error_kind'],'transient_transport')
+            self.assertEqual(planner.attempts,1)
+            self.assertEqual(planner.calls,0)
+            self.assertEqual(planner.request_status()['state'],'failed')
+            self.assertIsNone(planner.pending)
 
     def test_wrong_returned_model_is_rejected(self):
         with patch.dict(os.environ,{'open_api_key':'test-secret'}):
             result=perform_request(self.request(),Mock(return_value=self.response(model='expensive-other-model')))
         self.assertIn('identity mismatch',result['error']);self.assertNotIn('answer',result)
 
-    def test_truncated_answer_is_rejected(self):
-        response=self.response(choices=[dict(finish_reason='length',message={'content':'{}'})])
+    def test_invalid_api_json_is_distinct_from_invalid_public_model_json(self):
+        response=SimpleNamespace(status_code=200,json=Mock(side_effect=json.JSONDecodeError('test-secret','x',0)))
         with patch.dict(os.environ,{'open_api_key':'test-secret'}):
-            result=perform_request(self.request(),Mock(return_value=response))
+            api=perform_request(self.request(),Mock(return_value=response))
+            model=perform_request(self.request(),Mock(return_value=self.response(
+                choices=[dict(finish_reason='stop',message=dict(content='test-secret invalid public JSON',reasoning_content='private reasoning'))])))
+        self.assertEqual(api['error_kind'],'transient_http')
+        self.assertEqual(api['response_stage'],'api_envelope')
+        self.assertEqual(model['error_kind'],'transient_model_output')
+        self.assertEqual(model['response_stage'],'public_answer')
+        self.assertEqual(model['metadata']['usage']['input_tokens'],10)
+        for result in (api,model):
+            self.assertNotIn('answer',result)
+            self.assertNotIn('test-secret',json.dumps(result))
+            self.assertNotIn('private reasoning',json.dumps(result))
+
+    def test_missing_choices_is_a_sanitized_api_envelope_error(self):
+        with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            result=perform_request(self.request(),Mock(return_value=SimpleNamespace(status_code=200,json=lambda:dict(error='test-secret'))))
+        self.assertEqual(result['error_kind'],'transient_http')
+        self.assertEqual(result['response_stage'],'api_envelope')
+        self.assertNotIn('test-secret',json.dumps(result))
+
+    def test_truncated_answer_is_rejected(self):
+        response=self.response(usage=dict(prompt_tokens=22640,completion_tokens=8000,
+            completion_tokens_details=dict(reasoning_tokens=8000)),
+            choices=[dict(finish_reason='length',message={'content':'','reasoning_content':'hidden reasoning'})])
+        post=Mock(return_value=response)
+        with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            result=perform_request(self.request(),post)
         self.assertIn('incomplete',result['error'])
+        self.assertEqual(result['metadata']['finish_reason'],'length')
+        self.assertEqual(result['metadata']['usage']['completion_tokens_details']['reasoning_tokens'],8000)
+        self.assertNotIn('answer',result);self.assertNotIn('hidden reasoning',json.dumps(result))
+        post.assert_called_once()
 
     def test_unsupported_requested_model_never_contacts_api(self):
         request=self.request();request['requested_model']='opencode-go/gpt-6-luna';post=Mock()

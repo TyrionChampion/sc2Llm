@@ -35,6 +35,20 @@ class QueenInjection(unittest.TestCase):
                 if allocated:self.q.defense_tags={2}
                 self.assertEqual(self.q.tick(self.world(units),set()),[])
                 self.assertEqual(self.q.tasks[0].status,'waiting')
+    def test_old_native_injection_keeps_a_free_queen_busy_until_the_order_ends(self):
+        expansion=replace(self.base,tag=3,x=60)
+        self.enqueue('expansion')
+        busy=replace(self.queen,energy=70,orders=(251,),order_targets=(1,))
+        self.assertEqual(self.q.tick(self.world([self.base,expansion,busy]),set()),[])
+        self.assertEqual(self.q.tasks[0].status,'waiting')
+        out=self.q.tick(self.world([self.base,expansion,replace(busy,orders=(),order_targets=())],seconds=2),set())
+        self.assertEqual(len(out),1);self.assertEqual(out[0].action_raw.unit_command.target_unit_tag,3)
+    def test_injection_to_another_base_is_not_an_observed_order_for_this_goal(self):
+        expansion=replace(self.base,tag=3,x=60);self.enqueue('expansion')
+        self.q.tick(self.world([self.base,expansion,self.queen]),set())
+        other_order=replace(self.queen,orders=(251,),order_targets=(1,))
+        self.assertEqual(self.q.tick(self.world([self.base,expansion,other_order],seconds=3),set()),[])
+        self.assertFalse(self.q.tasks[0].program.pending['native_order_observed'])
     def test_existing_buff_is_observable_noop_and_pending_intent_coalesces(self):
         self.enqueue();self.enqueue();self.assertEqual(len(self.q.tasks),1)
         self.assertEqual(self.q.tick(self.world([replace(self.base,buffs=(11,)),self.queen]),set()),[])
@@ -44,6 +58,48 @@ class QueenInjection(unittest.TestCase):
         self.enqueue();self.q.tick(self.world(),set())
         self.assertEqual(self.q.tick(self.world(seconds=32),set()),[])
         self.assertEqual(self.q.tasks[0].status,'failed')
+    def test_failure_keeps_current_orders_and_owned_actor_evidence_without_overwriting_them(self):
+        self.enqueue();self.q.tick(self.world(),set())
+        current=replace(self.queen,energy=56,orders=(16,),order_targets=(0,),order_positions=((60,60),))
+        foreign=replace(self.base,tag=9,alliance=4)
+        self.assertEqual(self.q.tick(self.world([self.base,current,foreign],seconds=12),set()),[])
+        failure=next(e for e in self.events if e['kind']=='inject_larva_failed')
+        proof=failure['observation_evidence']
+        self.assertEqual(proof['queen']['orders'],[16]);self.assertEqual(proof['queen']['order_positions'],[(60,60)])
+        self.assertEqual(proof['queen']['energy'],56);self.assertEqual(proof['base']['tag'],1)
+        self.assertEqual([u['tag'] for u in proof['own_nearby_buildings']],[1])
+        self.assertEqual(report(self.world([self.base,current]),self.q)['queens'][0]['orders'],[16])
+
+    def test_pre_dispatch_expiry_retains_wait_reason_and_distinguishes_live_base_from_missing_queen(self):
+        self.enqueue()
+        self.q.tick(self.world([self.base,replace(self.queen,energy=24)]),set())
+        reason=self.q.tasks[-1].reason
+        later=self.world([self.base],seconds=92)
+        self.assertEqual(self.q.tick(later,set()),[])
+        self.assertEqual(self.q.tasks[-1].status,'failed')
+        proof=next(e for e in self.events if e['kind']=='inject_larva_failed')['observation_evidence']
+        self.assertEqual(proof['phase'],'before_dispatch')
+        self.assertEqual(proof['last_wait_reason'],reason)
+        self.assertIsNone(proof['queen']);self.assertIsNone(proof['base'])
+        self.assertEqual(proof['own_queens'],[])
+        self.assertEqual([u['tag'] for u in proof['own_bases']],[1])
+        self.assertTrue(proof['own_bases'][0]['completed'])
+        self.assertFalse(any(e['kind']=='inject_larva_order_issued' for e in self.events))
+
+    def test_reported_deadline_includes_waiting_and_does_not_restart_at_dispatch(self):
+        self.enqueue()
+        self.q.tick(self.world([self.base,replace(self.queen,energy=24)]),set())
+        self.assertEqual(self.q.tasks[-1].program.summary()['deadline_game_s'],90)
+        out=self.q.tick(self.world(seconds=50),set())
+        self.assertEqual(len(out),1)
+        summary=self.q.tasks[-1].program.summary()
+        self.assertEqual(summary['request_created_game_s'],0)
+        self.assertEqual(summary['pending']['sent'],50)
+        self.assertEqual(summary['deadline_game_s'],90)
+        self.assertEqual(summary['remaining_game_s'],40)
+        self.q.tick(self.world(seconds=92),set())
+        self.assertEqual(self.q.tasks[-1].status,'failed')
+        self.assertEqual(self.q.tasks[-1].program.summary()['remaining_game_s'],0)
     def test_explicit_base_cast_can_move_a_distant_free_queen_and_keeps_it_reserved(self):
         self.enqueue();queen=replace(self.queen,x=55)
         self.assertEqual(len(self.q.tick(self.world([self.base,queen]),set())),1)
@@ -60,7 +116,8 @@ class QueenInjection(unittest.TestCase):
         event=next(e for e in self.events if e['kind']=='inject_larva_confirmed')
         self.assertEqual((event['energy_at_send'],event['energy_before'],event['energy_now']),(50,61,36))
     def test_observed_approach_can_exceed_thirty_seconds_but_deadline_is_bounded(self):
-        self.enqueue();queen=replace(self.queen,x=90,orders=(251,));self.q.tick(self.world([self.base,queen]),set())
+        self.enqueue();queen=replace(self.queen,x=90);self.q.tick(self.world([self.base,queen]),set())
+        queen=replace(queen,orders=(251,),order_targets=(self.base.tag,))
         for seconds,x in ((10,80),(20,65),(31,50)):
             self.q.tick(self.world([self.base,replace(queen,x=x,energy=50+seconds*.7)],seconds),set())
             self.assertEqual(self.q.tasks[0].status,'running')
@@ -76,5 +133,34 @@ class QueenInjection(unittest.TestCase):
         other=TaskQueue(self.f.backend('terran',[251]),0,lambda _:None)
         with self.assertRaises(PlanValidationError):other.enqueue([dict(skill='inject_larva',args=dict(base='home'))],0)
         self.assertEqual(other.tasks,[])
+
+    def test_explicit_travel_deadline_keeps_one_cast_reserved_after_ninety_seconds(self):
+        self.q.enqueue([dict(skill='inject_larva',args=dict(base='home',timeout_s=120))],0)
+        queen=replace(self.queen,x=180)
+        self.assertEqual(len(self.q.tick(self.world([self.base,queen]),set())),1)
+        queen=replace(queen,orders=(251,),order_targets=(self.base.tag,))
+        for seconds in range(10,101,10):
+            queen=replace(queen,x=180-seconds*1.4,energy=50+seconds*.7)
+            self.assertEqual(self.q.tick(self.world([self.base,queen],seconds),set()),[])
+            self.assertEqual(self.q.tasks[0].status,'running')
+            self.assertIn(2,self.q.protected())
+        self.q.tick(self.world([replace(self.base,buffs=(11,)),replace(queen,energy=queen.energy-25)],101),set())
+        self.assertEqual(self.q.tasks[0].status,'completed')
+        self.assertEqual(sum(e['kind']=='inject_larva_order_issued' for e in self.events),1)
+        self.assertNotIn(2,self.q.protected())
+
+    def test_explicit_deadline_is_bounded_and_stalled_approach_still_fails_early(self):
+        for timeout in (0,301,True,90.5,'120',None):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(PlanValidationError):
+                    self.q.enqueue([dict(skill='inject_larva',args=dict(base='home',timeout_s=timeout))],0)
+                self.assertEqual(self.q.tasks,[])
+        self.q.enqueue([dict(skill='inject_larva',args=dict(base='home',timeout_s=300))],0)
+        queen=replace(self.queen,x=180)
+        self.assertEqual(len(self.q.tick(self.world([self.base,queen]),set())),1)
+        queen=replace(queen,orders=(251,),order_targets=(self.base.tag,))
+        self.assertEqual(self.q.tick(self.world([self.base,queen],22),set()),[])
+        self.assertEqual(self.q.tasks[0].status,'failed')
+        self.assertIn('stalled',self.q.tasks[0].reason)
 
 if __name__=='__main__':unittest.main()

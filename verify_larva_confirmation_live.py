@@ -13,7 +13,9 @@ def main():
     parser.add_argument('--batch-fixture',action='store_true',help='Explicit resource/pool fixture for six zerglings; no fast build')
     parser.add_argument('--mixed-fixture',action='store_true',help='Explicit two-roach/one-overlord fixture for concurrent egg claims')
     parser.add_argument('--legacy-claims',action='store_true',help='Controlled replay of the earlier reservation rule; does not modify project sources')
+    parser.add_argument('--append-count',type=int,default=0,help='Explicitly append 1..20 products after first native order; replay same request to verify no duplicate purchase')
     args=parser.parse_args();flags.FLAGS(['larva-confirmation'])
+    if not 0<=args.append_count<=20:parser.error('append-count must be 0..20')
     folder=Path('logs/larva-confirmation-'+args.label);folder.mkdir(exist_ok=False)
     arena=queue=None;events=[];samples=[]
     if args.batch_fixture and args.mixed_fixture:parser.error('Select only one fixture')
@@ -50,8 +52,18 @@ def main():
         before_overlords={u.tag for u in w.my(106)}
         queue.enqueue(plans,w.seconds,'native confirmation control')
         task=queue.tasks[0];start=w.seconds;wall=time.monotonic();last=-1
+        append_check=None
         while w.seconds-start<30 and time.monotonic()-wall<90:
             actions=queue.tick(w,set());w=arena.step([actions,[]])[0];intel.update(w);engagements.update(w)
+            if args.append_count and append_check is None and task.program.issued:
+                pending=list(task.program.pending);issued=task.program.issued
+                plan=[dict(plans[0],count=args.append_count,
+                    args=dict(plans[0]['args'],queue_mode='append'))]
+                queue.enqueue(plan,w.seconds,'native confirmation control',request_id='append-1')
+                queue.enqueue(plan,w.seconds,'native confirmation control',request_id='append-1')
+                count+=args.append_count
+                append_check=dict(preserved_inflight=task.program.pending==pending and task.program.issued==issued,
+                    same_task=queue.tasks[0] is task,requested=count,actual_task_count=task.count)
             if w.seconds-start>=last+0.5:
                 last=w.seconds-start
                 samples.append(dict(game_s=last,state=task.status,reason=task.reason,
@@ -63,6 +75,7 @@ def main():
         report.update(state=task.status,reason=task.reason,product=NAMES[product],count=count,
             new_products=[u.tag for u in w.my(product) if u.tag not in baseline],
             samples=samples,events=events,engine_action_errors=arena.action_errors)
+        if args.append_count:report['append_check']=append_check
         report['lifecycle']=dict(alerts=[e['intel_event'] for e in events if e['kind']=='intelligence_event'],
             observation_windows=engagements.public()['windows'])
         report['task_states']=[dict(skill=t.skill,state=t.status,reason=t.reason) for t in queue.tasks]
@@ -75,6 +88,10 @@ def main():
         (folder/'result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
         print(json.dumps({k:v for k,v in report.items() if k not in ('samples','events')},ensure_ascii=False),flush=True)
     return 0 if (report.get('state')=='completed' and len(report.get('new_products',[]))>=report.get('count',1)
+        and (not args.append_count or (report.get('append_check') and all(
+            report['append_check'][k] for k in ('preserved_inflight','same_task'))
+            and report['append_check']['actual_task_count']==report['append_check']['requested']
+            and len(report['new_products'])==report['count']))
         and all(t['state']=='completed' for t in report.get('task_states',[])) and not report['engine_action_errors']) else 1
 
 if __name__=='__main__':raise SystemExit(main())

@@ -76,7 +76,7 @@ class GoStructured(unittest.TestCase):
     def test_oversize_current_fact_stops_before_model_request(self):
         client=self.packet_client();budget=RequestBudget(2)
         planner=BotPlanner(client,budget,'模型自行选择战术')
-        payload=self.payload();payload['world']=dict(current_fact='x'*45000)
+        payload=self.payload();payload['world']=dict(current_fact='x'*planner.context_limit)
         with self.assertRaises(BudgetExhausted):planner.chat('',json.dumps(payload))
         self.assertEqual(budget.used,0)
         self.assertEqual(client.attempts,0)

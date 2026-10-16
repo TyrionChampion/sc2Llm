@@ -33,6 +33,61 @@ class SpatialMissions(unittest.TestCase):
     def start(self, task):
         self.q.enqueue([task],self.w.seconds)
         return self.q.tick(self.w,set())
+    def test_newborn_squad_waits_for_native_control_without_a_stop_or_replacement(self):
+        self.backend.available_abilities=lambda i,tags,**kw:{tag:{1,4} for tag in tags}
+        self.assertEqual(self.start(order(timeout_s=90)),[])
+        task=self.q.tasks[0]
+        self.assertTrue(task.active);self.assertEqual(task.program.tags,{1})
+        self.assertEqual(task.program.summary()['native_ability_wait']['missing_tags'],[1])
+        self.backend.available_abilities=lambda i,tags,**kw:{tag:{MOVE,ATTACK} for tag in tags}
+        out=self.q.tick(replace(self.w,game_loop=self.w.game_loop+23),set())
+        self.assertEqual(len(out),1);self.assertEqual(out[0].action_raw.unit_command.ability_id,ATTACK)
+        self.assertEqual(list(out[0].action_raw.unit_command.unit_tags),[1])
+        self.assertIsNone(task.program.summary().get('native_ability_wait'))
+    def test_unavailable_squad_ability_has_a_bounded_grace_with_the_original_deadline(self):
+        self.backend.available_abilities=lambda i,tags,**kw:{tag:set() for tag in tags}
+        self.assertEqual(self.start(order(timeout_s=90)),[])
+        task=self.q.tasks[0]
+        self.assertEqual(self.q.tick(replace(self.w,game_loop=self.w.game_loop+int(7*22.4)),set()),[])
+        self.assertTrue(task.active)
+        self.q.tick(replace(self.w,game_loop=self.w.game_loop+int(9*22.4)),set())
+        self.assertEqual(task.status,'failed');self.assertIn('ability unavailable',task.reason)
+        self.assertEqual(task.program.summary()['native_ability_wait']['missing_tags'],[1])
+        short=TaskQueue(self.backend,0,lambda _:None)
+        short.enqueue([order(timeout_s=1)],self.w.seconds)
+        self.assertEqual(short.tick(self.w,set()),[])
+        self.assertEqual(short.tasks[0].program.summary()['native_ability_wait']['deadline_game_s'],self.w.seconds+1)
+        short.tick(replace(self.w,game_loop=self.w.game_loop+45),set())
+        self.assertEqual(short.tasks[0].status,'failed')
+        self.assertIn('mission game-time deadline',short.tasks[0].reason)
+
+    def test_native_unit_paths_report_blockage_and_own_structures_without_choosing_a_recovery(self):
+        calls=[];distance=[0]
+        def query(index,tags,target):
+            calls.append((index,tags,target));return [distance[0] for _ in tags]
+        self.backend.unit_path_distances=query
+        depot=unit(2,19,31,32,is_building=True)
+        enemy=replace(depot,tag=3,alliance=4)
+        far=replace(depot,tag=4,x=150,y=150)
+        self.w=replace(self.w,units=(self.marine,depot,enemy,far))
+        actions=self.start(order(timeout_s=120));self.assertEqual(len(actions),1)
+        self.assertEqual(actions[0].action_raw.unit_command.ability_id,ATTACK)
+        report=self.q.tasks[0].program.summary()['native_paths']
+        self.assertEqual(report['blocked_tags'],[1])
+        self.assertEqual([u['tag'] for u in report['own_nearby_structures']],[2])
+        self.assertEqual(report['target'],list(self.q.tasks[0].program.route[0]))
+        self.assertEqual(len(calls),1)
+        self.q.tick(replace(self.w,game_loop=int(11*22.4)),set());self.assertEqual(len(calls),1)
+        distance[0]=100
+        self.assertEqual(self.q.tick(replace(self.w,game_loop=int(14*22.4)),set()),[])
+        self.assertEqual(self.q.tasks[0].program.summary()['native_paths']['blocked_tags'],[])
+        self.assertEqual(self.q.tasks[0].program.args['target'],[80.0,80.0])
+
+    def test_path_query_failure_is_unavailable_rather_than_a_false_blocked_route(self):
+        self.backend.unit_path_distances=lambda *args:[]
+        self.assertEqual(len(self.start(order(timeout_s=120))),1)
+        report=self.q.tasks[0].program.summary()['native_paths']
+        self.assertEqual(report['status'],'unavailable');self.assertNotIn('blocked_tags',report)
 
     def test_empty_queue_never_starts_search(self):
         for s in (10,50,200):
@@ -93,6 +148,63 @@ class SpatialMissions(unittest.TestCase):
         self.assertTrue(contact['goal_arrived']);self.assertEqual(contact['resolved_goal'],list(pos))
         self.assertEqual(contact['confirmed_arrivals'],[])
         self.assertEqual(contact['remaining_requested_route'],[[80,80],[100,100]])
+
+    def test_explicit_scout_continues_route_past_worker_without_contact_spam_or_attack(self):
+        self.start(scout([[80,80],[100,100]],stop_on_contact=False))
+        enemy=unit(2,45,35,35,alliance=4)
+        w=replace(self.w,game_loop=246,units=(self.marine,enemy))
+        self.assertEqual(self.q.tick(w,set()),[])
+        task=self.q.tasks[0]
+        self.assertEqual(task.status,'running');self.assertEqual(self.q.protected(),{1})
+        contact=next(e for e in self.events if e['kind']=='scout_contact')
+        self.assertFalse(contact['mission_stopped_on_contact']);self.assertFalse(contact['goal_arrived'])
+        self.assertEqual(contact['confirmed_arrivals'],[])
+        self.assertEqual(contact['remaining_requested_route'],[[80,80],[100,100]])
+        self.assertEqual(self.q.tick(replace(w,game_loop=260),set()),[])
+        self.assertEqual(len([e for e in self.events if e['kind']=='scout_contact']),1)
+        # Contact at the first waypoint does not abandon the explicit second waypoint.
+        w=replace(w,game_loop=270,units=(replace(self.marine,x=80,y=80),replace(enemy,x=83,y=83)))
+        actions=self.q.tick(w,set())
+        self.assertEqual([a.action_raw.unit_command.ability_id for a in actions],[MOVE])
+        self.assertEqual(task.program.step,1);self.assertEqual(len(task.program.arrivals),1)
+        w=replace(w,game_loop=290,units=(replace(self.marine,x=100,y=100),replace(enemy,x=103,y=103)))
+        self.assertEqual(self.q.tick(w,set()),[])
+        self.assertEqual(task.status,'completed');self.assertEqual(len(task.program.arrivals),2)
+        self.assertEqual(self.q.protected(),set())
+
+    def test_continuing_scout_reports_new_or_returning_contacts(self):
+        self.start(scout([[80,80]],stop_on_contact=False))
+        enemy=unit(2,45,35,35,alliance=4)
+        w=replace(self.w,game_loop=246,units=(self.marine,enemy))
+        self.q.tick(w,set())
+        self.q.tick(replace(w,game_loop=260,units=(self.marine,)),set())
+        self.q.tick(replace(w,game_loop=270),set())
+        self.q.tick(replace(w,game_loop=280,units=w.units+(unit(3,45,35,35,alliance=4),)),set())
+        self.assertEqual(len([e for e in self.events if e['kind']=='scout_contact']),3)
+        self.assertEqual(self.q.tasks[0].status,'running')
+
+    def test_continuing_scout_can_dispatch_with_worker_already_visible(self):
+        self.w=replace(self.w,units=(self.marine,unit(2,45,35,35,alliance=4)))
+        actions=self.start(scout([[80,80]],stop_on_contact=False))
+        self.assertEqual([a.action_raw.unit_command.ability_id for a in actions],[MOVE])
+        self.assertEqual(list(actions[0].action_raw.unit_command.unit_tags),[1])
+        self.assertEqual(self.q.tasks[0].status,'running')
+        self.assertFalse(next(e for e in self.events if e['kind']=='scout_contact')['mission_stopped_on_contact'])
+
+    def test_continuing_scout_retains_original_deadline_and_has_no_replacement(self):
+        self.start(scout([[80,80]],stop_on_contact=False,timeout_s=5))
+        enemy=unit(2,45,35,35,alliance=4)
+        self.q.tick(replace(self.w,game_loop=246,units=(self.marine,enemy)),set())
+        self.q.tick(replace(self.w,game_loop=400,units=(self.marine,enemy)),set())
+        self.assertEqual(self.q.tasks[0].status,'failed');self.assertEqual(len(self.q.tasks),1)
+        self.assertEqual(self.q.protected(),set())
+
+    def test_stop_on_contact_is_scout_only_and_strictly_boolean(self):
+        for value in (0,1,'false',None,[]):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                validate_args('scout',scout([[80,80]],stop_on_contact=value)['args'],(200,200))
+        with self.assertRaises(ValueError):
+            validate_args('order_units',order(stop_on_contact=False)['args'],(200,200))
 
     def test_cancel_then_explicit_redeploy_same_plan(self):
         self.start(scout([[80,80]]))
@@ -291,6 +403,8 @@ class SpatialFacts(unittest.TestCase):
         variants=schema['anyOf'][0]['properties']['tasks']['items']['anyOf']
         advertised={name:v for v in variants for name in v['properties']['skill']['enum']}
         self.assertEqual(advertised['scout']['properties']['args']['properties']['targets']['anyOf'][0]['enum'],['expansion_sites'])
+        self.assertEqual(advertised['scout']['properties']['args']['properties']['stop_on_contact']['type'],'boolean')
+        self.assertNotIn('stop_on_contact',advertised['scout']['properties']['args']['required'])
         self.assertIn('args',advertised['scout']['required'])
         q=TaskQueue(b,0,lambda s:None)
         q.enqueue([scout(),order()],10)

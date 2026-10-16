@@ -295,7 +295,7 @@ class Commander:
             sent_generation=self.request_defense_generations.pop(request_id,0)
             ownership_changed=bool(self.defense and sent_generation!=self.defense.generation)
             combat_plan=bool(plan and (plan.get('skills') or any(
-                isinstance(t,dict) and isinstance(t.get('skill'),str) and (t.get('skill') in {'attack_nearest','move_out','morph_unit','cancel_python_task'}
+                isinstance(t,dict) and isinstance(t.get('skill'),str) and (t.get('skill') in {'attack_nearest','move_out','morph_unit','cancel_python_task','use_ability'}
                 or t.get('skill') in self.tasks.library
                 or (self.tasks.python_catalog and t.get('skill') in self.tasks.python_catalog.entries))
                 for t in (plan.get('tasks') if isinstance(plan.get('tasks'),list) else []))))
@@ -462,6 +462,14 @@ class Commander:
             advice=self.operator_advice.batch()
             if advice['messages']:payload['operator_advice']=advice
             if self.tasks.tech_tree is not None:
+                from arena.native_abilities import report as ability_report
+                payload['native_abilities']=ability_report(w,self.tasks)
+                from arena.native_building_cancel import report as cancellation_report
+                payload['native_building_cancellation']=cancellation_report(self.tasks)
+                from arena.native_queue_cancel import report as queue_cancellation_report
+                payload['native_queue_cancellation']=queue_cancellation_report(self.tasks)
+                from arena.native_morph_cancel import report as morph_cancellation_report
+                payload['native_morph_cancellation']=morph_cancellation_report(self.tasks)
                 from arena.knowledge import model_knowledge
                 from arena.macro import site_summary
                 from arena.rally import producer_inventory

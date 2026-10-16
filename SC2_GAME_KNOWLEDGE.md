@@ -6,25 +6,92 @@
 
 LLM 决定经济、科技、阵容及作战时机；脚本选择单位、查询合法位置、等待资源和前置，观察实际完成。没有自动替模型选择科技路线。
 
+单位完成度1不保证出生动画期间已开放移动/攻击。防守发单前查询原生可用性；
+普通调兵保留原编队和目标最多等待8游戏秒，仍受原任务截止时间约束，
+`native_ability_wait`报告缺失能力的己方单位。防守的明确拒绝按1/2/4秒退避，
+连续5次则暂停该单位发令，在`command_rejections`报告，由模型决定取消或重下。
+
 | 指令 | 参数及语义 |
 |---|---|
-| train_worker | count=1..20，生产本族工人 |
-| build_supply | 本族人口单位/建筑，外层 count=1 |
-| train_unit | args.unit 使用本族目录名，count=1..20 |
-| build_structure | args.structure 使用本族目录名，可选 base=home/expansion/观察里的 site_N，外层 count=1 |
+| train_worker | count=1..200，生产本族工人；可选 args.queue_mode=append 显式追加 |
+| build_supply | 本族人口单位/建筑，外层 count=1..200 有限批次；建筑逐个确认建成，不自动循环 |
+| train_unit | args.unit 使用本族目录名，count=1..200；可选 args.queue_mode=append 显式追加 |
+| train_unit（神族定点折跃） | 可选 args.warp_target=[x,y]；仅用就绪折跃门，在指定中心3格内查询合法供能落点；无合法落点等待，不改回主矿。不同位置分别计数 |
+| inject_larva | 虫族一次注卵，count=1，args.base=home/expansion/已观测site_N；timeout_s可选1..300秒，默认90，跨地图步行应显式留足时间；不自动循环 |
+| build_structure | args.structure 使用本族目录名，可选 base=home/expansion/观察里的 site_N，外层 count=1..200 有限批次 |
 | research | args.upgrade 使用目录名，外层 count=1；看到升级完成才算成功 |
-| morph_unit | args.unit 使用可切换形态名；可选 target=home/rally/enemy_start/nearest_enemy；count=1..20 |
+| morph_unit | args.unit 使用可切换形态名；可选 target=home/rally/enemy_start/nearest_enemy；count=1..200 |
 | gather_gas | args.workers_per_refinery=0..3，每口已建成气矿持续维持此分配；0 表示释放回矿 |
-| expand | 在已知矿区建新基地；可选 args.base=expansion/观察里的 site_N |
+| expand | 在已知矿区建新基地；可选 args.base=expansion/观察里的 site_N，count=1..200 有限批次，明确同一site无法重复开矿 |
 | gather | 将过饱和矿区的多余工人分配到缺工基地 |
+| cancel_task | args.task_id 为己方控兵任务或完全未发单的宏；不取消已经发给引擎的订单/升降，不退款 |
+| stop_production | args.task_id 为己方工人/部队生产目标；只停止未购买数量，保留已付费虫卵、变异及队列等待真实产出；不取消原生订单、不推断退款；不用于建筑、科研、免费形态或弹药 |
+| cancel_native_morph | args.task_id 为己方付费建筑升级宏；停止原目标，仅对绑定的已观察升级发取消，最多30游戏秒，不撤销已完成形态，不推断退款 |
 
-一般 args={}。生产与形态切换的 count 是期望产品数量，跳虫等按实际批次生产，可能超过奇数请求。建筑、科研、采气、开矿等外层 count 必须为1。计划中的不同产品可并存，同一活跃意图会合并。等待不会自动补建缺失前置；模型需显式安排它们。
+一般 args={}。生产、建造、扩张与形态切换的 count 是期望新增产品数量，跳虫等按实际批次生产，可能超过奇数请求。科研、采气等非批量任务外层 count 必须为1。建筑批次逐个确认建成后购买下一个；同一活跃意图重复合并，不追加数量。等待不会自动补建缺失前置；模型需显式安排它们。
+
+水晶塔默认优先分散布点；普通候选全被原生拒绝或为空时，再查询更密的候选，
+仅放宽水晶塔7格间距偏好，保留建筑碰撞、矿区、任务预留和原生合法性检查。
+macro_placement_spacing_relaxed表示原生接受了候选，不代表已经付款或建成。
+
+train_worker/train_unit 默认 queue_mode=coalesce：重复活动意图保留已有数量，不追加。
+确实要增兵时，用 `{"skill":"train_unit","count":8,"args":{"unit":"roach","queue_mode":"append"}}`。
+它向同产品的活动批次新增8只，保留已发单、虫卵及出生确认；没有活动批次则新建有限批次。
+每次新增1..200，同产品每回复只能一条append，每个活动批次剩余待产最多200，已确认产出不占此上限；建筑、形态、弹药不支持追加。
+任务requested保留累计下单历史，可能超过200；remaining才是上限口径，原订单、产出和请求去重记录不重置。
+同请求重复处理不重复追加。`active_tasks.production_quantity` 报告 requested、issued、observed_completed、unissued、awaiting_completion、remaining。
+task_coalesced明确报告added_quantity=0和原任务ID，不能将“已接受计划”误当新增订单。
+任何非法参数仍整批拒绝，合法造兵也没有入队；修正后必须显式重新下令。
+模型请求耗尽后只完成已下的有限任务，不自动循环生产、补人口、补科技或选择阵容。
+
+`stop_production`保留原requested数量，以cancelled_unissued报告停止的未购买数量；
+在途数量仍继续观察，不把停止当作产出。之后明确append只购买新增数量，不恢复已停止部分；
+默认coalesce仍不追加。需要取消已经发给引擎的原生生产时，另按专用取消工具的支持范围处理。
+
+`rally_units`用`rally_producers`实际发布的label选择生产建筑，或用`producers:"all"`选择执行时
+已完成的己方产能。已发布编号不会因其他建筑死亡或新生而重排；例如#1死亡后原#2仍是#2，
+新建筑使用新编号。迟到回复的显式label还必须对应原观测里的真实建筑，不会改选另一座。
+`expansion`/入口地标可用已建至少25%的己方地面基地作锚点；生产建筑本身仍须完成。
+显式入口允许有可见敌军，模型自行决定风险；地形/建筑占位检查保留，自动集结继续避敌。
+集结点只影响所选产能后续单位，不召回现有编队，不设置工人集结，也不替代折跃落点。
+
+基地升级完成须核对实际形态与活动任务。本次Linux4.10原生控制中，Lair升级进行时仍观察到
+Hatchery type86、progress1.0和订单1216；普通建筑完成度不代表Lair已升级完成。
+该过程中`inject_larva`已原生确认可用：真实扣Queen能量并出现基地buff11，升级订单继续。
+这确认一次注卵施放，不表示幼虫已经出生，也不自动安排下一次注卵。
 
 **付费变异使用生产接口**：火蟑螂、潜伏者、巢虫领主、监察王虫用 train_unit；虫穴、主巢、巨型尖塔、轨道指挥用 build_structure。morph_unit 只用于目录里的免费可逆形态，例如架起/解架、埋地/出土、升降及折跃门转换。
+
+`forms`中的ravager表示从ravager_burrowed解除埋地，不表示由蟑螂付费变异；活动形态任务的
+`workflow.form_sources`给出所需已有执行者。虫族批量王虫可用train_unit unit=overlord count=N；
+两条相同build_supply不会变成两只王虫。其他种族供给建筑仍用单条build_supply并核对实际完成。
+
+实时观察可能比已发出的购买晚一帧。执行器临时预留尚未确认订单的矿、气、人口，防止跨帧重复使用；
+看到原生订单/产品或拒绝后释放，不能据预留假定已支付或已完成。
+等待任务的budget.unconfirmed_purchases_reserved_at_tick_start记录本帧采用的预留及语义。
+幼虫购买可能选到与请求不同的己方幼虫；任一购买未确认时暂不发送下一笔幼虫购买。
+确认后在已有幼虫生产目标之间轮转，不改变产品/数量，也不等待完整孵化才让下一目标下单。
+等待不触发隐式重购；女王等其他生产者可继续生产。
 
 核弹 nuke 和拦截机 interceptor 是补充库存任务，count 只能为1。核弹通过本方幽灵出现核打击能力来确认，缺少幽灵时会明确等待。航母机库数量在当前观察中不能直接完整读取；满库存由无异常状态、空闲航母的能力查询推断，并明确记录推断依据，不报告虚构的精确数量。
 
 ## Python 局部战术
+
+侦察默认遇到可见敌人（包括工人）就停止并报告，接触不代表已经抵达目标。
+需要穿过接触点继续查基地时，显式用`scout args.stop_on_contact=false`：仍报告接触，
+按原路线移动直到实际到达/死亡/超时/取消，不自动攻击、撤退、补派或延长截止时间。
+反复派默认scout可能再次停在同一工人；也可显式用order_units的move模式继续前进。
+
+有`native_abilities.enabled=true`时，单次原生能力也可直接用`use_ability`，不必先写Python：
+`args={caster:己方单位tag,ability:目录准确name,target:null或当前单位tag或[x,y],timeout_s:1..120}`。
+外层count=1；每个施法者每轮一单，无自动重施。查看实时ready、能量、装载乘客及任务分配，
+先释放被其他任务占用的单位；Nexus时空加速可与生产并存。ready只代表当前原生可用性，
+不代表目标合法或战术已成功；实际拒绝、失去目标和超时都会反馈。购买/科研仍用宏。
+能力报表可能按共同列值、精确坐标整数比例和字段名索引压缩，按context_policy还原；不要直接把缩放整数当作游戏坐标。
+
+普通工人建造取消用`cancel_native_building args={task_id:己方建造宏ID}`：先停止该宏，
+再取消关联的未完成建筑或建造者赶路，避免脚本随后再买。已完成建筑明确no-op；不推定退款。
+这不是单位训练队列、科研或基地升级的取消接口。原`cancel_task`仍只撤销支持的控兵/未发单宏。
 
 准备1..4个技能，manifest.unit 使用本族单位名，或 army/worker。army 包含常规作战与支援单位，排除工人、建筑、王虫、幼虫、核弹、机库拦截机和短命召唤物等；这些单位可用各自具体选择器。错误种族的选择器在准备验收时拒绝。
 
@@ -873,6 +940,8 @@ exempt_products最多8个本族产品名、不可重复；reason非空中文说�
 启动器 official_duel.py 默认接入现场开发，可用 --without-live-skills 关闭。已有比赛必须下一次加载执行层才生效。此功能独立于防守副官。
 
 主模型发现缺少局部操作时提交：
+
+已有 `inject_larva` 可完成普通单次注卵，无需申请Python技能。下面是需要自定义循环时的开发示例；仅在现场开发已启用时可用。
 ```json
 {"tasks":[],"reason":"缺少女王注卵循环，申请补充技能","develop_skill":{"name":"queen_cycle","unit":"queen","goal":"能量足够时给未处于注卵计时的己方基地注卵，确认后等待下一轮；无目标或低能量时等待","verification":"queen_inject"}}
 ```

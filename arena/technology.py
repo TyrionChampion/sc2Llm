@@ -76,17 +76,17 @@ RULES=[
 ]
 ABILITY_NOTES={
  'zerg':[
-  '女王注卵、菌毯、治疗是主动能力，不属于research。需已登记Python cast技能；缺少时仅在live_skill_development.enabled=true时请求develop_skill。注卵选queen_inject验收。',
+  '女王注卵用inject_larva count=1 args={base:home|expansion|已观测site_N}；zerg_injection给出能量、占用和注卵buff。一单一次，不自动循环，不需Python。菌毯、治疗可用native_abilities中的use_ability，或已登记Python cast技能。',
   '潜伏者需要钻地才能输出；用tech_tree.forms中的形态，或明确派遣Python部署脚本。',
   '毒爆爆炸属于战斗控制；升级速度不会自动选择值得交换的敌军。研究/控兵由不同层执行。',
-  '火蟑螂胆汁、感染虫真菌/神经寄生、飞蛇拉人/遮蔽云等需局部施法脚本，不能将攻击移动当成已施放。',
+  '火蟑胆汁、真菌/神经寄生、飞蛇拉人/遮蔽云等用use_ability按原生可用性、己方施法者及目标明确下令，或派已登记局部施法脚本；攻击移动不等于已施放。',
   '监察王虫可侦测，王虫不能代替侦测；升级王虫速度不等于获得侦测。'],
  'terran':[
   '轨道升级用build_structure orbital_command；矿骡/扫描/补给分别用call_mule/scan/supply_drop。',
   '兴奋剂和坦克形态可由已启用combat_micro在显式作战任务内处理；自定义Python任务需自己处理，不要假设全局自动接管。',
-  '运输装卸、幽灵EMP、渡鸦技能、女妖隐形、大和炮等需已验收Python cast控制，只有完成相关研究不够。'],
+  '运输装卸、EMP、渡鸦技能、隐形、大和炮可用native_abilities中的use_ability，或已验收Python cast控制；研究完成不等于施放。'],
  'protoss':[
-  '闪烁、风暴、力场、守护者之盾、时空加速和运输装卸需要主动能力接口/已验收Python脚本；以可调用目录和引擎能力为准。',
+  '闪烁、风暴、力场、守护者之盾、时空加速和运输装卸可用native_abilities中的use_ability，或已验收Python脚本；须模型选择施法者/目标并看当前原生可用性。',
   '折跃门科技完成后仍要morph_unit转换；必须有供能、冷却与合法折跃位置。'],
 }
 

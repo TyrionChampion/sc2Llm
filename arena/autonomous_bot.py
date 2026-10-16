@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import json
 import threading
+import time
 
 from arena.match_control import surrender_blockers
 from arena.tech_tree import TOWNHALLS, WORKERS
@@ -15,74 +16,72 @@ INITIAL_STRATEGY = '''自主选择适合当前局势的战略。根据已侦察�
 空闲产能立即安排生产，产能不足就补产能，供给或前置阻塞就补齐，不让多矿经济只变成库存。
 遵守请求预算，明显不可恢复时投降。'''
 
-BOT_RULES = '''你指挥真实星际对局，自主选战略，在预算内战胜当前对手。
+BOT_RULES = '''自主指挥真实星际对局，在预算内战胜对手。
 只返回JSON：{"tasks":[],"reason":"100字内中文：路线依据、阶段目标或调整"}。
-任务用skill，例如{"skill":"train_unit","count":8,"args":{"unit":"marine"}}。
 顶层只需tasks/reason；任务仅skill/count/args。禁止type、response_format和任务级reason。
-每轮最多6个必要任务，可并排生产、补给、科技和侦察；空tasks保留任务。仅依据己方观测，不能获知迷雾后敌军。
-开局比较至少两条可行路线（扩张、机械化、防守反击、时机进攻），依地图/侦察/经济/压力
-选工人、基地、兵种比例与规模，设阶段军力/产能/升级目标和检查时点。
-reason报告实际军力、目标与依据；新观测支持才修订，未达标不称成军。
-依赖侦察的攻击或扩张须等新观测决定；同轮侦察与全军进攻不代表已获得敌情。
-生产/扩张/科技/侦察/调兵由你下令，宿主不选战略。
-下令/到达≠建成/战术成功/胜利；核对world及反馈。
-无敌情只是未侦察，不是安全；用scout补情报，别用无接触论证扩张或长期等待。
+每轮≤6任务，生产/补给/科技/侦察可并行；空tasks保留任务。仅己方观测，无迷雾敌情。
+开局比较两路（扩张/机械/防反/时机进攻），按地图/侦察/经济/压力定工人、基地、兵种比例。
+设军力/产能/升级目标与检查时点；reason报军力/目标/依据，按观测调整，达标才称成军。
+攻/扩需侦察则先等观测；同轮侦察不等于已有敌情。生产/扩张/科技/侦察/调兵须下令。
+宿主不选战略。下令/到达≠建成/战术成功/胜利；核对world/反馈，无敌情≠安全，用scout补情报。
 
-接口契约：train_worker/train_unit/morph_unit外层count为1..20，其他外层count必须1。
-train_worker、build_supply、gather、attack_nearest、move_out、no_op的args={}。
+接口契约：训练/变形/建造/扩张外层count为1..200，其他外层count必须1。
+build_supply、gather、attack_nearest、move_out、no_op的args={}，train_worker默认args={}。
 train_unit args={unit:tech_tree.units准确name}；build_structure args={structure:准确name,
 base:"home"或"expansion"或已观测site_N}；research args={upgrade:tech_tree.research准确name}。
 gather_gas args={workers_per_refinery:0..3}；expand args={base:"expansion"或已观测site_N}。
+神族可折跃兵可加warp_target:[x,y]，仅折跃门在3格内生产；无合法点则等，不转主矿。
 morph_unit args={unit:tech_tree.forms准确name,target:"home|rally|enemy_start|nearest_enemy"}。
+morph_unit仅免费形态；付费ravager/lurker/brood_lord/overseer用train_unit。forms里的ravager是解除埋地。
 build_structure也用于气矿、科技实验室/反应堆、轨道指挥；按recipes费用、前置和实际进度补齐。
 科技实验室研究与母建筑训练并行，不必停产。
-宏任务等资源/前置，不自动补建；同产品同地点活动命令合并，重复count不追加。
-按issued_quantity/observed_completed及等待原因续排。
-工人自动采矿只执行；按饱和/闲置/压力/科技决定工人、矿数、产能。
+宏任务等资源/前置，不自动补建。train_unit/train_worker的args可加queue_mode:"append"，
+count为新增1..200，每产品每轮一次，每批待产≤200；默认coalesce合并不追加。
+建筑/形态/弹药无append。按active_tasks.production_quantity与等待reason续排，完成不循环。
+build_supply count=N造本族N个补给（虫族overlord）；建筑逐个等建成。活动目标重复合并。
+plan_rejected整批未执行，纠正后重下。
+注卵用inject_larva count=1 args={base:home|expansion|site_N}；看zerg_injection，一次施法不循环。
+use_ability args={caster:己方tag,ability:准确name,target:null或tag或[x,y],timeout_s:1..120}；看native_abilities。
+每caster每轮一单，无自动重施/选目标；购买/研究用宏。
+按饱和/压力/科技选工人、矿数和产能。
 
-只预留已决定的近期扩张/必要前置，余钱按局势造兵，不为远期计划囤钱。
-每轮核对库存、产能/任务、实际军力与目标；有钱且落后就造兵，阻塞补供给/气源/前置。
-工人/基地/矿骡/研究不代替补兵；按资源/供给/吞吐/间隔选批量，完成续排，新设施投产。
-库存涨而军力不涨：闲产能排兵，忙且不足补设施，不连续只加建筑。按多矿饱和度补工/采集，
-军力落后优先补兵，压力升高重估扩张预留并优先守军；兵种、规模、扩张/出兵时机自主决定。
+仅预留已决定的近期扩张/前置，余钱造兵，不为远期囤钱。
+每轮核对库存/产能/任务/军力/目标；落后补兵，阻塞补供给/气源/前置。经济和科研不代替军队。
+按资源/供给/吞吐/间隔选批量，完成续排。闲设施排兵，忙且不足增设施。
+多矿按饱和补工；受压重估预留/守军，阵容和时机自选。
 
 经济目标可用macro_plan args={opening:"economic|pressure|defend|custom",target_bases:1..8,
 worker_target:1..90,expand_by_game_s:0..5400,reserve_expansion:true或false,reserve_for_s:30..180,
 exempt_products:[最多8个准确产品名],reason:"目标依据"}，全部字段必填。
 它只记录目标/有限预留，不自动建造，须下expand及前置。仅活动且未下令的expand可储蓄，
-计划可修订，预留到期释放。
+可修订，到期释放。
 cancel_expansion args={task_id:活动且尚未下令的expand ID}；已下令建造不能用此接口取消。
 
 防守defend_base args={base:defense_report中的label,units:[准确单位名]或"all",count:1..32,
 stance:"hold|trade|screen",timeout_s:30..900,reason:"依据"}。防守占有单位；reason里的“守坡”不派兵，须下defend_base，出击前撤防。
-cancel_task args={task_id:活动的defend_base/scout/order_units ID}，不能引用历史任务。
-scout示例：{"skill":"scout","count":1,"args":{"unit":"scv","count":1,"targets":["enemy_start"],"timeout_s":120,"reason":"侦察"}}。
-args.unit用真实选择器，args.count必填1..8，timeout_s=1..600；targets:["enemy_start"]或坐标/地标列表，或整个字符串"expansion_sites"（禁止放数组）。
-scout遇可见敌军即停，接触不等于到达/清理目标；续行用order_units move或换路线，不自动进攻。
-order_units示例：{"skill":"order_units","count":1,"args":{"unit":"army","count":36,"mode":"attack_move","target":"enemy_start","timeout_s":240,"reason":"整队出击"}}。
-args.unit用真实选择器，args.count=1..200或"all"，mode="move|attack_move"，target=地标或[x,y]，timeout_s=1..600；外层count固定1。
-army按战斗单位总数选人，不保证兵种比例；人数达标仍须检查所需支援是否实际产出且自由，
-必要时分别按兵种下令在同一点集结。数值count会等够自由单位才出发；
-attack_nearest/move_out不等待集结，只发送当前自由军队。按自己选择的战术安排侦察、分兵与集结。
-活动集结令等待时，不要另发抢占同一批单位的矛盾任务；若调整，用活动ID取消再重新下令。
+cancel_task/stop_production args={task_id:己方ID}。前者撤控兵/未发单宏；后者停后续工人/部队购买，在途保留，不退款；append仅加新量。
+scout外层count=1，args={unit:真实选择器,count:1..8,targets:["enemy_start"]或坐标/地标列表或字符串"expansion_sites",timeout_s:1..600,reason:"侦察"}。
+args.count必填；expansion_sites用整个字符串，不能放数组。
+scout默认遇敌含工人即停；args.stop_on_contact:false则报告接触并沿原路线move。接触≠到达。另可order_units move续行。
+order_units args={unit:"army"等真实选择器,count:1..200或"all",mode:"move|attack_move",target:地标或[x,y],timeout_s:1..600,reason:"意图"}；外层count=1。
+army按战斗单位数选人，不保证配比；达标仍检查支援产出/自由，必要时按兵种同点集结；数值count等够自由兵才出发。
+attack_nearest/move_out不等集结，仅派当前自由军队；自主安排侦察/分兵/集结。
+集结令等待时勿抢同批单位；调整须按活动ID取消重下。
 cancel_unit_order args={task_id:活动scout/order_units ID}。
-相同空间任务参数（reason除外）合并，不自动派第二队；按实际自由兵力规划增援。
-idle不等于自由。timeout_s从排队起算，包含等兵、赶路和交战，总对局时间更长不会延长单任务。
-rally_units args={producers:"all"或rally_producers的label列表,target:有效地标或[x,y],
-duration_s:1..3600,reason:"集结意图"}；all也包括产工人基地，选择正确生产设施。
+空间任务同参数（除reason）合并，不自动派第二队；按自由兵力增援。
+idle≠自由。timeout_s含排队、等兵、赶路、交战；对局延长不延单任务。
+rally_units args={producers:"all"或rally_producers的label列表,target:地标或[x,y],
+duration_s:1..3600,reason:"意图"}；all含产工人基地。显式入口可受威胁；锚点支持已建25%的己方基地。
 scan args={target:有效地标或[x,y]}；call_mule/supply_drop args={base:"home|expansion"}，需轨道能量。
 
-连续战损评估阵容、规模、升级、地形、视野和增援，不能重复同一失败计划。
-已侦察到成群攻城坦克时，比较机械化或空军支援、侧翼牵制、守点转科技等可执行方案；
-生化连续被范围火力重创后，应调整克制阵容或路线，不能只加人数再正面撞同一阵地。
-少量闲兵不等于成军，研究排队不等于完成；按实际需要/目标补供给。敌主矿清空且仍ongoing，
-侦察残余建筑并按观测坐标攻击；enemy_start仅固定出生点。
+战损后重估阵容/规模/升级/地形/视野/增援，勿重复失败路线。
+见坦克群比较机械/空军/侧翼/守点转科技；生化遭范围火力重创须改阵容/路线，勿只加人数正面撞阵。
+闲兵≠成军，排队≠完成；提前补供给。主矿清空仍ongoing则侦察残余建筑；enemy_start仅出生点。
 combat_micro只对已明确分配的军队使用已研究且可用的兴奋剂、坦克架起/收起，不替你选战略。
-prepared_strategy是开局前目标，其中旧局举例不是本局执行记录；执行须看本局decision_memory/反馈，契约与新观测优先。
+prepared_strategy是开局目标；旧局举例非本局，以当前decision_memory/反馈/契约为准。
 按iteration_policy的剩余请求、时间与检查间隔批量生产，避免重复等待。
-请求将尽时预排可执行的生产、部署、增援和合理任务时限。最后一轮没有后续决策，
-不能只侦察等下一轮；根据实际情报/兵力留下明确攻守令及生产集结点。编队不自动吸收新兵，须亲自派增援。
-限时允许经济/科技路线，勿拖满时限代替运营，按阶段进展评估。
+请求将尽预排生产/部署/增援和时限；末轮须按情报/兵力留下攻守令与集结点，不能只侦察等待。
+编队不吸收新兵，须派增援。限时仍可经济/科技，按阶段进展评估。
 当control_policy.surrender_allowed=true且clear_disadvantage有持续败势证据，本轮必须以唯一
 surrender任务立即认输：args={reason:"具体观测败势"}。短暂缺钱、单次拒绝或网络错误不等于败势。
 '''
@@ -234,6 +233,17 @@ def nested_contact_tables(value):
 
 def economical_payload(payload,threshold=39000):
     result = deepcopy(payload)
+    from arena.context_tables import grouped_columns
+    native=result.get('native_abilities',{})
+    for field,keys in (('actors',('unit','buffs','passengers','allocated','ready_ability_ids')),
+                       ('targets',('alliance','unit'))):
+        if field in native:native[field]=grouped_columns(native[field],keys)
+    if any(isinstance(native.get(field),dict) and native[field].get('encoding')=='column_value_groups_v1'
+           for field in ('actors','targets')):
+        result.setdefault('context_policy',{})['column_value_groups_encoding']=(
+            'column_value_groups_v1 restores a columns/rows table: each group row combines indexed common '
+            'values with vary indices; order [group,row] restores rows, or flat indices into concatenated groups. coordinates[col] divides position integers '
+            'by scale; type/mask restores numeric types. Extra retained; all values exact.')
     tree = result.get('tech_tree', {})
     for group in ('units', 'structures', 'research'):
         for entry in tree.get(group, []):
@@ -303,7 +313,7 @@ def economical_payload(payload,threshold=39000):
         result['context_policy']['omitted_upgrade_prose']='Names, costs, recipes and prerequisites retained; explanatory effect prose omitted'
         result['context_policy']['spatial_history_scope']='Historical own observations; not current occupancy or victory'
         result['context_policy']['scope']='All contacts/history are own observations; left vision is not death; no hidden enemy inference'
-    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > 41000:
+    if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold+2000:
         removed=result['context_policy'].setdefault('omitted_history',[])
         for section,key,keep in (('decision_memory','recent',2),
                 ('economy_report','recent_requested_spending',0),('economy_report','checkpoints',1)):
@@ -353,6 +363,9 @@ class BotPlanner:
         if not isinstance(strategy,str) or not strategy.strip() or len(strategy)>1800:
             raise ValueError('A complete model strategy of 1..1800 characters is required')
         self.client, self.budget = client, budget
+        self.context_limit=getattr(client,'max_battle_context_chars',45000)
+        if type(self.context_limit) is not int or not 45000<=self.context_limit<=90000:
+            raise ValueError('Battle input guard requires 45,000..90,000 characters')
         self.prepared_strategy = strategy
         self.request_limit = request_limit
         self.adaptive_cadence = adaptive_cadence
@@ -363,6 +376,9 @@ class BotPlanner:
         self.fatal_error = None
         self.fatal_kind = None
         self.consecutive_errors = 0
+        self.consecutive_transient_errors = 0
+        self.retry_not_before = 0
+        self.last_request_error = None
         self.last_request_game_s = None
         self.usage = dict(input_tokens=0, output_tokens=0, cached_input_tokens=0)
 
@@ -379,22 +395,26 @@ class BotPlanner:
         return self.client.closed
 
     def decision_interval(self):
-        if (not self.adaptive_cadence or self.policy.get('decision_urgent')
-                or self.policy.get('production_decision_due')):
+        if not self.adaptive_cadence or self.policy.get('decision_urgent'):
             return 25
         now = self.policy.get('game_s', 0)
-        if now < 180:
-            return 30
         remaining = max(1, self.request_limit-self.attempts)
         deadline=min(self.policy.get('max_game_s',1800),
                      self.policy.get('estimated_game_deadline_s',float('inf')))
+        if self.policy.get('production_decision_due'):
+            # Ordinary idle capacity is persistent, not a new emergency every 25s.
+            # Spread finite requests over the actual horizon; leave a slot for execution.
+            return 25 if now<180 else max(25,min(60,(deadline-now)/(remaining+1)))
+        if now < 180:
+            return 30
         return max(60, (deadline-now)/remaining)
 
     def ready_for_request(self):
         due = (self.last_request_game_s is None or self.policy.get('clear_disadvantage')
                or self.policy.get('game_s',float('inf'))-self.last_request_game_s >= self.decision_interval())
         return (not self.closed and not self.fatal_error and self.attempts < self.request_limit
-                and self.budget.used < self.budget.limit and bool(due))
+                and self.budget.used < self.budget.limit and bool(due)
+                and time.monotonic() >= self.retry_not_before)
 
     def chat(self, system, user):
         if not self.ready_for_request():
@@ -418,14 +438,15 @@ class BotPlanner:
                                           source='pre_match_plan',execution_evidence=False)
         payload['iteration_policy'] = dict(self.policy, request_limit=self.request_limit,
                                          requests_left=self.request_limit-self.attempts,
-                                         decision_interval_s=round(self.decision_interval(),1))
+                                         decision_interval_s=round(self.decision_interval(),1),
+                                         input_char_limit=self.context_limit)
         compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
         # Fit the FULL prompt, including changing system rules and iteration metadata.
         # Only old decision/economy history is eligible; current tasks, errors and war facts stay.
         for section,field,keep in (('decision_memory','milestones',1),
                 ('decision_memory','recent',1),('economy_report','checkpoints',1),
                 ('economy_report','recent_requested_spending',0)):
-            if len(BOT_RULES)+len(compact)<=45000:break
+            if len(BOT_RULES)+len(compact)<=self.context_limit:break
             values=payload.get(section,{}).get(field)
             if isinstance(values,list) and len(values)>keep:
                 payload[section][field]=values[-keep:] if keep else []
@@ -433,25 +454,29 @@ class BotPlanner:
                     dict(field=section+'.'+field,omitted=len(values)-keep,
                          reason='Full system and iteration metadata included in budget'))
                 compact=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
-        if len(BOT_RULES) + len(compact) > 45000:
+        if len(BOT_RULES) + len(compact) > self.context_limit:
             # Share repeated values/field names before refusing dense current combat.
             # Unlike history pruning this retains every current fact and its order.
             from arena.context_tables import object_pool, key_table
             payload['context_policy']['shared_encoding'] = (
-                'review_object_pool_v1: recursively replace {$review_ref:N} with objects[N]. '
-                'review_key_table_v1: recursively replace numeric dictionary keys with keys[N]. '
+                'review_object_pool_v1: {$review_ref:N} references objects[N]. '
+                'review_integer_pool_v1: negative integer -(N+1) references objects[N]; original negatives '
+                'are {$integer:negative}. Pool entries are literal; recursively decode their children. '
+                'review_key_table_v1 or review_key_table_base36_v1: dictionary keys index keys[N], decimal or base36 (0..9,a..z). '
                 'Decode these wrappers before nested columns/rows tables; all values retained.')
-            payload = object_pool(payload)
+            payload = object_pool(payload,integer_refs=True)
             compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
-            if len(BOT_RULES) + len(compact) > 45000:
-                payload = key_table(payload)
+            if len(BOT_RULES) + len(compact) > self.context_limit:
+                payload = key_table(payload,base36=True)
                 compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
-        if len(BOT_RULES) + len(compact) > 45000:
-            self.fatal_error = 'Battle context exceeds 45,000-character hard limit'
+        if len(BOT_RULES) + len(compact) > self.context_limit:
+            self.fatal_error = 'Battle context exceeds %s-character hard limit'%format(self.context_limit,',')
             self.fatal_kind = 'context_budget'
-            raise BudgetExhausted('Battle context exceeds 45,000-character hard limit')
+            raise BudgetExhausted(self.fatal_error)
         self.budget.reserve('battle')
-        self.last_request_game_s = payload.get('world',{}).get('game_s')
+        # Encoded envelopes do not have a top-level world. Cadence must use
+        # the original current observation, never depend on wire representation.
+        self.last_request_game_s = source.get('world',{}).get('game_s')
         self.input_chars += len(BOT_RULES) + len(compact)
         self.schema_transport_chars += schema_chars
         try:
@@ -459,12 +484,31 @@ class BotPlanner:
         except Exception as error:
             self.consecutive_errors += 1
             detail = str(error)
-            if self.consecutive_errors >= 3 or any(word in detail.lower() for word in (
+            self.last_request_error = detail
+            kind = getattr(error, 'error_kind', None)
+            permanent = kind in ('quota_exhausted', 'account_rejected', 'model_identity_mismatch') or any(word in detail.lower() for word in (
                     'http 401', 'http 402', 'http 403', 'quota', 'usage limit', 'not supported',
-                    'unauthorized', 'unexpected codex tool', 'invalid battle plan')):
+                    'unauthorized', 'unexpected codex tool', 'invalid battle plan'))
+            transient = (kind in ('transient_transport', 'transient_http', 'transient_model_output')
+                         or isinstance(error, (TimeoutError, ConnectionError))
+                         or any(label in detail.lower() for label in (
+                             'readtimeout', 'connecttimeout', 'network timeout',
+                             'http 408', 'http 425', 'http 429', 'http 500',
+                             'http 502', 'http 503', 'http 504')))
+            if transient and not permanent:
+                self.consecutive_transient_errors += 1
+                self.retry_not_before = time.monotonic() + min(
+                    60, 10 * 2 ** min(self.consecutive_transient_errors-1, 3))
+                # No hidden retries or replay of stale prompts: Commander requests
+                # a fresh observation after cooldown, within the existing budgets.
+            elif permanent or self.consecutive_errors >= 3:
                 self.fatal_error = detail
+                self.fatal_kind = 'model_unavailable'
             raise
         self.consecutive_errors = 0
+        self.consecutive_transient_errors = 0
+        self.retry_not_before = 0
+        self.last_request_error = None
         for key in self.usage:
             self.usage[key] += ((self.client.last_metadata or {}).get('usage') or {}).get(key, 0) or 0
         if getattr(self.client,'model','').startswith('opencode-go/'):
@@ -488,7 +532,15 @@ class BotPlanner:
         return self.client.last_metadata
 
     def request_status(self):
-        return self.client.request_status()
+        status = dict(self.client.request_status())
+        remaining = max(0, self.retry_not_before-time.monotonic())
+        status.update(consecutive_errors=self.consecutive_errors,
+                      input_char_limit=self.context_limit,
+                      consecutive_transient_errors=self.consecutive_transient_errors,
+                      retry_after_s=round(remaining, 2), last_error=self.last_request_error)
+        if remaining and not self.fatal_error and not self.closed:
+            status['state'] = 'retry_wait'
+        return status
 
     def close(self):
         self.client.close()

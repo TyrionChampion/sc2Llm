@@ -44,7 +44,7 @@ def producer_kind(backend, type_id):
     return FALLBACK_PRODUCER_NAMES.get(type_id)
 
 
-def producer_inventory(backend, world, index):
+def producer_inventory(backend, world, index,include_routes=True):
     """Stable type#N addressing for the player's own production buildings.
 
     Ordinals are assigned by unit tag order, like site_N naming elsewhere in this
@@ -56,20 +56,27 @@ def producer_inventory(backend, world, index):
             and u.done and not u.flying]
     records = []
     labels = {}
-    counters = {}
+    registry=getattr(backend,'_rally_producer_registry',None)
+    if registry is None:
+        registry={};backend._rally_producer_registry=registry
+    state=registry.setdefault(index,dict(labels={},counters={}))
     for unit_ in sorted(mine, key=lambda u: u.tag):
         kind = producer_kind(backend, unit_.type_id)
         if kind is None:
             continue
-        counters[kind] = counters.get(kind, 0) + 1
-        label = '%s#%d' % (kind, counters[kind])
+        key=(kind,unit_.tag)
+        if key not in state['labels']:
+            state['counters'][kind]=state['counters'].get(kind,0)+1
+            state['labels'][key]='%s#%d'%(kind,state['counters'][kind])
+        label=state['labels'][key]
         labels[unit_.tag] = label
         records.append(dict(label=label, kind=kind, tag=unit_.tag, type_id=unit_.type_id,
                             pos=[round(unit_.x, 1), round(unit_.y, 1)],
                             rally_targets=[[round(x, 1), round(y, 1), tag]
                                            for x, y, tag in unit_.rally_targets]))
-        from arena.tactical_facts import point_rally_routes
-        records[-1]['point_rally_routes']=point_rally_routes(backend,world,index,unit_)
+        if include_routes:
+            from arena.tactical_facts import point_rally_routes
+            records[-1]['point_rally_routes']=point_rally_routes(backend,world,index,unit_)
     return records, labels
 
 
@@ -147,11 +154,12 @@ class GroundMap:
         return kind,result,path[0]
 
 
-def my_townhalls(world):
-    return [u for u in world.my_units if u.type_id in TOWNHALLS and u.done and not u.flying]
+def my_townhalls(world,allow_construction=False):
+    return [u for u in world.my_units if u.type_id in TOWNHALLS and not u.flying
+            and (u.done or allow_construction and u.progress>=.25)]
 
 
-def named_rally_point(grid, backend, index, name, world,allow_threatened=False):
+def named_rally_point(grid, backend, index, name, world,allow_threatened=False,allow_construction=False):
     """Resolve one named place to a concrete point, or raise ValueError.
 
     Single source of truth for the names the commander may pass to rally_units, so no
@@ -161,6 +169,7 @@ def named_rally_point(grid, backend, index, name, world,allow_threatened=False):
     """
     home = backend.homes[index]
     enemy = backend.enemy_start(index)
+    base_requirement='completed or at least 25% constructed' if allow_construction else 'completed'
     if name == 'home':
         return (home[0], home[1]), 'home'
     if name == 'enemy_start':
@@ -173,24 +182,24 @@ def named_rally_point(grid, backend, index, name, world,allow_threatened=False):
             raise ValueError('nearest_enemy has no visible target; no fallback')
         return min(world.enemy_units, key=lambda u: u.distance(home)).pos, 'nearest_enemy'
     if name == 'expansion':
-        halls = [u for u in my_townhalls(world) if u.distance(home) > 15]
+        halls = [u for u in my_townhalls(world,allow_construction) if u.distance(home) > 15]
         if not halls:
-            raise ValueError('expansion has no completed owned expansion')
+            raise ValueError('expansion has no '+base_requirement+' owned expansion')
         base = min(halls, key=lambda u: u.distance(home))
         return (base.x, base.y), 'expansion'
     if name in ('main_ramp_top', 'expansion_entrance', 'main_ground_approach'):
         if grid is None:
             raise ValueError('no static ground map; named entrance unavailable')
-        halls = my_townhalls(world)
+        halls = my_townhalls(world,allow_construction)
         if not halls:
-            raise ValueError('no completed owned base to anchor ' + name)
+            raise ValueError('no '+base_requirement+' owned base to anchor ' + name)
         if name == 'main_ramp_top':
             base = min(halls, key=lambda u: u.distance(home))
             expansion = False
         elif name == 'expansion_entrance':
             outer = [u for u in halls if u.distance(home) > 15]
             if not outer:
-                raise ValueError('expansion_entrance has no completed owned expansion')
+                raise ValueError('expansion_entrance has no '+base_requirement+' owned expansion')
             base = max(outer, key=lambda u: u.distance(home))
             expansion = True
         else:
@@ -274,7 +283,8 @@ class RallyOrder:
             return (x + .5, y + .5), 'coordinate'
         if not isinstance(target, str):
             raise ValueError('target must be a named place or [x, y]')
-        return named_rally_point(self.grid, self.backend, self.index, target, world)
+        return named_rally_point(self.grid, self.backend, self.index, target, world,
+                                 allow_threatened=True,allow_construction=True)
 
     def tick(self, world, q, t, used, bank, out):
         """Program protocol shared with MacroRun/SkillRun: append actions, return the bank."""
@@ -307,6 +317,7 @@ class RallyOrder:
             except (ValueError, AttributeError) as error:
                 self.reason = str(error)
                 self.event('rally_order_unavailable', error=self.reason, target=self.spec.get('target'))
+                q.update(t, 'failed', self.reason)
                 return bank
             duration = self.spec.get('duration_s')
             if isinstance(duration, (int, float)) and not isinstance(duration, bool):
@@ -343,6 +354,7 @@ class RallyOrder:
             if len(abilities) != 1:
                 self.reason = 'unique GeneralRallyUnits ability not supplied by engine'
                 self.event('rally_order_unavailable', error=self.reason)
+                q.update(t, 'failed', self.reason)
                 return bank
             self.ability = ability = abilities[0]
         for tag in self.spec.get('tags', ()):

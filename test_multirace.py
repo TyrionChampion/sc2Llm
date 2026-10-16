@@ -133,7 +133,9 @@ class MultiRace(unittest.TestCase):
            'control_policy':{'spatial_missions_available':True,'defense_orders_available':True},
            'python_skill_library':[],'rally_producers':[{'label':'barracks#1'}],
            'rally_landmarks':['home','expansion','enemy_start','nearest_enemy','main_ramp_top'],
-           'defense_report':[{'label':'home'}]}
+           'defense_report':[{'label':'home'}],
+           'native_abilities':{'enabled':True,'catalogue':{'1442':{'name':'effect_blink_stalker','target':'point'}}},
+           'native_building_cancellation':{'enabled':True},'native_queue_cancellation':{'enabled':True},'native_morph_cancellation':{'enabled':True}}
   items=battle_plans.output_schema(payload)['anyOf'][0]['properties']['tasks']['items']
   in_schema=set()
   for variant in items.get('anyOf',[]):

@@ -37,7 +37,7 @@ class FormationArrival(unittest.TestCase):
     def test_missing_distant_member_and_attack_orders_do_not_count_as_arrival(self):
         target=[80,80]
         for units,mode in (([unit(1,48,80,80),unit(2,48,90,80)],'move'),
-                           ([unit(1,48,75,80),unit(2,48,85,80)],'attack_move'),
+                           ([unit(1,48,75,80,orders=(ATTACK,)),unit(2,48,85,80,orders=(ATTACK,))],'attack_move'),
                            ([unit(1,48,75,80,orders=(MOVE,)),unit(2,48,85,80,orders=(MOVE,))],'move')):
             task,events=self.mission(units,target,mode)
             self.assertEqual(task.status,'failed')

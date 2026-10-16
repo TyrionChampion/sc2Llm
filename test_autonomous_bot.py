@@ -67,6 +67,40 @@ class AutonomousTests(unittest.TestCase):
         self.assertTrue(planner.fatal_error);self.assertFalse(planner.ready_for_request())
         self.assertEqual(planner.budget.used,0)
 
+    def test_malformed_response_recovery_keeps_attempts_and_fresh_observation(self):
+        from arena.go_planner import GoRequestError
+        class Malformed(Client):
+            failures=4
+            def chat(self,system,user):
+                if self.failures:
+                    self.failures-=1;self.attempts+=1
+                    raise GoRequestError('OpenCode Go invalid public JSON answer','transient_model_output')
+                return super().chat(system,user)
+        client=Malformed();planner=BotPlanner(client,RequestBudget(6),'继续观察',request_limit=6)
+        now=100
+        with patch('arena.autonomous_bot.time.monotonic',side_effect=lambda:now):
+            for i in range(4):
+                planner.policy=dict(game_s=100+25*i)
+                with self.assertRaises(GoRequestError):planner.chat('',json.dumps({'world':{'game_s':100+25*i}}))
+                self.assertIsNone(planner.fatal_error);self.assertFalse(planner.ready_for_request())
+                now=planner.retry_not_before
+            planner.policy=dict(game_s=200)
+            planner.chat('',json.dumps({'world':{'game_s':200}}))
+        self.assertEqual(client.payload['world']['game_s'],200)
+        self.assertEqual(planner.attempts,5);self.assertEqual(planner.budget.used,5)
+        self.assertEqual(planner.consecutive_errors,0)
+
+    def test_wrong_provider_model_stops_without_fallback(self):
+        from arena.go_planner import GoRequestError
+        class WrongModel(Client):
+            def chat(self,*args):
+                self.attempts+=1
+                raise GoRequestError('OpenCode Go model identity mismatch; no fallback','model_identity_mismatch')
+        planner=BotPlanner(WrongModel(),RequestBudget(6),'保持指定模型')
+        with self.assertRaises(GoRequestError):planner.chat('','{}')
+        self.assertIsNotNone(planner.fatal_error);self.assertFalse(planner.ready_for_request())
+        self.assertEqual(planner.budget.used,1)
+
     def test_intelligence_wakeup_cannot_burn_budget_before_25_seconds(self):
         planner=BotPlanner(Client(),RequestBudget(5),'x')
         planner.policy={'game_s':100}
@@ -78,14 +112,101 @@ class AutonomousTests(unittest.TestCase):
         planner.policy={'game_s':110,'clear_disadvantage':{'kind':'no_recovery'}}
         self.assertTrue(planner.ready_for_request())
 
-    def test_three_transient_failures_stop_and_count_requests(self):
+    def test_transient_failures_back_off_then_recover_with_fresh_context(self):
+        class Broken(Client):
+            def request_status(self):return {'state':'failed'}
+            def chat(self,system,user):
+                if self.attempts < 3:
+                    self.attempts+=1
+                    raise RuntimeError('OpenCode Go request failed: ReadTimeout')
+                return super().chat(system,user)
+        planner=BotPlanner(Broken(),RequestBudget(5),'x')
+        now=100
+        with patch('arena.autonomous_bot.time.monotonic',side_effect=lambda:now):
+            for delay in (10,20,40):
+                with self.assertRaises(RuntimeError):planner.chat('','{}')
+                self.assertIsNone(planner.fatal_error)
+                planner.policy={'clear_disadvantage':True,'decision_urgent':True}
+                self.assertFalse(planner.ready_for_request())
+                self.assertEqual(planner.request_status()['state'],'retry_wait')
+                self.assertEqual(planner.request_status()['retry_after_s'],delay)
+                # Calling during cooldown must not send or spend another request.
+                attempts=planner.attempts
+                with self.assertRaises(BudgetExhausted):planner.chat('','{}')
+                self.assertEqual(planner.attempts,attempts)
+                now+=delay
+                self.assertTrue(planner.ready_for_request())
+            self.assertEqual(planner.budget.used,3)
+            planner.chat('',json.dumps({'world':{'game_s':300}}))
+            self.assertEqual(planner.client.payload['world']['game_s'],300)
+            self.assertEqual(planner.budget.used,4)
+            self.assertEqual(planner.consecutive_errors,0)
+            self.assertEqual(planner.retry_not_before,0)
+
+    def test_repeated_transport_faults_keep_both_request_caps(self):
         class Broken(Client):
             def chat(self,*args):
                 self.attempts+=1;raise RuntimeError('network timeout')
+        for global_cap,match_cap in ((3,5),(5,3)):
+            planner=BotPlanner(Broken(),RequestBudget(global_cap),'x',match_cap)
+            now=100
+            with patch('arena.autonomous_bot.time.monotonic',side_effect=lambda:now):
+                for _ in range(3):
+                    with self.assertRaises(RuntimeError):planner.chat('','{}')
+                    now=planner.retry_not_before
+                self.assertIsNone(planner.fatal_error)
+                self.assertFalse(planner.ready_for_request())
+                with self.assertRaises(BudgetExhausted):planner.chat('','{}')
+            self.assertEqual(planner.budget.used,3)
+            self.assertEqual(planner.attempts,3)
+
+    def test_invalid_worker_failures_still_stop_after_three(self):
+        class Broken(Client):
+            def chat(self,*args):
+                self.attempts+=1;raise RuntimeError('invalid worker output')
         planner=BotPlanner(Broken(),RequestBudget(5),'x')
         for _ in range(3):
             with self.assertRaises(RuntimeError):planner.chat('','{}')
-        self.assertFalse(planner.ready_for_request());self.assertEqual(planner.budget.used,3)
+        self.assertTrue(planner.fatal_error)
+        self.assertFalse(planner.ready_for_request())
+
+    def test_temporary_http_errors_recover_but_account_errors_stop(self):
+        from arena.go_planner import GoRequestError
+        for message,kind,fatal in (
+                ('HTTP 503: OpenCode Go request rejected','transient_http',False),
+                ('HTTP 429: OpenCode Go request rejected','transient_http',False),
+                ('HTTP 429: OpenCode Go quota exceeded','quota_exhausted',True),
+                ('HTTP 401: OpenCode Go request rejected','account_rejected',True)):
+            class Broken(Client):
+                def chat(self,*args):
+                    self.attempts+=1;raise GoRequestError(message,kind)
+            planner=BotPlanner(Broken(),RequestBudget(5),'x')
+            with self.assertRaises(RuntimeError):planner.chat('','{}')
+            self.assertEqual(bool(planner.fatal_error),fatal)
+            self.assertEqual(planner.budget.used,1)
+
+    def test_commander_keeps_existing_orders_during_retry_wait(self):
+        class StatusClient(Client):
+            def request_status(self):return {'state':'failed'}
+        backend=Backend()
+        backend.initial=[world([unit(1,CC,is_building=True),unit(2,48,ground_dps=10)])]
+        planner=BotPlanner(StatusClient(),RequestBudget(5),'x')
+        planner.retry_not_before=120
+        planner.consecutive_errors=3
+        planner.consecutive_transient_errors=3
+        with tempfile.TemporaryDirectory() as folder:
+            commander=Commander(backend,0,planner,opening=False,feedback_dir=folder)
+            try:
+                commander.tasks.enqueue([{'skill':'attack_nearest'}],0)
+                with patch('arena.autonomous_bot.time.monotonic',return_value=100):
+                    actions=commander.tick(backend.initial[0])
+                    self.assertEqual(commander.stats()['planner_request']['state'],'retry_wait')
+                self.assertTrue(actions)
+                self.assertTrue(any(2 in a.action_raw.unit_command.unit_tags for a in actions))
+                self.assertEqual(planner.attempts,0)
+                self.assertEqual(planner.budget.used,0)
+                self.assertIsNone(commander.client_fatal)
+            finally:commander.stop()
 
     def test_adaptive_cadence_spreads_budget_and_accelerates_visible_combat(self):
         planner=BotPlanner(Client(),RequestBudget(26),'x',adaptive_cadence=True)
@@ -113,6 +234,9 @@ class AutonomousTests(unittest.TestCase):
         planner.policy={'game_s':205,'max_game_s':1800,'production_decision_due':False}
         self.assertFalse(planner.ready_for_request())
         planner.policy['production_decision_due']=True
+        self.assertFalse(planner.ready_for_request())
+        self.assertLessEqual(planner.decision_interval(),60)
+        planner.policy['game_s']=240
         self.assertTrue(planner.ready_for_request())
         planner.client.attempts=24
         self.assertFalse(planner.ready_for_request())
@@ -336,8 +460,12 @@ class AutonomousTests(unittest.TestCase):
 
     def test_prompt_scout_matches_actual_executor(self):
         self.assertIn('targets:["enemy_start"]',BOT_RULES)
+        self.assertIn('args.stop_on_contact:false',BOT_RULES)
         validate_args('scout',dict(unit='scv',count=1,targets=['enemy_start'],
                                  timeout_s=120,reason='侦察'),(200,200))
+        args=validate_args('scout',dict(unit='scv',count=1,targets=['enemy_start'],
+            stop_on_contact=False,timeout_s=120,reason='深入侦察'),(200,200))
+        self.assertFalse(args['stop_on_contact'])
 
     def test_repair_manifest_rejects_symlinks_and_tracks_non_python(self):
         with tempfile.TemporaryDirectory() as d:

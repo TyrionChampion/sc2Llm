@@ -1,5 +1,6 @@
 """Persistent, bounded high-level task queue; observe results, don't spam orders."""
 from dataclasses import dataclass,field
+from collections import deque
 import math
 from copy import deepcopy
 import json
@@ -20,7 +21,7 @@ SPECS={
  'barracks':(BARRACKS,BUILD_BARRACKS,150,None),
  'expand':(CC,318,400,None),
 }
-ALLOWED=set(SPECS)|MACROS|{'attack_nearest','move_out','gather','no_op','macro_plan','cancel_expansion','rally_units','scout','order_units','cancel_unit_order','defend_base','cancel_task'}
+ALLOWED=set(SPECS)|MACROS|{'attack_nearest','move_out','gather','no_op','macro_plan','cancel_expansion','rally_units','scout','order_units','cancel_unit_order','defend_base','cancel_task','stop_production','use_ability','cancel_native_building','cancel_native_queue','cancel_native_morph'}
 TERMINAL={'completed','failed','cancelled'}
 
 @dataclass
@@ -43,6 +44,7 @@ class Task:
     sent: float=-999
     retry_at: float=0
     attempts: int=0
+    issued: int=0
     program: object=None
     args: dict=field(default_factory=dict)
     intent: object=None
@@ -54,6 +56,10 @@ class TaskQueue:
     def __init__(self,backend,index,emit=print,feedback=None,python_catalog=None):
         self.backend=backend; self.index=index; self.emit=emit
         self.tasks=[]; self.next_id=1; self.clock=0; self.library={}
+        self.production_append_receipts=deque(maxlen=128)
+        self.last_larva_purchase_task=0
+        self.larva_unacknowledged_at_tick_start=False
+        self.native_ability_receipts=deque(maxlen=128)
         self.feedback=feedback; self.action_contexts=[]
         self.defense_tags=set(); self.defense_paused={}; self.defense_blocked=set()
         self.python_catalog=python_catalog; self.pending_stops=[];self.python_blocked=set()
@@ -124,7 +130,8 @@ class TaskQueue:
         if isinstance(target,str):
             # Resolve once here so an unknown or currently impossible name fails at enqueue
             # time with a concrete reason, instead of silently doing nothing in battle.
-            named_rally_point(grid,self.backend,self.index,target,w)
+            named_rally_point(grid,self.backend,self.index,target,w,
+                              allow_threatened=True,allow_construction=True)
         return spec
 
     def rally_orders(self):
@@ -233,6 +240,16 @@ class TaskQueue:
         self.action_contexts.append(dict(source='task_queue' if t else 'gas_allocation',task_id=t.id if t else None,skill=t.skill if t else 'gather_gas',
                                         request_id=t.request_id if t else None))
         return True
+    @staticmethod
+    def unissued_macro(t):
+        run=t.program
+        return (isinstance(run,MacroRun) and run.spec.get('kind') in ('production','research','form')
+                and run.issued==0 and not run.pending and not run.relocation)
+    @staticmethod
+    def stoppable_production(t):
+        return bool(t and isinstance(t.program,MacroRun) and t.program.spec.get('kind')=='production'
+            and not t.program.spec['entry'].get('structure')
+            and t.program.spec['entry']['name'] not in ('nuke','interceptor'))
     def enqueue(self,items,now,source='LLM',request_id=None,skills=None):
         issues=[]
         def invalid(field,received,expected):
@@ -249,7 +266,7 @@ class TaskQueue:
                       (source,sum(t.active for t in self.tasks)))
             self.event('plan_wait',request_id=request_id,active_tasks=sum(t.active for t in self.tasks))
             return
-        clean=[]; cancellations=set(); supersedes=[]
+        clean=[]; cancellations=set(); supersedes=[];native_cancel_records={};production_stops=set()
         if sum(isinstance(i,dict) and i.get('skill')=='macro_plan' for i in items)>1:
             invalid('tasks',items,'at most one macro_plan per reply')
         for index,item in enumerate(items):
@@ -267,9 +284,42 @@ class TaskQueue:
                     not target.active or target.skill!='expand' or not isinstance(target.program,MacroRun) or target.program.issued):
                     invalid(field+'.args',args,'task_id of an active unissued expansion; native construction cannot be cancelled here')
                 else:cancellations.add(task_id)
+            elif skill=='stop_production':
+                target=next((t for t in self.tasks if t.id==args.get('task_id')),None)
+                if set(args)!={'task_id'} or type(args.get('task_id')) is not int or not self.stoppable_production(target):
+                    invalid(field+'.args',args,'task_id of an owned worker/unit production goal; no buildings, research, forms or ammo')
+                else:production_stops.add(target.id)
             elif skill=='macro_plan':
                 try:args=validate_plan(args,self.tech_tree,self.race)
                 except (ValueError,KeyError,TypeError) as e:invalid(field+'.args',args,str(e))
+            elif skill=='use_ability':
+                from arena.native_abilities import validate_args
+                try:args=validate_args(self.tech_tree,args,self.backend.size)
+                except (ValueError,KeyError,TypeError) as e:invalid(field+'.args',args,str(e))
+            elif skill=='cancel_native_building':
+                from arena.native_building_cancel import supported,capture
+                task_id=args.get('task_id');target=next((t for t in self.tasks if t.id==task_id),None)
+                if set(args)!={'task_id'} or type(task_id) is not int or target is None or not supported(target):
+                    invalid(field+'.args',args,'task_id of an owned worker-built building macro; not unit queues, research or townhall upgrades')
+                else:
+                    native_cancel_records[task_id]=capture(target)
+                    if target.active:cancellations.add(task_id)
+            elif skill=='cancel_native_queue':
+                from arena.native_queue_cancel import supported,capture
+                task_id=args.get('task_id');target=next((t for t in self.tasks if t.id==task_id),None)
+                if set(args)!={'task_id'} or type(task_id) is not int or target is None or not supported(target,self.tech_tree):
+                    invalid(field+'.args',args,'task_id of an owned unit/research macro with building producers; not eggs, morphs or construction')
+                else:
+                    native_cancel_records[task_id]=dict(capture(target,self.tech_tree),cancel_tool=skill)
+                    if target.active:cancellations.add(task_id)
+            elif skill=='cancel_native_morph':
+                from arena.native_morph_cancel import supported,capture
+                task_id=args.get('task_id');target=next((t for t in self.tasks if t.id==task_id),None)
+                if set(args)!={'task_id'} or type(task_id) is not int or target is None or not supported(target,self.tech_tree):
+                    invalid(field+'.args',args,'task_id of an owned paid building-upgrade macro; not units, research or construction')
+                else:
+                    native_cancel_records[task_id]=dict(capture(target),cancel_tool=skill)
+                    if target.active:cancellations.add(task_id)
             elif skill in python_names:
                 if skill in self.python_blocked:invalid(field+'.skill',skill,'skill is blocked pending repair; inspect skill_repairs/live_skill_development')
                 args=self.python_catalog.validate_args(skill,args,field+'.args')
@@ -300,16 +350,15 @@ class TaskQueue:
                     if same:
                         supersedes.extend(same)
                         for task_id in same:
-                            target=next(t for t in self.tasks if t.id==task_id)
-                            setattr(target,'superseded',True)
                             cancellations.add(task_id)
             elif skill=='cancel_task':
                 task_id=args.get('task_id')
                 target=next((t for t in self.tasks if t.id==task_id),None)
                 if set(args)!={'task_id'} or type(task_id) is not int or not target \
-                        or target.skill not in ('defend_base','scout','order_units'):
+                        or not (target.skill in ('defend_base','scout','order_units','rally_units')
+                                or self.unissued_macro(target)):
                     invalid(field+'.args',args,
-                            'task_id of a known defend_base/scout/order_units mission owned by this player')
+                            'task_id of an owned defend_base/scout/order_units/rally_units mission or wholly unissued macro; issued native orders/relocations cannot be cancelled here')
                 else:cancellations.add(task_id)
             elif skill in ('scout','order_units'):
                 try:args=spatial_args(skill,args,self.backend.size)
@@ -320,22 +369,32 @@ class TaskQueue:
             elif skill in MACROS and skill not in SPECS:
                 invalid(field+'.skill',skill,'backend with an engine-bound three-race tech_tree')
             else:
-                allowed={'unit'} if skill=='train_unit' else set()
+                allowed=({'unit','queue_mode'} if skill=='train_unit' else
+                         {'queue_mode'} if skill=='train_worker' else set())
                 for arg in sorted(set(args)-allowed):
                     invalid(field+'.args.'+arg,args[arg],
                             'remove this parameter; allowed args for '+skill+': '+(', '.join(sorted(allowed)) or 'none'))
                 if skill=='train_unit' and args.get('unit','marine')!='marine':
                     invalid(field+'.args.unit',args.get('unit'),'marine (currently supported unit)')
+                if skill in ('train_worker','train_unit') and args.get('queue_mode','coalesce') not in ('coalesce','append'):
+                    invalid(field+'.args.queue_mode',args.get('queue_mode'),'coalesce or append')
             count=item.get('count',1)
-            if type(count) is not int or not 1<=count<=20:
-                invalid(field+'.count',count,'integer 1..20')
-            elif skill not in ('train_worker','train_unit','morph_unit') and count!=1:
-                invalid(field+'.count',count,'1; quantities >1 are supported only for training')
+            if type(count) is not int or not 1<=count<=200:
+                invalid(field+'.count',count,'integer 1..200')
+            elif (skill not in ('train_worker','train_unit','morph_unit') and
+                  not (self.tech_tree is not None and skill in ('build_supply','build_structure','expand','supply_depot','barracks')) and count!=1):
+                invalid(field+'.count',count,'1; quantities >1 require training, forms or engine-bound construction')
             if skill=='train_unit' and isinstance(args,dict) and args.get('unit') in ('nuke','interceptor') and count!=1:
                 invalid(field+'.count',count,'1 for ammo restocking; raw API does not expose an exact stored-ammo count')
             clean.append((skill,count,args))
         if issues: raise PlanValidationError(issues)
+        casters=[args['caster'] for skill,count,args in clean if skill=='use_ability']
+        if len(set(casters))!=len(casters):
+            raise PlanValidationError([dict(field='tasks',received=casters,
+                expected='at most one explicit ability order per caster in a reply')])
         def key(skill,args):
+            if skill in ('cancel_native_building','cancel_native_queue','cancel_native_morph'):return (skill,args['task_id'])
+            if skill=='use_ability':return (skill,json.dumps(args,sort_keys=True))
             if skill=='defend_base':
                 # Distinct bases/kind-splits are distinct intents: two simultaneous defences must
                 # coexist. reason is deliberately excluded, like scout/order_units.
@@ -351,26 +410,66 @@ class TaskQueue:
                 return (skill,str(args.get('target')),'all' if requested=='all' else tuple(sorted(requested or ())))
             if self.tech_tree is not None and skill in MACROS:return intent_key(specification(self.tech_tree,self.race,skill,args))
             return skill
-        remaining={t.intent if t.intent is not None else t.skill for t in self.tasks if t.active and t.id not in cancellations}
-        incoming={key(skill,args) for skill,count,args in clean if skill not in ('cancel_python_task','cancel_expansion','cancel_unit_order','cancel_task','macro_plan')}
+        def receipt(skill,args):
+            return (source,request_id,key(skill,args)) if request_id is not None else None
+        inactive_after_stop={t.id for t in self.tasks if t.id in production_stops and not t.program.issued}
+        inactive_after_plan=cancellations|inactive_after_stop
+        append_keys=set()
+        for index,(skill,count,args) in enumerate(clean):
+            if args.get('queue_mode')!='append':continue
+            intent=key(skill,args)
+            product=(specification(self.tech_tree,self.race,skill,args)['entry']['id']
+                     if self.tech_tree is not None and skill in ('train_worker','train_unit') else intent)
+            if product in append_keys:
+                invalid('tasks[%d]'%index,args,'at most one append per product in a plan')
+            append_keys.add(product)
+            if receipt(skill,args) in self.production_append_receipts:continue
+            target=next((t for t in self.tasks if t.active and t.id not in inactive_after_plan and t.intent==intent),None)
+            remaining=(max(0,target.program.issued-len(target.program.born)) if target and target.id in production_stops
+                else self.production_quantity(target)['remaining'] if target else 0)
+            if target and remaining+count>200:
+                invalid('tasks[%d].count'%index,count,'outstanding production quantity after append must stay <=200')
+        if issues:raise PlanValidationError(issues)
+        remaining={t.intent if t.intent is not None else t.skill for t in self.tasks if t.active and t.id not in inactive_after_plan}
+        incoming={key(skill,args) for skill,count,args in clean if skill not in ('cancel_python_task','cancel_expansion','cancel_unit_order','cancel_task','stop_production','macro_plan')
+                  and not (args.get('queue_mode')=='append' and receipt(skill,args) in self.production_append_receipts)
+                  and not (skill=='use_ability' and receipt(skill,args) in self.native_ability_receipts)}
         new_count=len(incoming-remaining)
-        if sum(t.active and t.id not in cancellations for t in self.tasks)+new_count>32: raise ValueError('task queue full')
+        if sum(t.active and t.id not in inactive_after_plan for t in self.tasks)+new_count>32: raise ValueError('task queue full')
         if len((remaining|incoming)&python_names)>4: raise ValueError('at most 4 active Python tactics per player')
         for t in self.tasks:
+            if t.id in production_stops:
+                if not t.active:
+                    self.event('production_stop_noop',task_id=t.id,state=t.status,request_id=request_id)
+                else:
+                    removed=max(0,t.count-t.program.issued)
+                    if removed:
+                        t.program.cancelled_unissued=getattr(t.program,'cancelled_unissued',0)+removed
+                        t.count=t.program.issued
+                    self.event('production_goal_stopped',task_id=t.id,stopped_unissued=removed,
+                        quantity=self.production_quantity(t),native_orders_cancelled=False,refund_confirmed=False,request_id=request_id)
+                    if not t.count:self.update(t,'cancelled','Unissued production goal stopped; no native order cancelled or refund inferred')
             if t.id in cancellations:
+                if t.id in supersedes:setattr(t,'superseded',True)
                 if not t.active:
                     self.event('task_cancel_noop',task_id=t.id,skill=t.skill,state=t.status,
                                reason='Owned mission already ended; no stop order or state rewrite',
                                request_id=request_id)
                     continue
-                if t.skill in python_names or t.skill in ('scout','order_units','defend_base'):
+                if t.id in native_cancel_records:
+                    cancel_kind={'cancel_native_queue':'queue','cancel_native_morph':'morph'}.get(native_cancel_records[t.id].get('cancel_tool'),'building')
+                    self.event('native_'+cancel_kind+'_cancel_requested',original_task_id=t.id,
+                        request_id=request_id,original_request_id=t.request_id,
+                        native_cancellation_complete=False,refund_confirmed=False)
+                    self.update(t,'cancelled','Explicit macro goal stopped; linked native '+cancel_kind+' cancellation still pending')
+                elif t.skill in python_names or t.skill in ('scout','order_units','defend_base'):
                     self.pending_stops.append(t)
                     self.update(t,'cancelled',
                         'superseded by a new order for the same base; its units are inherited'
                         if getattr(t,'superseded',False)
                         else 'LLM cancelled allocated mission; stop orders pending')
                 else:
-                    self.update(t,'cancelled','LLM cancelled unissued expansion; no native construction cancelled')
+                    self.update(t,'cancelled','LLM cancelled unissued macro; no native order cancelled or spent resources refunded')
         self.tasks=[t for t in self.tasks if t.active]+[t for t in self.tasks if not t.active][-48:]
         for name,definition in proposed.items():
             if self.library.get(name)!=definition:
@@ -378,10 +477,35 @@ class TaskQueue:
                 self.event('skill_defined',skill=name,definition=deepcopy(definition),request_id=request_id,source=source)
         self.library=proposed
         for skill,count,args in clean:
-            if skill in ('cancel_python_task','cancel_expansion','cancel_unit_order','cancel_task'):continue
-            if any(t.active and (t.intent if t.intent is not None else t.skill)==key(skill,args) for t in self.tasks):
+            if skill in ('cancel_python_task','cancel_expansion','cancel_unit_order','cancel_task','stop_production'):continue
+            if skill=='use_ability' and receipt(skill,args) in self.native_ability_receipts:
+                self.event('native_ability_request_replayed',request_id=request_id,
+                           reason='same explicit request already accepted; no extra cast')
+                continue
+            append=args.get('queue_mode')=='append'
+            record=receipt(skill,args) if append else None
+            if record is not None and record in self.production_append_receipts:
+                self.event('production_append_replayed',skill=skill,request_id=request_id,
+                           added_quantity=0,reason='this explicit append request already applied')
+                continue
+            existing=next((t for t in self.tasks if t.active and
+                (t.intent if t.intent is not None else t.skill)==key(skill,args)),None)
+            if existing and append:
+                previous=existing.count;existing.count+=count
+                if record is not None:self.production_append_receipts.append(record)
+                self.event('production_appended',task_id=existing.id,skill=skill,
+                    request_id=request_id,previous_count=previous,added_quantity=count,
+                    production_quantity=self.production_quantity(existing),
+                    reason='explicit finite replenishment; in-flight orders and deadline preserved')
+                continue
+            if existing:
                 self.emit('[queue] %s duplicate active intent %s coalesced' % (source,skill))
-                self.event('task_coalesced',skill=skill,request_id=request_id,reason='same skill already active')
+                self.event('task_coalesced',skill=skill,task_id=existing.id,request_id=request_id,
+                    requested_count=count,added_quantity=0,
+                    **({'production_quantity':self.production_quantity(existing)}
+                       if skill in ('train_worker','train_unit') else {}),
+                    reason=('same intent already active; no quantity added; use queue_mode=append for explicit replenishment'
+                            if skill in ('train_worker','train_unit') else 'same intent already active; existing task preserved'))
                 continue
             t=Task(self.next_id,skill,count,source=source,request_id=request_id,created=now,args=deepcopy(args),intent=key(skill,args))
             if skill=='macro_plan':
@@ -398,6 +522,18 @@ class TaskQueue:
                 t.program=RallyOrder(self.backend,self.index,self.event,grid=grid,
                                      build_spec=lambda world, args=args, grid=grid, skill=skill: self._rally_spec(world,skill,args,grid))
             elif skill in ('scout','order_units'):t.program=SpatialMission(skill,args)
+            elif skill=='use_ability':
+                from arena.native_abilities import NativeAbilityRun
+                t.program=NativeAbilityRun(args)
+            elif skill=='cancel_native_building':
+                from arena.native_building_cancel import NativeBuildingCancelRun
+                t.program=NativeBuildingCancelRun(native_cancel_records[args['task_id']])
+            elif skill=='cancel_native_queue':
+                from arena.native_queue_cancel import NativeQueueCancelRun
+                t.program=NativeQueueCancelRun(native_cancel_records[args['task_id']])
+            elif skill=='cancel_native_morph':
+                from arena.native_morph_cancel import NativeMorphCancelRun
+                t.program=NativeMorphCancelRun(native_cancel_records[args['task_id']])
             elif skill=='defend_base':
                 from arena.defense_orders import DefendBase
                 inherited=[x for x in (next((y for y in self.tasks if y.id==task_id),None)
@@ -408,13 +544,44 @@ class TaskQueue:
                 from arena.python_skills import PythonSkillRun
                 t.program=PythonSkillRun(self.python_catalog.entries[skill],args)
             self.next_id+=1; self.tasks.append(t)
+            if skill=='use_ability' and request_id is not None:self.native_ability_receipts.append(receipt(skill,args))
+            if record is not None:self.production_append_receipts.append(record)
             self.emit('[queue] %s enqueued #%d %s count=%d' % (source,t.id,skill,count))
             self.event('task_enqueued',task_id=t.id,skill=skill,count=count,request_id=request_id,source=source)
+    @staticmethod
+    def production_quantity(t):
+        issued=t.program.issued if isinstance(t.program,MacroRun) else t.issued
+        completed=len(t.program.born) if isinstance(t.program,MacroRun) else len(t.born)
+        stopped=getattr(t.program,'cancelled_unissued',0)
+        return dict(requested=t.count+stopped,issued=issued,observed_completed=completed,
+                    unissued=max(0,t.count-issued),awaiting_completion=max(0,issued-completed),
+                    remaining=max(0,t.count-completed),**({'cancelled_unissued':stopped} if stopped else {}))
     def summary(self):
         return [{'id':t.id,'skill':t.skill,'count':t.count,'state':t.status,'reason':t.reason,
-                 **({'workflow':t.program.summary()} if t.program else {}),
+                 **({'production_quantity':self.production_quantity(t)}
+                    if t.skill in ('train_worker','train_unit','build_supply','build_structure','expand','supply_depot','barracks') else {}),
+                 **({'workflow':self.workflow_summary(t)} if t.program else {}),
                  **({'budget':t.budget} if t.budget else {})}
                 for t in self.tasks if t.active]
+    def workflow_summary(self,t):
+        result=t.program.summary()
+        if isinstance(t.program,MacroRun) and t.program.spec['kind']=='form':
+            result['form_sources']=sorted({self.tech_tree.names[r['producer']]
+                for r in t.program.spec['entry']['recipes']})
+            result['form_meaning']='Free transformation from existing source actors, not purchase of the named product.'
+        return result
+    def pending_purchase_reservations(self):
+        """Reserve uncertain in-flight purchases against potentially lagging realtime stock."""
+        result=dict(minerals=0,gas=0,supply=0,orders=0)
+        for t in self.tasks:
+            if not t.active:continue
+            purchases=(t.program.pending if isinstance(t.program,MacroRun)
+                       else getattr(t.program,'pending_purchases',()))
+            for p in purchases:
+                if p.get('seen'):continue
+                for key in ('minerals','gas','supply'):result[key]+=p.get(key,0)
+                result['orders']+=1
+        return result
     def protected(self):
         return {t.worker for t in self.tasks if t.active and t.worker}|{
             tag for t in self.tasks if t.active and t.program and getattr(t,'skill',None)!='rally_units'
@@ -504,11 +671,26 @@ class TaskQueue:
             self.event('spatial_cancel_stop_requested' if cancelled.skill in ('scout','order_units','defend_base') else
                        'python_skill_cancel_stop_requested',task_id=cancelled.id,confirmed=False)
         self.pending_stops.clear()
-        bank=w.minerals; supply=w.supply_cap-w.supply_used
-        self.gas_bank=w.vespene;self.supply_bank=supply
+        pending=self.pending_purchase_reservations()
+        self.larva_unacknowledged_at_tick_start=any(
+            p.get('larva_purchase') and not p.get('seen')
+            for task in self.tasks if task.active and isinstance(task.program,MacroRun)
+            for p in task.program.pending)
+        bank=max(0,w.minerals-pending['minerals'])
+        self.gas_bank=max(0,w.vespene-pending['gas'])
+        self.supply_bank=w.supply_cap-w.supply_used-pending['supply']
+        supply=self.supply_bank
         if self.tech_tree is not None:self.balance_gas(w,used,output)
 
         ordered=sorted(self.tasks,key=lambda t:t.id!=self.economy.budget_task)
+        # One native larva purchase may consume a different larva. Rotate
+        # requested products so the confirmation gate does not starve later goals.
+        slots=[i for i,t in enumerate(ordered) if t.active and isinstance(t.program,MacroRun)
+            and t.id!=self.economy.budget_task and t.program.issued<t.count
+            and t.program.spec.get('kind')=='production'
+            and any(r['producer']==151 for r in t.program.spec['entry']['recipes'])]
+        rotated=sorted((ordered[i] for i in slots),key=lambda t:(t.id<=self.last_larva_purchase_task,t.id))
+        for i,t in zip(slots,rotated):ordered[i]=t
         for t in ordered:
             if not t.active: continue
             if t.id in self.defense_paused:continue
@@ -526,6 +708,9 @@ class TaskQueue:
                                withheld_minerals=held_m,withheld_gas=held_g,
                                note='Task received only unreserved resources; inspect reason for other blockers.')
                           if held_m or held_g else {})
+                if pending['orders']:
+                    t.budget['unconfirmed_purchases_reserved_at_tick_start']=dict(pending)
+                    t.budget['unconfirmed_purchase_meaning']='Not a spend/completion claim; hold until observed order/product or rejection, preventing duplicate use of lagging stock.'
                 continue
             deadline=max(300,180+t.count*30)
             if now-t.created>deadline:
@@ -538,7 +723,9 @@ class TaskQueue:
                     self.army_tactics.mission(t.skill)
                     self.update(t,'completed','persistent tactical mission accepted; execution and outcome require observation')
                     continue
-                army=[u for u in w.my_units if not u.is_building and u.type_id not in WORKERS and (u.ground_dps>0 or u.air_dps>0 or u.type_id in (54,56,81,82,129,126,499,111,77,75))]
+                army=[u for u in w.my_units if u.done and not u.hallucination
+                      and not u.is_building and u.type_id not in WORKERS
+                      and (u.ground_dps>0 or u.air_dps>0 or u.type_id in (54,56,81,82,129,126,499,111,77,75))]
                 if not army:
                     self.update(t,'waiting','no combat units'); continue
                 tags=[u.tag for u in army if u.tag not in used]
@@ -556,6 +743,8 @@ class TaskQueue:
             if len(t.born)>=t.count:
                 self.update(t,'completed','observed %d newly completed unit(s)' % len(t.born)); continue
             if producer_type is not None:
+                if t.issued>=t.count:
+                    self.update(t,'running','all requested orders issued; awaiting observed completion');continue
                 producers=[u for u in w.my(producer_type) if u.done and not u.orders and u.tag not in used]
                 if not producers:
                     self.update(t,'waiting','production building busy or missing'); continue
@@ -565,6 +754,7 @@ class TaskQueue:
                     self.update(t,'waiting','resources or supply'); continue
                 p=producers[0]
                 self.issue(t,command(ability,[p.tag]),output); used.add(p.tag)
+                t.issued+=1
                 bank-=cost; supply-=1; t.sent=now
                 self.update(t,'running','training; awaiting observed completion'); continue
             # Building state is matched by new unit tag + intended location.
@@ -621,8 +811,12 @@ class TaskQueue:
             targets=[tag for tag in u.order_targets if tag in refs]
             if targets:self.gas_assignments.setdefault(u.tag,targets[0])
         old=set(self.gas_assignments)
-        self.gas_assignments={tag:ref for tag,ref in self.gas_assignments.items() if tag not in w.dead_units and ref in refs}
+        self.gas_assignments={tag:ref for tag,ref in self.gas_assignments.items()
+            if tag not in w.dead_units and ref in refs and (w.by_tag(tag) is None or tag in workers)}
         released=(old-set(self.gas_assignments))|self.gas_release_pending
+        # Hidden mining workers keep their claims; an observed building or
+        # other non-worker must neither hold a slot nor receive a gather order.
+        released={tag for tag in released if w.by_tag(tag) is None or tag in workers}
         target=self.gas_workers_per_refinery
         for ref in refs:
             assigned=sorted(tag for tag,r in self.gas_assignments.items() if r==ref)

@@ -32,6 +32,20 @@ class LarvaConfirmation(unittest.TestCase):
         self.tick([self.f.unit(1,151),replace(self.f.unit(2,103,orders=(1342,)),x=80)])
         self.assertTrue(self.t.active);self.assertTrue(self.run.pending[0]['seen'])
         self.assertEqual(self.run.pending[0]['tags'],[2]);self.assertEqual(self.run.born,set())
+    def test_acknowledged_old_egg_cannot_steal_a_later_redirected_purchase(self):
+        for old_present in (True,False):
+            with self.subTest(old_present=old_present):
+                self.setUp();self.t.count=2;self.run.issued=2
+                self.run.pending[0]['seen']=True
+                new=dict(self.run.pending[0],tags=[3],sent=9,seen=False,eggs_before=[])
+                self.run.pending.append(new)
+                completed=self.f.unit(1 if old_present else 5,104)
+                self.tick([completed,self.f.unit(3,151),self.f.unit(2,103,orders=(1342,))])
+                self.assertTrue(self.t.active)
+                self.assertEqual(len(self.run.pending),1)
+                self.assertIs(self.run.pending[0],new)
+                self.assertEqual(new['tags'],[2]);self.assertTrue(new['seen'])
+                self.assertEqual(self.run.born,{completed.tag})
     def test_one_egg_cannot_acknowledge_two_pending_purchases(self):
         self.t.count=2;self.run.issued=2
         self.run.pending.append(dict(self.run.pending[0],tags=[3]))

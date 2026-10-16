@@ -10,8 +10,9 @@ class WarpConfirmation(unittest.TestCase):
   self.f=fixtures.MultiRace();self.f.setUp();self.b=self.f.backend('protoss');self.q=TaskQueue(self.b,0,lambda kind,**kw:None)
   self.q.enqueue([dict(skill='train_unit',args=dict(unit='zealot'),count=2)],0);self.t=self.q.tasks[0]
   self.run=MacroRun(specification(self.f.tree,'protoss','train_unit',{'unit':'zealot'}),{'unit':'zealot'})
+  self.t.program=self.run
   self.run.baseline=set();self.run.issued=2;self.run.next_at=100
-  self.run.pending=[dict(tags=[1],ability=1413,sent=0,seen=False,pos=(35,35),ack_timeout_s=30,consumes_actor=False)]
+  self.run.pending=[dict(tags=[1],ability=1413,sent=0,seen=False,pos=(35,35),ack_timeout_s=30,consumes_actor=False,warp_in=True)]
  def test_slow_warp_remains_pending_until_a_real_unit_is_observed(self):
   w=replace(self.f.world([self.f.unit(1,133)],race='protoss'),game_loop=224)
   self.run.tick(w,self.q,self.t,set(),500,[])

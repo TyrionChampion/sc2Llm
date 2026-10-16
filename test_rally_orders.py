@@ -214,6 +214,83 @@ class RallyOrderQueue(unittest.TestCase):
         self.assertAlmostEqual(command_.target_world_space_pos.x, 30)
         self.assertAlmostEqual(command_.target_world_space_pos.y, 30)
 
+    def test_producer_label_survives_an_earlier_building_death_and_lower_tag_birth(self):
+        from arena.rally import producer_inventory
+        initial=replace(self.world,units=(self.fixture.unit(10,HATCHERY,is_building=True),self.fixture.unit(20,HATCHERY,is_building=True)))
+        self.assertEqual(producer_inventory(self.backend,initial,0)[1],{10:'hatchery#1',20:'hatchery#2'})
+        after=replace(initial,units=(self.fixture.unit(20,HATCHERY,is_building=True),))
+        self.assertEqual(producer_inventory(self.backend,after,0)[1],{20:'hatchery#2'})
+        # Native tag order need not equal the order buildings were first observed.
+        after=replace(after,units=after.units+(self.fixture.unit(5,HATCHERY,is_building=True),))
+        self.assertEqual(producer_inventory(self.backend,after,0)[1],{5:'hatchery#3',20:'hatchery#2'})
+
+    def test_labels_are_player_local_and_morph_does_not_renumber_surviving_hatcheries(self):
+        from arena.rally import producer_inventory
+        producer_inventory(self.backend,self.world,0)
+        after=replace(self.world,units=(self.fixture.unit(1,100,is_building=True),self.fixture.unit(2,HATCHERY,is_building=True)))
+        self.assertEqual(producer_inventory(self.backend,after,0)[1],{1:'lair#1',2:'hatchery#2'})
+        other=replace(self.world,units=(self.fixture.unit(9,HATCHERY,is_building=True),))
+        self.assertEqual(producer_inventory(self.backend,other,1)[1],{9:'hatchery#1'})
+
+    def test_late_selector_cannot_rebind_to_a_new_building_after_the_original_dies(self):
+        from arena.battle_plans import capture,revalidate
+        before=capture(self.world,self.queue)
+        after=replace(self.world,units=(self.fixture.unit(2,HATCHERY,is_building=True),self.fixture.unit(4,HATCHERY,is_building=True)))
+        plan=dict(tasks=[dict(skill='rally_units',args=dict(producers=['hatchery#1'],target='home'))])
+        self.assertTrue(revalidate(plan,before,after,self.queue,(30,30),35))
+
+    def test_late_selector_with_a_stable_ordinal_gap_still_targets_its_original_building(self):
+        from arena.battle_plans import capture,revalidate
+        before=capture(self.world,self.queue)
+        after=replace(self.world,units=(self.fixture.unit(2,HATCHERY,is_building=True),))
+        plan=dict(tasks=[dict(skill='rally_units',args=dict(producers=['hatchery#2'],target='home'))])
+        self.assertEqual(revalidate(plan,before,after,self.queue,(30,30),35),[])
+
+    def test_late_selector_for_a_building_absent_from_the_request_needs_a_fresh_decision(self):
+        from arena.battle_plans import capture,revalidate
+        before=capture(self.world,self.queue)
+        after=replace(self.world,units=self.world.units+(self.fixture.unit(4,HATCHERY,is_building=True),))
+        plan=dict(tasks=[dict(skill='rally_units',args=dict(producers=['hatchery#3'],target='home'))])
+        self.assertTrue(revalidate(plan,before,after,self.queue,(30,30),35))
+
+    def test_explicit_entrance_can_anchor_to_a_partly_built_owned_expansion(self):
+        self.world=replace(self.world,units=(self.fixture.unit(1,HATCHERY,is_building=True),
+            replace(self.fixture.unit(2,HATCHERY,is_building=True),x=60,progress=.59)))
+        cmds=self.commands([dict(skill='rally_units',args=dict(producers='all',target='expansion_entrance'))],1)
+        self.assertEqual(list(cmds),[(1,)])
+        self.assertGreater(cmds[(1,)].target_world_space_pos.x,60)
+        self.assertEqual(self.queue.tasks[-1].status,'running')
+
+    def test_early_unfinished_expansion_and_nonowned_bases_are_not_rally_anchors(self):
+        for progress,alliance in ((.24,1),(.59,4)):
+            with self.subTest(progress=progress,alliance=alliance):
+                self.setUp()
+                self.world=replace(self.world,units=(self.fixture.unit(1,HATCHERY,is_building=True),
+                    replace(self.fixture.unit(2,HATCHERY,is_building=True),x=60,progress=progress,alliance=alliance)))
+                self.assertEqual(self.commands([dict(skill='rally_units',args=dict(producers='all',target='expansion_entrance'))],1),{})
+                self.assertEqual(self.queue.tasks[-1].status,'failed')
+
+    def test_explicit_threatened_entrance_keeps_geometry_but_does_not_choose_tactics(self):
+        from arena.rally import named_rally_point
+        self.world=replace(self.world,units=(self.fixture.unit(1,HATCHERY,is_building=True),
+            replace(self.fixture.unit(2,HATCHERY,is_building=True),x=60)))
+        point,_=named_rally_point(self.backend.grid,self.backend,0,'expansion_entrance',self.world)
+        pressure=replace(self.fixture.unit(9,48),x=point[0],y=point[1],alliance=4,ground_dps=10,attack_range=20)
+        self.world=replace(self.world,units=self.world.units+(pressure,))
+        with self.assertRaisesRegex(ValueError,'threatened'):
+            named_rally_point(self.backend.grid,self.backend,0,'expansion_entrance',self.world)
+        cmds=self.commands([dict(skill='rally_units',args=dict(producers=['hatchery#1'],target='expansion_entrance'))],1)
+        self.assertEqual(list(cmds),[(1,)])
+        self.assertAlmostEqual(cmds[(1,)].target_world_space_pos.x,point[0])
+        self.assertAlmostEqual(cmds[(1,)].target_world_space_pos.y,point[1])
+
+    def test_explicit_entrance_still_rejects_an_occupied_approach(self):
+        obstacles=[replace(self.fixture.unit(20+i,21,is_building=True),x=60+i,y=30+i) for i in range(10)]
+        self.world=replace(self.world,units=(self.fixture.unit(1,HATCHERY,is_building=True),
+            replace(self.fixture.unit(2,HATCHERY,is_building=True),x=60),*obstacles))
+        self.assertEqual(self.commands([dict(skill='rally_units',args=dict(producers='all',target='expansion_entrance'))],1),{})
+        self.assertEqual(self.queue.tasks[-1].status,'failed')
+
     def test_same_plan_is_coalesced_and_different_producers_coexist(self):
         self.commands([{'skill': 'rally_units', 'args': {'producers': ['hatchery#1'], 'target': 'home'}}])
         self.commands([{'skill': 'rally_units', 'args': {'producers': ['hatchery#1'], 'target': 'home'}}])
@@ -223,6 +300,65 @@ class RallyOrderQueue(unittest.TestCase):
         active = [t for t in self.queue.tasks if t.active and t.skill == 'rally_units']
         self.assertEqual(len(active), 2, '不同产能的订单应共存')
         self.assertEqual(self.queue.rally_owned_tags(), {1, 2})
+
+    def test_generic_cancel_can_replace_owned_rally_without_rejecting_reinforcements(self):
+        self.commands([dict(skill='rally_units',args=dict(producers=['hatchery#1'],target='home'))])
+        old=self.queue.tasks[-1]
+        self.queue.enqueue([dict(skill='cancel_task',args=dict(task_id=old.id)),
+            dict(skill='rally_units',args=dict(producers=['hatchery#1'],target=[80,80],reason='前线集结')),
+            dict(skill='train_worker',count=2)],6)
+        self.assertEqual(old.status,'cancelled')
+        commands=self.queue.tick(replace(self.world,game_loop=int(7*22.4)),set())
+        rally=[a.action_raw.unit_command for a in commands
+               if a.action_raw.unit_command.ability_id==RALLY_ABILITY]
+        self.assertEqual(len(rally),1)
+        self.assertEqual((rally[0].target_world_space_pos.x,rally[0].target_world_space_pos.y),(79.5,79.5))
+        self.assertEqual(len(self.queue.rally_orders()),1)
+        self.assertEqual(self.queue.tasks[-1].count,2)
+
+    def test_ended_rally_cancel_is_noop_and_mixed_invalid_plan_preserves_active_rally(self):
+        from arena.tasks import PlanValidationError
+        self.commands([dict(skill='rally_units',args=dict(producers=['hatchery#1'],target='home'))])
+        old=self.queue.tasks[-1]
+        with self.assertRaises(PlanValidationError):self.queue.enqueue([
+            dict(skill='cancel_task',args=dict(task_id=old.id)),dict(skill='invented')],6)
+        self.assertTrue(old.active)
+        self.queue.update(old,'completed','expired')
+        self.queue.enqueue([dict(skill='cancel_task',args=dict(task_id=old.id))],7)
+        self.assertEqual(old.status,'completed')
+        with self.assertRaises(PlanValidationError):self.queue.enqueue([dict(skill='cancel_task',args=dict(task_id=999))],7)
+
+    def test_late_cancel_of_a_known_rally_remains_valid_after_expiration(self):
+        from arena.battle_plans import capture,revalidate
+        self.commands([dict(skill='rally_units',args=dict(producers=['hatchery#1'],target='home'))])
+        old=self.queue.tasks[-1];before=capture(self.world,self.queue)
+        plan=dict(tasks=[dict(skill='cancel_task',args=dict(task_id=old.id))])
+        self.assertEqual(revalidate(plan,before,self.world,self.queue,(30,30),35),[])
+        self.assertTrue(old.active)
+        self.queue.update(old,'completed','expired while the model was thinking')
+        self.assertEqual(revalidate(plan,before,self.world,self.queue,(30,30),35),[])
+        self.assertEqual(old.status,'completed')
+
+    def test_late_rally_cancel_rejects_unknown_or_newly_created_targets(self):
+        from arena.battle_plans import capture,revalidate
+        before=capture(self.world,self.queue)
+        self.commands([dict(skill='rally_units',args=dict(producers=['hatchery#1'],target='home'))])
+        for task_id in (self.queue.tasks[-1].id,999):
+            self.assertTrue(revalidate(dict(tasks=[dict(skill='cancel_task',args=dict(task_id=task_id))]),
+                before,self.world,self.queue,(30,30),35))
+
+    def test_late_player_two_defense_uses_its_own_published_base_labels(self):
+        from arena.battle_plans import capture,revalidate
+        from arena.defense_orders import base_labels
+        from arena.tasks import TaskQueue
+        self.backend.homes=[(30,30),(150,150)];self.backend.races=['zerg','zerg']
+        q=TaskQueue(self.backend,1,lambda _:None)
+        w=replace(self.world,units=(self.fixture.unit(1,HATCHERY,is_building=True),
+            replace(self.fixture.unit(2,HATCHERY,is_building=True),x=150,y=150)))
+        self.assertEqual(base_labels(w,self.backend.homes[1]),{1:'base_1',2:'home'})
+        before=capture(w,q)
+        plan=dict(tasks=[dict(skill='defend_base',args=dict(base='base_1',units='all'))])
+        self.assertEqual(revalidate(plan,before,w,q,self.backend.homes[1],35),[])
 
     def test_coordinate_target_is_clamped_to_a_grid_cell(self):
         # 坐标永远被夹到最近的合法格心(不会直接采用浮点原始坐标);1 格内即为通过。
@@ -238,6 +374,20 @@ class RallyOrderQueue(unittest.TestCase):
             self.assertLessEqual(abs(x - raw[0]), 1.5)
             self.assertLessEqual(abs(y - raw[1]), 1.5)
             self.assertTrue(self.backend.grid.free(int(x), int(y)))
+
+    def test_unresolvable_coordinate_fails_and_releases_automatic_rally_ownership(self):
+        self.assertEqual(self.commands([dict(skill='rally_units',args=dict(producers='all',target=[250,250]))],1),{})
+        task=self.queue.tasks[-1]
+        self.assertEqual(task.status,'failed')
+        self.assertIn('no ground cell',task.reason)
+        self.assertEqual(self.queue.rally_owned_tags(),set())
+
+    def test_missing_native_rally_identity_fails_and_releases_ownership(self):
+        self.backend.tech_tree=SimpleNamespace(abilities={})
+        self.assertEqual(self.commands([dict(skill='rally_units',args=dict(producers='all',target='home'))],1),{})
+        self.assertEqual(self.queue.tasks[-1].status,'failed')
+        self.assertIn('GeneralRallyUnits',self.queue.tasks[-1].reason)
+        self.assertEqual(self.queue.rally_owned_tags(),set())
 
     def test_bad_selector_or_target_is_rejected_at_enqueue(self):
         from arena.tasks import PlanValidationError

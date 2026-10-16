@@ -5,6 +5,7 @@ import tempfile
 import sys
 from types import SimpleNamespace
 import unittest
+import gzip
 from unittest.mock import patch
 
 from arena.autonomous_bot import RequestBudget
@@ -19,6 +20,26 @@ class ReviewClient:
 
 
 class ReviewTests(unittest.TestCase):
+    def test_actual_terran_review_keeps_all_worlds_with_the_go_input_guard(self):
+        from arena.go_planner import GO_MODEL
+        from arena.context_tables import decode_tables
+        fixture=json.loads(gzip.decompress((Path(__file__).parent/'testdata/duel-terran-review-diagnostics.json.gz').read_bytes()))
+        diagnostic=fixture['diagnostics']
+        captured={}
+        class Client(ReviewClient):
+            def chat(self,rules,observation):
+                captured.update(rules=rules,observation=observation)
+                return json.dumps(dict(tasks=[],category='strategy',strategy='比较机械防反与生化侧翼，依据侦察决定。'))
+        budget=RequestBudget(2)
+        with patch('arena.autonomous_review.GoPlanner',Client):
+            review_game(GO_MODEL,'/tmp/unused-review-fixture',budget,diagnostic,fixture['strategy'],'LLM_duel',
+                        review_context=fixture['review_context'])
+        self.assertEqual(budget.used,1)
+        self.assertLessEqual(len(captured['rules'])+len(captured['observation']),90000)
+        evidence=decode_tables(json.loads(captured['observation']))['evidence']
+        worlds=[row.get('world',None) if 'world' in row else evidence['timeline_worlds'][row['world_index']]
+                for row in evidence['timeline']]
+        self.assertEqual(worlds,[row['world'] for row in diagnostic['timeline']])
     def test_large_review_roundtrips_every_world_and_task_change(self):
         from arena.context_tables import decode_tables
         task={'id':1,'skill':'train_unit','state':'running','count':20,

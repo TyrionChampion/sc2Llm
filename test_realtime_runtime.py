@@ -91,6 +91,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(actions[0].action_raw.unit_command.ability_id,ATTACK)
         self.assertEqual(list(actions[0].action_raw.unit_command.unit_tags),[2])
         self.assertEqual(r.counts['retreat'],0);self.assertEqual(r.counts['defend'],0)
+    def test_legacy_attack_waits_for_unit_completion(self):
+        q=self.queue();q.enqueue([{'skill':'attack_nearest'}],0)
+        forming=unit(2,73,ground_dps=10,progress=.2)
+        target=unit(3,MARINE,33,30,4,ground_dps=10)
+        self.assertEqual(q.tick(world([forming,target]),set()),[])
+        self.assertTrue(q.tasks[0].active)
+        ready=replace(forming,progress=1)
+        actions=q.tick(world([ready,target],5),set())
+        self.assertEqual(len(actions),1)
+        self.assertEqual(list(actions[0].action_raw.unit_command.unit_tags),[2])
+
     def test_default_reflex_only_gathers_idle_unprotected_workers(self):
         r=ReflexNet((30,30),lambda _:None)
         r.retreat_until[2]=100  # Even stale retreat state cannot re-enable combat.
@@ -148,15 +159,22 @@ class RuntimeTests(unittest.TestCase):
         class Client:
             release=threading.Event()
             def chat(self,system,user):
-                self.release.wait(2)
+                self.release.wait()
                 return json.dumps({'tasks':[{'skill':'train_worker'}]})
         backend=Backend()
         backend.initial=[world([unit(1,CC,is_building=True),unit(2,SCV)])]
         client=Client(); c=Commander(backend,0,client)
+        returned=threading.Event();batches=[];errors=[]
+        def tick():
+            try:batches.append(c.tick(backend.initial[0]))
+            except BaseException as error:errors.append(error)
+            finally:returned.set()
+        worker=threading.Thread(target=tick,daemon=True)
         try:
-            start=time.monotonic(); batch=c.tick(backend.initial[0])
-            self.assertLess(time.monotonic()-start,.2)
-            self.assertTrue(batch); self.assertTrue(c.thinking)
+            worker.start()
+            self.assertTrue(returned.wait(1),'game tick waited for a model reply that remains explicitly blocked')
+            self.assertFalse(errors);self.assertFalse(client.release.is_set())
+            self.assertTrue(batches[0]); self.assertTrue(c.thinking)
             self.assertEqual(c.decisions,0)
             client.release.set()
             limit=time.monotonic()+1
@@ -164,7 +182,7 @@ class RuntimeTests(unittest.TestCase):
             c.tick(world(backend.initial[0].units,2))
             self.assertEqual(c.decisions,1)
         finally:
-            client.release.set(); c.stop()
+            client.release.set();worker.join(2);c.stop()
     def test_stale_plan_is_visible_and_discarded(self):
         class Client:
             def chat(self,*args): return '{"tasks":[{"skill":"no_op"}]}'

@@ -83,6 +83,61 @@ class DefendBaseOrders(unittest.TestCase):
         self.assertGreaterEqual(row['nearest_attacker_distance'], 0)
 
     # -- 2. 显式分兵 ---------------------------------------------------------
+    def test_incomplete_warp_units_wait_until_ready_before_defending(self):
+        task = self.order(base='home', units='all')
+        forming = replace(unit(10, 73, 33, 33, ground_dps=10), progress=.12)
+        threat = enemy(8, 37, 37)
+        self.assertEqual(self.queue.tick(self.snap([forming, threat]), set()), [])
+        self.assertFalse(task.program.tags)
+        self.assertNotIn(forming.tag, self.queue.defense_tags)
+        ready = replace(forming, progress=1)
+        out = self.queue.tick(self.snap([ready, threat], sec=5), set())
+        self.assertEqual(task.program.tags, {ready.tag})
+        self.assertTrue(any(ready.tag in a.action_raw.unit_command.unit_tags for a in out))
+    def test_unacknowledged_defense_command_waits_for_a_fresh_order_before_resending(self):
+        task=self.order(base='home',units='all')
+        w=self.snap([marine(10,32,32),enemy(8,37,37)],sec=1)
+        self.assertEqual(len(self.queue.tick(w,set())),1)
+        self.assertEqual(self.queue.tick(replace(w,game_loop=w.game_loop+1),set()),[])
+        self.assertEqual(task.program.issued,1)
+        self.assertEqual(len(self.queue.tick(self.snap([marine(10,32,32),enemy(8,37,37)],sec=2.1),set())),1)
+    def test_completed_newborn_waits_for_native_attack_availability(self):
+        import test_multirace as fixtures
+        f=fixtures.MultiRace();f.setUp();backend=f.backend('zerg',[1,4,251,1694])
+        q=TaskQueue(backend,0,lambda _:None)
+        q.enqueue([dict(skill='defend_base',args=dict(base='home',units='all',count=1,reason='守基地'))],10)
+        queen=replace(f.unit(3,126),ground_dps=10)
+        threat=replace(f.unit(4,48),alliance=4,x=37,ground_dps=10)
+        w=f.world([f.unit(1,86,is_building=True),queen,threat],race='zerg')
+        self.assertTrue(queen.done);self.assertEqual(q.tick(w,set()),[])
+        self.assertEqual(q.tasks[0].program.tags,{3})
+        self.assertEqual(q.tasks[0].program.summary()['command_waiting'][0]['unit_tag'],3)
+        backend.available_abilities=lambda index,tags,**kw:{tag:{23} for tag in tags}
+        actions=q.tick(replace(w,game_loop=w.game_loop+23),set())
+        self.assertEqual(len(actions),1)
+        self.assertEqual(list(actions[0].action_raw.unit_command.unit_tags),[3])
+        self.assertEqual(q.tasks[0].program.summary()['command_waiting'],[])
+    def test_native_rejection_backs_off_only_the_affected_defender_and_is_bounded(self):
+        events=[];self.queue.feedback=lambda kind,**kw:events.append(dict(kind=kind,**kw))
+        task=self.order(base='home',units='all',count=2)
+        actors=[marine(10,32,32),marine(11,33,33),enemy(8,37,37)]
+        at=1.;w=self.snap(actors,sec=at)
+        self.assertEqual(len(self.queue.tick(w,set())),2)
+        for attempt in range(5):
+            rejected=replace(self.snap([actors[0],replace(actors[1],orders=(ATTACK,)),actors[2]],sec=at+.1),errors=((10,ATTACK,3),))
+            self.assertEqual(self.queue.tick(rejected,set()),[])
+            # A moving enemy must not defeat this actor's retry delay.
+            moved=self.snap([actors[0],replace(actors[1],orders=(ATTACK,)),replace(actors[2],x=40+attempt)],sec=at+.2)
+            self.assertTrue(all(10 not in a.action_raw.unit_command.unit_tags for a in self.queue.tick(moved,set())))
+            at+=min(4,2**attempt)+.2
+            actions=self.queue.tick(self.snap([actors[0],replace(actors[1],orders=(ATTACK,)),actors[2]],sec=at),set())
+            if attempt<4:self.assertTrue(any(10 in a.action_raw.unit_command.unit_tags for a in actions))
+            else:self.assertTrue(all(10 not in a.action_raw.unit_command.unit_tags for a in actions))
+        self.assertEqual(len([e for e in events if e['kind']=='defense_command_rejected']),5)
+        row=task.program.summary()['command_rejections'][0]
+        self.assertEqual(row['unit_tag'],10);self.assertTrue(row['suspended'])
+        self.assertEqual(task.program.tags,{10,11})
+
     def test_model_can_split_kinds_and_counts_between_two_bases(self):
         w = self.snap([marine(10, 32, 32), marine(11, 33, 33), viking(12, 148, 148),
                        enemy(8, 34, 34), enemy(9, 152, 152)])

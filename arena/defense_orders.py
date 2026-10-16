@@ -188,6 +188,8 @@ class DefendBase:
         self.base_tag = None
         self.base_label = None
         self.last_orders = {}
+        self.command_state = {}
+        self.command_waiting = {}
         self.issued = 0
         self.started_s = None
         self.state = 'resolving'
@@ -215,6 +217,10 @@ class DefendBase:
                     units=self.unit_kinds, count=self.count, stance=self.stance,
                     unit_tags=sorted(self.tags), state=self.state, issued=self.issued,
                     timeout_s=self.timeout_s, reason=self.reason, note=self.note,
+                    command_rejections=[dict(unit_tag=tag,failures=row['failures'],
+                        retry_at_game_s=row['retry_at'],suspended=row['suspended'])
+                        for tag,row in sorted(self.command_state.items()) if row['failures']],
+                    command_waiting=[dict(row) for tag,row in sorted(self.command_waiting.items()) if tag in self.tags],
                     meaning='standing order; reports, never re-targets or diverts other troops')
 
     def _release(self, q, w):
@@ -292,7 +298,8 @@ class DefendBase:
             return True
 
         free = [u for u in w.my_units
-                if usable(u) and not u.is_building and u.type_id not in WORKERS
+                if usable(u) and u.done and not u.hallucination
+                and not u.is_building and u.type_id not in WORKERS
                 and (u.ground_dps > 0 or u.air_dps > 0) and self._kind_matches(u)]
         # Keep the units this order already held, so two orders sharing an army do not alternate
         # ownership every tick (each release used to hand its units to the sibling).
@@ -366,13 +373,52 @@ class DefendBase:
             return bank
         self.state = 'defending'
         self.note = None
+        available=None;query_error=None
         for u in chosen:
             target = min(attackers, key=lambda e: u.distance(e))
             ability = ATTACK if self.stance in ('hold', 'trade') else MOVE
+            receipt=self.command_state.get(u.tag)
+            if receipt and receipt['pending'] and w.game_loop>receipt['loop']:
+                tree=getattr(q,'tech_tree',None)
+                canonical=tree.canonical_ability if tree is not None else lambda a:a
+                errors=[code for tag,a,code in w.errors
+                        if tag==u.tag and canonical(a)==canonical(receipt['ability'])]
+                if errors:
+                    receipt['pending']=False;receipt['failures']+=1
+                    receipt['retry_at']=w.seconds+min(4,2**(receipt['failures']-1))
+                    receipt['suspended']=receipt['failures']>=5
+                    q.event('defense_command_rejected',task_id=t.id,unit_tag=u.tag,
+                        ability_id=receipt['ability'],result_codes=errors,
+                        failures=receipt['failures'],retry_at_game_s=receipt['retry_at'],
+                        suspended=receipt['suspended'],
+                        handling='Same explicit defence goal only; no alternate base or replacement selected to bypass rejection. Renew/cancel this goal if suspended.')
+                elif any(canonical(a)==canonical(receipt['ability']) for a in u.orders):
+                    receipt.update(pending=False,failures=0,retry_at=0,suspended=False)
+            if receipt and (receipt['suspended'] or w.seconds<receipt['retry_at']):continue
+            if receipt and receipt['pending'] and w.seconds-receipt['sent']<1:continue
             key = (ability, round(target.x), round(target.y))
             if self.last_orders.get(u.tag) == key and u.orders:
                 continue
+            waiting=self.command_waiting.get(u.tag)
+            if waiting and w.seconds<waiting['retry_at_game_s']:continue
+            tree=getattr(q,'tech_tree',None)
+            if tree is not None:
+                if available is None:
+                    try:available=q.backend.available_abilities(q.index,[actor.tag for actor in chosen])
+                    except (RuntimeError,TimeoutError,ConnectionError) as error:
+                        available={};query_error=type(error).__name__
+                if query_error or not tree.ability_available(ability,available.get(u.tag,set())):
+                    reason=('native ability query unavailable: '+query_error if query_error else
+                            'native defence ability not ready; completion alone does not establish control readiness')
+                    self.command_waiting[u.tag]=dict(unit_tag=u.tag,ability_id=ability,reason=reason,
+                        retry_at_game_s=w.seconds+.5)
+                    if not waiting or waiting['reason']!=reason:
+                        q.event('defense_command_waiting',task_id=t.id,**self.command_waiting[u.tag])
+                    continue
+            self.command_waiting.pop(u.tag,None)
             self.last_orders[u.tag] = key
+            receipt=self.command_state.setdefault(u.tag,dict(failures=0,retry_at=0,suspended=False))
+            receipt.update(pending=True,loop=w.game_loop,sent=w.seconds,ability=ability)
             out.append(command(ability, [u.tag], pos=target.pos))
             q.action_contexts.append(dict(source='defense_guard',task_id=t.id,
                                           skill=t.skill,request_id=t.request_id))

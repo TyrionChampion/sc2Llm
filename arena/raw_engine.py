@@ -22,6 +22,27 @@ MOVE, ATTACK, GATHER = 3794, 3674, 3666
 NAMES = {SCV:'SCV', MARINE:'Marine', CC:'CommandCenter', DEPOT:'SupplyDepot', BARRACKS:'Barracks',33:'SiegeTank',32:'SiegeTankSieged'}
 
 
+class ActionResponseTap:
+    """Observe SC2Env's existing RPC without resending or changing actions."""
+    def __init__(self,controller):
+        self.controller=controller;self.response=None;self.packet=None;self.sent_at=None
+    def __getattr__(self,name):return getattr(self.controller,name)
+    def begin(self):self.response=self.packet=self.sent_at=None
+    def actions(self,request):
+        self.packet=[a.SerializeToString() for a in request.actions]
+        self.sent_at=time.time()
+        self.response=self.controller.actions(request)
+        return self.response
+    def failures(self,batch):
+        if self.response is None:return []  # Terminal response is read by observe.
+        if len(self.response.result)!=len(self.packet):
+            raise RuntimeError('native action response count mismatch; acceptance unknown')
+        if not batch:return []  # SC2Env sends an empty no-op for an empty batch.
+        if self.packet!=[a.SerializeToString() for a in batch]:
+            raise RuntimeError('native action packet changed; response attribution unknown')
+        return [(n,code) for n,code in enumerate(self.response.result) if code!=error_pb2.Success]
+
+
 def command(ability, tags, pos=None, target=None, queued=False):
     a = pb.Action()
     c = a.action_raw.unit_command
@@ -184,6 +205,7 @@ def headless_map_for_speed(map_name, speed):
 
 
 class RawArena:
+    action_error_channels=('action_response','observation_action_errors')
     def __init__(self, map_name='Acropolis', render=True, difficulty=None, seed=7, races=None, bot_race='terran',game_speed='faster'):
         from arena.game_speed import LOOPS_PER_SECOND as SPEEDS
         map_name=headless_map_for_speed(map_name,game_speed)
@@ -212,6 +234,7 @@ class RawArena:
         try:
             if not self.env._realtime: raise RuntimeError('realtime is required')
             self.controllers = self.env._controllers
+            self.controllers[:]=[ActionResponseTap(c) for c in self.controllers]
             infos = [c.game_info() for c in self.controllers]
             self.info = infos[0]
             self.size = (self.info.start_raw.map_size.x,self.info.start_raw.map_size.y)
@@ -299,15 +322,26 @@ class RawArena:
         if len(batches)!=len(self.last): raise ValueError('action batch/player count mismatch')
         if self.match_control_pending:
             return self._finish_surrender()
-        before=self.snapshots(); sent_at=[time.time()]*len(batches)
+        before=self.snapshots()
+        for controller in self.controllers:controller.begin()
         self.last=self.env.step([list(b) or [pb.Action()] for b in batches])
         worlds=self.snapshots(); self.clock.update(worlds[0].game_loop)
+        response_failures=[c.failures(batch) for c,batch in zip(self.controllers,batches)]
+        sent_at=[c.sent_at for c in self.controllers]
+        for i,failures in enumerate(response_failures):
+            combined=list(worlds[i].errors)
+            for n,code in failures:
+                raw=batches[i][n].action_raw.unit_command
+                for tag in raw.unit_tags:
+                    error=(tag,raw.ability_id,code)
+                    if error not in combined:combined.append(error)
+            worlds[i]=replace(worlds[i],errors=tuple(combined))
         for i,w in enumerate(worlds):
             for tag,ability,code in w.errors:
                 self.action_errors+=1
                 print('[action-error] P%d tag=%d ability=%d result=%s' %
                       (i+1,tag,ability,error_pb2.ActionResult.Name(code)),flush=True)
-        return self.attach_action_feedback(before,worlds,batches,sent_at=sent_at)
+        return self.attach_action_feedback(before,worlds,batches,response_failures,sent_at)
     @property
     def ended(self): return getattr(self,'_terminal_result',None) is not None or any(t.last() for t in self.last)
     def result(self):
@@ -383,6 +417,16 @@ class RawArena:
             item.end_pos.x,item.end_pos.y=target
         response=self.controllers[index].query(request)
         if len(response.pathing)!=len(targets):raise RuntimeError('incomplete ground path query response')
+        return [p.distance for p in response.pathing]
+
+    def unit_path_distances(self,index,tags,target):
+        """Native paths for specific owned actors, including their real size/form."""
+        request=query.RequestQuery()
+        for tag in tags:
+            item=request.pathing.add(unit_tag=tag)
+            item.end_pos.x,item.end_pos.y=target
+        response=self.controllers[index].query(request)
+        if len(response.pathing)!=len(tags):raise RuntimeError('incomplete owned-unit path query response')
         return [p.distance for p in response.pathing]
 
     def placement(self, index, ability, worker, candidates):

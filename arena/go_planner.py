@@ -1,5 +1,6 @@
 """Bounded, cancellable OpenCode Go requests using an injected vault binding."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -14,10 +15,27 @@ GO_MODEL = 'opencode-go/deepseek-v4.1-flash'
 GO_MODELS = (GO_MODEL, 'opencode-go/deepseek-v4-pro')
 GO_ENDPOINT = 'https://opencode.ai/zen/go/v1'
 KEY_ENV = 'open_api_key'
+GO_BATTLE_MAX_TOKENS = 16000
+WORKER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class CredentialBindingMissing(RuntimeError):
     pass
+
+
+class GoRequestError(RuntimeError):
+    def __init__(self, message, error_kind=None):
+        super().__init__(message)
+        self.error_kind = error_kind
+
+
+def transport_failure(error):
+    # Exception messages may contain URLs/credentials. Only export fixed types.
+    name = type(error).__name__
+    transient = name in ('ReadTimeout', 'ConnectTimeout', 'Timeout', 'TimeoutError',
+                         'ConnectionError', 'ChunkedEncodingError')
+    return dict(error='OpenCode Go request failed: '+name,
+                error_kind='transient_transport' if transient else 'worker_error')
 
 
 class GoPlanner:
@@ -26,6 +44,7 @@ class GoPlanner:
     soft_timeout = 15
     timeout = 40
     reasoning_effort = 'low'
+    max_battle_context_chars = 90000
     # Small compatibility probes succeeded, but real game requests returned 400
     # for this format. Keep the proven JSON mode; no automatic retry/fallback.
     native_schema = False
@@ -39,7 +58,9 @@ class GoPlanner:
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.response_kind = 'battle'
-        self.max_tokens = 8000
+        # The provider charges reasoning against the completion ceiling too.
+        # Real battle P1 request15 used all8000 tokens before any public answer.
+        self.max_tokens = GO_BATTLE_MAX_TOKENS
         self.calls = self.attempts = 0
         self.last_raw = self.last_metadata = None
         self.closed = False
@@ -95,13 +116,21 @@ class GoPlanner:
             result = json.loads((folder/'result.json').read_text())
             self.last_metadata = result.get('metadata')
             if result.get('error'):
-                raise RuntimeError(result['error'])
+                raise GoRequestError(result['error'], result.get('error_kind'))
             if process.returncode:
                 raise RuntimeError('OpenCode Go worker failed')
             self.last_raw = result['answer']
             self.calls += 1
             self.state = 'received'
             return self.last_raw
+        except subprocess.TimeoutExpired:
+            ChatGPTSubscriptionPlanner._stop(process)
+            result = dict(error='OpenCode Go request failed: worker deadline exceeded',
+                          error_kind='transient_transport')
+            (folder/'result.json').write_text(json.dumps(result))
+            self.last_metadata = None
+            self.state = 'failed'
+            raise GoRequestError(result['error'], result['error_kind']) from None
         except BaseException:
             self.state = 'failed'
             raise
@@ -136,11 +165,10 @@ def perform_request(request, post):
                  'User-Agent':'opencode/1.18.32'},
         json=dict(model=wire_model, messages=[dict(role='system', content=request['system']),
                   dict(role='user', content=request['observation'])],
-                  max_tokens=request.get('max_tokens',8000), reasoning_effort='low', response_format=format_spec),
+                  max_tokens=request.get('max_tokens',GO_BATTLE_MAX_TOKENS), reasoning_effort='low', response_format=format_spec),
         timeout=request['timeout'])
     if response.status_code >= 400:
-        suffix = ' quota exceeded' if response.status_code == 429 else ' request rejected'
-        result=dict(error='HTTP %d: OpenCode Go%s' % (response.status_code, suffix))
+        result=dict(error='HTTP %d: OpenCode Go request rejected' % response.status_code)
         # Report only fixed diagnostic labels: provider messages can echo request
         # details/credentials and must never be written to the journal.
         topics=set()
@@ -163,8 +191,20 @@ def perform_request(request, post):
         except (ValueError,TypeError,AttributeError):pass
         collect_topics(getattr(response,'text',''))
         if topics:result['provider_error_topics']=sorted(topics)
+        if result.get('provider_error_type') == 'insufficient_quota':
+            result.update(error='HTTP %d: OpenCode Go quota exceeded' % response.status_code,
+                          error_kind='quota_exhausted')
+        elif response.status_code in (401,402,403):
+            result['error_kind']='account_rejected'
+        elif response.status_code in (408,425,429) or 500 <= response.status_code < 600:
+            result['error_kind']='transient_http'
         return result
-    data = response.json()
+    try:data = response.json()
+    except ValueError:
+        return dict(error='OpenCode Go invalid API JSON response',error_kind='transient_http',response_stage='api_envelope')
+    if (not isinstance(data,dict) or not isinstance(data.get('choices'),list) or not data['choices']
+            or not isinstance(data['choices'][0],dict)):
+        return dict(error='OpenCode Go invalid API envelope',error_kind='transient_http',response_stage='api_envelope')
     choice = data['choices'][0]
     raw_usage = data.get('usage') or {}
     usage = dict(raw_usage, input_tokens=raw_usage.get('prompt_tokens',0),
@@ -174,16 +214,25 @@ def perform_request(request, post):
                     finish_reason=choice.get('finish_reason'), usage=usage, endpoint=GO_ENDPOINT,
                     response_format=format_spec['type'])
     if data.get('model') not in (wire_model, 'deepseek/'+wire_model):
-        return dict(error='OpenCode Go model identity mismatch; no fallback', metadata=metadata)
+        return dict(error='OpenCode Go model identity mismatch; no fallback', error_kind='model_identity_mismatch',metadata=metadata)
     if choice.get('finish_reason') != 'stop':
-        return dict(error='OpenCode Go incomplete response', metadata=metadata)
-    answer = choice['message']['content']
+        return dict(error='OpenCode Go incomplete response',error_kind='transient_model_output',response_stage='public_answer',metadata=metadata)
+    message=choice.get('message');answer=message.get('content') if isinstance(message,dict) else None
     if not isinstance(answer, str):
-        return dict(error='OpenCode Go missing public answer', metadata=metadata)
+        return dict(error='OpenCode Go missing public answer',error_kind='transient_model_output',response_stage='public_answer',metadata=metadata)
     # Validate the actual public JSON; hidden reasoning is never saved or used as a plan.
-    plan = json.loads(answer)
+    try:plan = json.loads(answer)
+    except json.JSONDecodeError as error:
+        return dict(error='OpenCode Go invalid public JSON answer',error_kind='transient_model_output',
+            response_stage='public_answer',metadata=metadata,
+            public_json_error=dict(message=error.msg,line=error.lineno,column=error.colno,
+                position=error.pos,public_chars=len(answer),
+                outer_code_fence=answer.strip().startswith('```') and answer.strip().endswith('```')))
+    except (ValueError,RecursionError):
+        return dict(error='OpenCode Go invalid public JSON answer',error_kind='transient_model_output',
+                    response_stage='public_answer',metadata=metadata)
     if not isinstance(plan, dict):
-        return dict(error='Invalid battle plan: JSON object required', metadata=metadata)
+        return dict(error='OpenCode Go public JSON object required',error_kind='transient_model_output',response_stage='public_answer',metadata=metadata)
     return dict(answer=answer, metadata=metadata)
 
 
@@ -194,5 +243,6 @@ if __name__ == '__main__':
         result = perform_request(json.loads((folder/'request.json').read_text()), requests.post)
     except Exception as error:
         # Transport exception text can contain request details; retain only its type.
-        result = dict(error='OpenCode Go request failed: '+type(error).__name__)
+        result = transport_failure(error)
+    result['worker_source_sha256']=WORKER_SOURCE_SHA256
     (folder/'result.json').write_text(json.dumps(result, ensure_ascii=False))
