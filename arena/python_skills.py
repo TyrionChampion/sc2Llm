@@ -132,7 +132,7 @@ class IsolatedWorker:
         executable="/runtime/bin/"+Path(sys.executable).resolve().name
         argv=["bwrap","--unshare-all","--die-with-parent","--new-session","--clearenv",
             "--ro-bind",str(base),"/runtime","--ro-bind","/usr/lib","/usr/lib",
-            "--symlink","usr/lib","/lib","--symlink","usr/lib","/lib64",
+            "--symlink","usr/lib","/lib","--ro-bind","/lib64","/lib64",
             "--proc","/proc","--dev","/dev","--tmpfs","/tmp",
             "--ro-bind",str(root),"/skill","--chdir","/tmp",
             executable,"-I","-S","-u","/skill/runner.py"]

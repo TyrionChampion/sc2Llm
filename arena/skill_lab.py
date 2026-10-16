@@ -109,7 +109,7 @@ class SkillLab:
         digest=self.digest();base=Path(sys.base_prefix).resolve()
         argv=['bwrap','--unshare-all','--die-with-parent','--new-session','--clearenv',
             '--ro-bind',str(base),'/runtime','--ro-bind','/usr/lib','/usr/lib',
-            '--symlink','usr/lib','/lib','--symlink','usr/lib','/lib64','--proc','/proc','--dev','/dev','--tmpfs','/tmp',
+            '--symlink','usr/lib','/lib','--ro-bind','/lib64','/lib64','--proc','/proc','--dev','/dev','--tmpfs','/tmp',
             '--ro-bind',str(self.root/'skills'),'/lab/skills','--ro-bind',str(self.root/'tests'),'/lab/tests',
             '--ro-bind',str(self.root/'fixtures'),'/lab/fixtures',
             '--ro-bind',str(ROOT/'arena/lab_runner.py'),'/runner.py','--chdir','/tmp',

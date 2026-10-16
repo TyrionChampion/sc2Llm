@@ -30,6 +30,7 @@ def main(players_override=None,catalogs_override=None,argv=None,opening=True,rep
     parser.add_argument('--no-overlay',action='store_true',help='hide the native status text')
     parser.add_argument('--delay',type=float,default=0,help='explicit mock planner latency only')
     parser.add_argument('--output',default='logs/native_llm_result.json')
+    parser.add_argument('--feedback-dir',default='logs/feedback',help='player-local journals and chat mailboxes')
     parser.add_argument('--combat-micro',action='store_true',help='stim and tank stance execution for explicitly commanded combat units')
     parser.add_argument('--defense',action='store_true',help='independent official DeepSeek non-thinking base defense (official Flash players only)')
     parser.add_argument('--tactics',action='store_true',help='high-level commander plus independent non-thinking battle agent (official Flash players only)')
@@ -88,7 +89,7 @@ def main(players_override=None,catalogs_override=None,argv=None,opening=True,rep
         report.update(engine=arena.version,process_logs=str(arena.directory),map_targets=arena.start_location_report,
                       speed_verification=getattr(arena,'speed_verification',None))
         worlds=arena.initial
-        commanders=[Commander(arena,i,client,python_catalog=catalogs[i],opening=opening and report['races'][i]=='terran',repair=repairs_override[i] if repairs_override else None,defense_client=defenders[i] if defenders else None,combat_micro=args.combat_micro,development=developments_override[i] if developments_override else None,tactics_enabled=args.tactics,tactical_client=tacticians[i] if tacticians else None) for i,(client,_) in enumerate(players)]
+        commanders=[Commander(arena,i,client,feedback_dir=args.feedback_dir,python_catalog=catalogs[i],opening=opening and report['races'][i]=='terran',repair=repairs_override[i] if repairs_override else None,defense_client=defenders[i] if defenders else None,combat_micro=args.combat_micro,development=developments_override[i] if developments_override else None,tactics_enabled=args.tactics,tactical_client=tacticians[i] if tacticians else None) for i,(client,_) in enumerate(players)]
         started=time.monotonic();last_ui=0;last_log=0;seen_calls=[0,0]
         while not arena.ended and time.monotonic()-started<args.seconds:
             batches=[c.tick(w) for c,w in zip(commanders,worlds)]

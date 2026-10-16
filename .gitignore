@@ -29,4 +29,5 @@ skill-library
 
 # Local match launcher and private model service state
 launcher-runtime
+client-runtime
 .vendor-history

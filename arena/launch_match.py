@@ -1,6 +1,7 @@
 """Configured native duel worker. Invoked only by an explicit launcher Start."""
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -62,7 +63,13 @@ def main(argv=None):
         from arena.deepseek_planner import DeepSeekFlashPlanner
         from arena.live_skills import LiveSkillDevelopment
         for i, player in enumerate(config['players']):
-            catalog, strategy, receipt = prepare_skills(run, i, player)
+            if config.get('interface') == 'lan':
+                # Exactly the strategy reviewed by this player; no hidden library tactic.
+                catalog, strategy = None, player['prompt']
+                receipt = dict(player=i + 1, race=player['race'], custom_python='none',
+                               live_restored=[], notice='房间模式：内置工具与玩家已确认的战术提示词')
+            else:
+                catalog, strategy, receipt = prepare_skills(run, i, player)
             report['skills'].append(receipt)
             catalogs.append(catalog)
             development = None
@@ -79,6 +86,13 @@ def main(argv=None):
                 client = DeepSeekFlashPlanner(reasoning_effort=config['reasoning'])
                 identity = dict(side='P%d' % (i + 1), provider='deepseek', model=client.model,
                     key_source=client.p.key_env, endpoint=client.p.base_url, race=player['race'])
+            elif (player['model'] in ('opencode-go/deepseek-v4.1-flash', 'opencode-go/deepseek-v4-pro')
+                  and os.environ.get('open_api_key', '').strip()):
+                from arena.go_planner import GoPlanner, GO_ENDPOINT
+                client = GoPlanner(player['model'], run / ('p%d' % (i + 1)) / 'battle')
+                client.timeout = 60
+                identity = dict(side='P%d' % (i + 1), provider='opencode-go', model=player['model'],
+                    key_source='open_api_key', endpoint=GO_ENDPOINT, race=player['race'])
             else:
                 from arena.opencode_bridge import OpenCodePlanner, OpenCodeServer
                 report['status'] = 'starting_model_service'; save()
@@ -88,27 +102,31 @@ def main(argv=None):
                 client = OpenCodePlanner(server, player['model'], i, run / ('p%d' % (i + 1)) / 'battle')
                 client.phase = 'battle'
                 identity = {**client.identity(), 'race': player['race']}
-                strategy += '此启动模式只加载现有技能，未接入 OpenCode 后台源码修复。'
+                if config.get('interface') != 'lan':
+                    strategy += '此启动模式只加载现有技能，未接入 OpenCode 后台源码修复。'
             client.prepared_strategy = strategy
             clients.append((client, identity))
         report['status'] = 'prepared'; save()
         if args.prepare_only:
             print('PREPARED_ONLY: no game, no model service, no model API calls.', flush=True)
             return
-        with (run / 'output-window.log').open('w') as stream:
-            viewer = subprocess.Popen([str(ROOT / 'run_sc2.sh'), sys.executable,
-                str(ROOT / 'llm_output_window.py'), '--run', str(run)], cwd=ROOT,
-                stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        time.sleep(.5)
-        if viewer.poll() is not None:
-            raise RuntimeError('双方中文输出窗口启动失败，请查看 output-window.log')
-        report.update(output_window_pid=viewer.pid, identities=[identity for _, identity in clients], status='starting_native_game'); save()
+        if config.get('interface') != 'lan':
+            with (run / 'output-window.log').open('w') as stream:
+                viewer = subprocess.Popen([str(ROOT / 'run_sc2.sh'), sys.executable,
+                    str(ROOT / 'llm_output_window.py'), '--run', str(run)], cwd=ROOT,
+                    stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+            time.sleep(.5)
+            if viewer.poll() is not None:
+                raise RuntimeError('双方中文输出窗口启动失败，请查看 output-window.log')
+        report.update(output_window_pid=viewer.pid if viewer else None,
+            identities=[identity for _, identity in clients], status='starting_native_game'); save()
         import native_llm
         native_llm.main(players_override=clients, catalogs_override=catalogs,
             developments_override=developments, opening=False,
             argv=['--seconds', str(config['minutes'] * 60), '--map', 'Acropolis',
                 '--game-speed', config['speed'], '--p1-race', config['players'][0]['race'],
-                '--p2-race', config['players'][1]['race'], '--output', str(run / 'match.json')]
+                '--p2-race', config['players'][1]['race'], '--output', str(run / 'match.json'),
+                '--feedback-dir', str(run / 'feedback')]
                 + (['--combat-micro'] if config['combat_micro'] else [])
                 + (['--tactics'] if config['tactics'] else []))
         report['status'] = 'finished'

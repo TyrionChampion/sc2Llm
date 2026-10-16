@@ -67,7 +67,7 @@ class OpenCodeServer:
         config.write_text(json.dumps({"mcp":self.mcp,"provider":model_options,"$schema":"https://opencode.ai/config.json","permission":{"*":"deny"},
                                      "plugin":[],"autoupdate":False,"share":"disabled"}))
         # The game wrapper's API keys are not passed to this OpenCode process.
-        env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","http_proxy","https_proxy","all_proxy","no_proxy","SSL_CERT_FILE","SSL_CERT_DIR")}
+        env={k:v for k,v in os.environ.items() if k in ("PATH","HOME","LANG","LC_ALL","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","http_proxy","https_proxy","all_proxy","no_proxy","SSL_CERT_FILE","SSL_CERT_DIR","SYSTEMROOT","WINDIR","USERPROFILE","APPDATA","LOCALAPPDATA","TEMP","TMP","COMSPEC","PATHEXT")}
         for kind in ("DATA","CACHE","STATE","CONFIG"):env["XDG_"+kind+"_HOME"]=str(self.root/kind.lower())
         env.update(OPENCODE_CONFIG=str(config),OPENCODE_SERVER_PASSWORD=self.secret,
                    OPENCODE_SERVER_USERNAME="opencode",OPENCODE_DISABLE_AUTOUPDATE="true")
@@ -103,9 +103,13 @@ class OpenCodeServer:
         return response.json()
     def close(self):
         if self.process and self.process.poll() is None:
-            os.killpg(self.process.pid,signal.SIGTERM)
+            if os.name == 'nt': self.process.terminate()
+            else: os.killpg(self.process.pid,signal.SIGTERM)
             try:self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:os.killpg(self.process.pid,signal.SIGKILL);self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                if os.name == 'nt': self.process.kill()
+                else: os.killpg(self.process.pid,signal.SIGKILL)
+                self.process.wait(timeout=3)
         if self.log:self.log.close()
         keyfile=self.root/"data/opencode/auth.json"
         if keyfile.exists():keyfile.unlink()

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -27,7 +28,7 @@ def configuration():
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)
-        self.env = patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'fake-local-key'}); self.env.start()
+        self.env = patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'fake-local-key', 'open_api_key': ''}); self.env.start()
     def tearDown(self): self.env.stop(); self.temp.cleanup()
 
     def test_catalog_never_returns_auth(self):
@@ -70,7 +71,7 @@ class LauncherTests(unittest.TestCase):
         commands=[]
         def spawn(command,**kw):
             commands.append(command)
-            return subprocess.Popen([str(ROOT/'run_sc2.sh'),str(ROOT/'.venv311/bin/python'),'-c',
+            return subprocess.Popen([sys.executable,'-c',
                 'import time; time.sleep(30)'],**kw)
         manager=MatchManager(self.root,spawn=spawn,busy=lambda:None)
         try:

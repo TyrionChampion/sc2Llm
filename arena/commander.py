@@ -41,12 +41,14 @@ class ScriptedPlanner:
         return json.dumps({'tasks':tasks,'reason':'scripted baseline economy + marine attack'})
 
 class Commander:
-    def __init__(self,backend,index,client,opening=True,interval=6,max_plan_age=30,feedback_dir="logs/feedback",combat_reflex=False,python_catalog=None,repair=None,defense_client=None,combat_micro=False,development=None,tactics_enabled=False,tactical_client=None):
+    def __init__(self,backend,index,client,opening=True,interval=6,max_plan_age=30,feedback_dir="logs/feedback",combat_reflex=False,python_catalog=None,repair=None,defense_client=None,combat_micro=False,development=None,tactics_enabled=False,tactical_client=None,display_player=None):
         if tactics_enabled and (defense_client is not None or combat_reflex):
             raise ValueError('army tactics replaces legacy defense/combat reflex ownership')
         if tactical_client is not None and not tactics_enabled:
             raise ValueError('tactical client requires tactics_enabled')
         self.index=index; self.client=client; self.interval=interval; self.backend=backend
+        self.display_player=index+1 if display_player is None else display_player
+        if type(self.display_player) is not int or self.display_player not in (1,2):raise ValueError('invalid display player')
         self.compact_battle=bool(getattr(client,"compact_battle",False))
         self.request_defense_generations={}; self.defense=None
         self.request_observations={}; self.previous_strategy=None; self.late_plans_accepted=0
@@ -58,8 +60,8 @@ class Commander:
         self.repair=repair
         if repair:repair.bind(self)
         self.game_loop=backend.initial[index].game_loop
-        self.feedback=FeedbackJournal(index+1,feedback_dir)
-        self.operator_advice=OperatorAdvice(self.feedback.path,index+1,self.feedback.audit)
+        self.feedback=FeedbackJournal(self.display_player,feedback_dir)
+        self.operator_advice=OperatorAdvice(self.feedback.path,self.display_player,self.feedback.audit)
         self.request_advice_ids={}
         self._seen_feedback_world=None; self.engine_errors=0
         self.intelligence=Intelligence(self.record_feedback); self.request_intel_revisions={}
@@ -140,7 +142,7 @@ class Commander:
             self.control_policy['combat_micro']=dict(enabled=True,abilities=['stim','siege','unsiege'],
                 scope='After explicit attack_nearest/move_out/order_units or defensive assignment only; scouts and active Python/JSON/morph units excluded',
                 rules='Healthy researched unstimmed bio uses stim individually at contact; tanks deploy at ground contact/arrival and undeploy to advance/withdraw. No automatic strategic attack or retreat.')
-            self.system+='\nFor Terran attack_nearest/move_out/order_units and defense squads, the executor automatically handles researched healthy-unit stim and tank siege/unsiege from fresh local observations. Decide objectives, technology and force composition; do not repeatedly morph tanks or define a Python task just to obtain these basic combat abilities. Active custom Python/JSON tactics retain full control and must implement their own abilities.'
+            self.system+=battle_plans.COMBAT_MICRO_PROTOCOL
         if development:
             from arena.live_skills import PROTOCOL as DEVELOPMENT_PROTOCOL
             self.system+='\n'+DEVELOPMENT_PROTOCOL
@@ -167,7 +169,7 @@ class Commander:
             self.tasks.enqueue(OPENING,backend.initial[index].seconds,'explicit scripted opening')
         self.worker.start()
     def emit(self,message):
-        line='[P%d] %s' % (self.index+1,message)
+        line='[P%d] %s' % (self.display_player,message)
         self.log.append(line); del self.log[:-100]
         print(line,flush=True)
 

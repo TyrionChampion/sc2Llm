@@ -14,7 +14,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from arena.launch_config import ROOT, model_catalog, validate_config
+from arena.launch_config import ROOT, model_catalog, validate_config, safe_text
 from arena.lifecycle import write_json_atomic, read_match_status, match_status_label
 
 RUNTIME = ROOT / 'launcher-runtime'
@@ -46,13 +46,6 @@ def native_busy():
     return None
 
 
-def safe_text(text):
-    for name, value in os.environ.items():
-        if ('API_KEY' in name or name.endswith('_TOKEN')) and value and len(value) > 6:
-            text = text.replace(value, '[凭据已隐藏]')
-    return text
-
-
 class MatchManager:
     def __init__(self, root=RUNTIME, spawn=None, busy=native_busy):
         self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
@@ -81,7 +74,7 @@ class MatchManager:
             run = Path(tempfile.mkdtemp(prefix='match-', dir=self.root))
             write_json_atomic(run / 'config.json', config)
             write_json_atomic(run / 'run.json', dict(status='queued', config=config))
-            command = [str(ROOT / 'run_sc2.sh'), str(ROOT / '.venv311/bin/python'),
+            command = [str(ROOT / 'run_sc2.sh'), sys.executable,
                        '-u', '-m', 'arena.launch_match', '--run', str(run)]
             child = None
             try:

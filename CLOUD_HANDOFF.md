@@ -1,5 +1,57 @@
 # 自主 bot 对战交接
 
+## 2026-10-16 当前：默认改为双端本机原生游戏
+
+用户明确不接受无画面推流的集中式方案，选择Windows与Linux混用。已改为协调器只负责房间、
+一次性配对、地图/引擎校验和联机阶段；每端运行自己的原生SC2、本方模型与Commander。
+Windows走本机SC2，Linux默认走既有Proton原生窗口。默认`bash start_room.sh`；Windows可用
+`start_room.ps1`或直接Python。两端从网页取得2分钟有效的一次性配对码，在本机运行网页命令，
+随后选本机模型、确认提示词、准备。凭据不上传协调器，网页身份与客户端令牌不能混用。
+
+主要文件：arena/distributed_room.py（协调协议），arena/lan_native.py（单本机SC2、host_ip及四端口），
+arena/lan_client.py（本方模型/Commander与消息），arena/client_requests.py（调用前持久化所有尝试），
+arena_client.py与start_client.sh/ps1。启动阶段依次prepare/create/join/play，只有P1建房；
+引擎Base/data_version、地图SHA和工具契约不匹配即停止，不启动模型、不改用两个独立游戏。
+本方后端slot0与房间P2显示身份分开，P2仍只持有自己的一个控制器。游戏控制API仅listen127.0.0.1。
+四个游戏通信端口默认15000～15003，真实LAN需双方放通TCP/UDP；窗口由各自电脑渲染。
+聊天保留server消息ID进入本方OperatorAdvice，下一轮正常决策读取，重发不产生第二条建议；
+没有接收能力时不能借聊天恢复请求。失败细节只展示本方，失联不计胜，不自动重开未知比赛。
+模型调用前记录每场requests.json，包含失败尝试，存在的账本拒绝初始化覆盖。
+
+最终真实集成：logs/lan-full-native-k7gysjvj/result.json。真实HTTP协调器、两个LocalClient、
+两个LinuxSC2进程，各一个本方控制器；双方12工到13工、双向建议进入各自后续请求且不串线，
+0动作拒绝，两份回放SHA验证通过。每端账本attempted=3/successful=3/failed=0，均为明确标记
+的本地夹具模型，0外部推理调用；不是付费实战或胜场。它是同机双进程验证，不是双机混合系统验证。
+Chromium双会话的配对、私有模型目录、确认/准备、联机阶段、聊天、刷新、390px布局通过，
+logs/lan-native-browser-preview/保存截图与结果；这里Windows/Linux客户端报告是模拟的。
+
+尚未在两台真实Windows/Linux电脑上跑通GPU窗口与跨网卡/防火墙组合，不能声称已实机跨系统验收。
+两端必须使用相同Base/data_version，Linux4.10 API引擎不能直接混入Windows5.x；Linux应使用兼容Proton版本。
+完整环境与命令见LAN_ROOMS.md，`verify_lan_clients_live.py`可重复零模型的本机原生集成检查。
+最终相关回归674项，672通过、2原有占位skip，见logs/lan-native-final-regressions.log。
+十个旧账本哈希不变，上一批仍181/200；没有新增付费实战，不重置历史。
+分支仍codex/lan-ai-rooms，尚未提交/推送。下面集中式首版记录保留为历史，默认已替换；旧版仅`--central`兼容。
+
+## 2026-10-16 前版：集中式局域网房间首版（已被上方默认替代）
+
+此前修复已提交为`aa39646`并快进合并到远端`main`。当前新开发分支为
+`codex/lan-ai-rooms`，本轮功能修改尚未提交或推送。
+
+`bash start_room.sh`启动局域网房间，默认端口8768。房主P1创建房间，P2通过链接或六位码入场；
+各自选模型/种族、编辑战术提示词，检查系统工具契约后准备，双方在线且确认最新版本才能由房主开战。
+配置变更取消双方准备。每方只读取本方公开决策与聊天，建议复用原OperatorAdvice，在下一轮正常请求读取。
+每场feedback目录独立，房间和自身比赛进程可重启恢复，未知启动状态不自动重复开局。
+共用主机模型账号；存在open_api_key时支持直接Go适配器。房间使用内置工具、玩家已确认的完整战术，
+不加载持久库战术或固定开局。检查内容与真实Commander请求逐字比对通过，1200字符战术不截断。
+网页暂为房间/决策/聊天，原生画面仍在主机，未实现远端画面推流。完整说明见LAN_ROOMS.md。
+
+另修复启动器写死旧Python环境路径和凭据脱敏遗漏小写open_api_key；扩大回归发现旧技能沙箱
+把/lib64错映射为/usr/lib，现只读绑定真实/lib64，真实隔离worker及实验室33项检查通过。
+最终相关651项运行、649通过、2项原有占位skip：logs/lan-room-regressions.log。
+Chromium两个独立会话完整流程、中文IME、刷新重连及390px布局通过，零页面异常；
+logs/lan-room-browser-preview/保存截图与结果，明确使用本地假引擎/消息消费器，无真实模型或SC2调用。
+十个旧账本SHA核验全一致，上一批仍finished、181/200（P1=89/P2=92），没有新增实战或重置历史。
+
 ## 2026-10-15 最新：第五批已结束，修复已验收
 
 分支`codex/battle-llm-chat`，保留原有全部未提交修改；本轮没有提交或推送。

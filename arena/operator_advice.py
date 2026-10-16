@@ -24,7 +24,7 @@ def read_status(directory):
     return json.loads((Path(directory)/'status.json').read_text())
 
 
-def submit_advice(directory, text, player=None):
+def submit_advice(directory, text, player=None, message_id=None):
     if not isinstance(text, str) or not text.strip():
         raise ValueError('请输入给模型的建议')
     text = text.strip()
@@ -39,9 +39,32 @@ def submit_advice(directory, text, player=None):
     pending = sum(m['state'] in ('queued', 'sent', 'retry') for m in status['messages'])
     if pending+len(list((directory/'inbox').glob('*.json'))) >= MAX_PENDING:
         raise ValueError('待处理建议已满，请等待模型下一轮回复')
-    message = dict(id=uuid.uuid4().hex, text=text, submitted_at=time.time())
+    if message_id is not None and (not isinstance(message_id, str) or len(message_id) != 32
+                                  or any(c not in '0123456789abcdef' for c in message_id)):
+        raise ValueError('建议 ID 无效')
+    message = dict(id=message_id or uuid.uuid4().hex, text=text, submitted_at=time.time())
     write_json_atomic(directory/'inbox'/(message['id']+'.json'), message)
     return message
+
+
+def public_decisions(journal, limit=20):
+    """Public answers only, never queued prompts, raw transport or hidden reasoning."""
+    rows = []
+    journal = Path(journal)
+    with journal.open('rb') as stream:
+        offset = max(0, journal.stat().st_size - 256000)
+        stream.seek(offset)
+        if offset: stream.readline()
+        for line in stream:
+            try: row = json.loads(line)
+            except (ValueError, UnicodeDecodeError): continue
+            if row.get('record') != 'request_finished': continue
+            try: plan = json.loads(row.get('response') or '{}')
+            except (ValueError, TypeError): plan = {}
+            if not isinstance(plan, dict): plan = {}
+            rows.append(dict(request_id=row.get('request_id'), reason=plan.get('reason', ''),
+                tasks=plan.get('tasks', []), error=row.get('error'), latency_s=row.get('latency_s')))
+    return rows[-limit:]
 
 
 class OperatorAdvice:

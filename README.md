@@ -8,6 +8,7 @@
 
 ## 功能与入口
 
+- `bash start_room.sh`：局域网双人房间，双方配对本机原生客户端，各自选模型、检查提示词、准备开战并聊天；Windows/Linux 启动与联测范围见 [LAN_ROOMS.md](LAN_ROOMS.md)。
 - `arena_launcher.py`、`arena/launcher.html`：本地对战控制台，选择模型、
   种族和速度，启动/结束比赛，查看双方输出与状态。
 - `official_duel.py`、`opencode_match.py`、`session_match.py`、`native_llm.py`：
