@@ -26,7 +26,7 @@ BOT_RULES = '''自主指挥真实星际对局，在预算内战胜对手。
 宿主不选战略。下令/到达≠建成/战术成功/胜利；核对world/反馈，无敌情≠安全，用scout补情报。
 
 接口契约：训练/变形/建造/扩张外层count为1..200，其他外层count必须1。
-build_supply、gather、attack_nearest、move_out、no_op的args={}，train_worker默认args={}。
+build_supply、gather、no_op的args={}，train_worker默认args={}。
 train_unit args={unit:tech_tree.units准确name}；build_structure args={structure:准确name,
 base:"home"或"expansion"或已观测site_N}；research args={upgrade:tech_tree.research准确name}。
 gather_gas args={workers_per_refinery:0..3}；expand args={base:"expansion"或已观测site_N}。
@@ -65,7 +65,7 @@ args.count必填；expansion_sites用整个字符串，不能放数组。
 scout默认遇敌含工人即停；args.stop_on_contact:false则报告接触并沿原路线move。接触≠到达。另可order_units move续行。
 order_units args={unit:"army"等真实选择器,count:1..200或"all",mode:"move|attack_move",target:地标或[x,y],timeout_s:1..600,reason:"意图"}；外层count=1。
 army按战斗单位数选人，不保证配比；达标仍检查支援产出/自由，必要时按兵种同点集结；数值count等够自由兵才出发。
-attack_nearest/move_out不等集结，仅派当前自由军队；自主安排侦察/分兵/集结。
+全军进攻用move_out args={scope:"all"}；否则只派自由军队，集结侦察自选。
 集结令等待时勿抢同批单位；调整须按活动ID取消重下。
 cancel_unit_order args={task_id:活动scout/order_units ID}。
 空间任务同参数（除reason）合并，不自动派第二队；按自由兵力增援。

@@ -1,4 +1,4 @@
-"""One independent battle LLM; target/squad choices come from that LLM only."""
+"""Independent battle LLM and execution of explicit whole-army attack orders."""
 import json
 import math
 import queue
@@ -30,6 +30,7 @@ visible_enemies仅当前己方视野，不可编造雾中敌人。基地受伤�
 
 class BattleAgent:
     uses_assembly_anchor = False
+    supports_all_army = True
     anchor = None
     max_age_wall = 12
     max_age_game = 12
@@ -50,6 +51,8 @@ class BattleAgent:
         self.last_decision=None;self.recent=deque(maxlen=12);self.action_contexts=[]
         self.request_trace={};self.last_shape=None;self.first_alert={};self.empty_move_out_orders=0
         self.request_bodies=[]  # last serialized prompts; powers the prefix-cache measurement
+        self.all_army_report={'enabled':False};self.all_army_progress={};self.all_army_stops=set()
+        self.all_army_signature=None
         self.inbox=queue.Queue(maxsize=1);self.outbox=queue.Queue(maxsize=1)
         self.closed=threading.Event()
         self.worker=threading.Thread(target=self._work,daemon=True,name='battle-agent')
@@ -59,14 +62,27 @@ class BattleAgent:
         row=dict(kind=kind,game_s=getattr(self,'game_s',None),wall=self.clock(),**details)
         self.recent.append(row);self.event(kind,**{k:v for k,v in row.items() if k!='kind'})
 
-    def mission(self,skill):
+    def mission(self,skill,scope=None):
+        if skill not in ('defend','attack_nearest','move_out'):raise ValueError('invalid army mission')
+        if scope not in (None,'available','all'):raise ValueError('invalid army scope')
+        if skill=='defend' and scope=='all':raise ValueError('all scope requires an attack mission')
+        previous_all=self.strategy.get('scope')=='all'
+        scope=('all' if previous_all else 'available') if scope is None and skill!='defend' else (scope or 'available')
         if skill=='defend':
             objective='defend_base'
             new=dict(attack_authorized=False,objective=objective,reason='主指挥显式选择防守')
         else:
             objective='visible_enemy' if skill=='attack_nearest' else 'enemy_start'
             new=dict(attack_authorized=True,objective=objective,reason='主指挥显式下达 '+skill)
-        if new==self.strategy:return
+        new['scope']=scope
+        if new==self.strategy:
+            if scope=='all':
+                self.assignments={tag:a for tag,a in self.assignments.items() if not a['failed']}
+            return
+        if previous_all and scope!='all':self.all_army_stops.update(self.assignments)
+        if scope=='all' or previous_all:
+            self.assignments.clear();self.all_army_progress.clear();self.all_army_signature=None
+        self.all_army_report={'enabled':scope=='all'}
         self.strategy=new;self.objective=objective;self.generation+=1;self.dirty=True
         self._event('tactical_mission',strategic_order=new,reason=new['reason'])
 
@@ -200,7 +216,7 @@ class BattleAgent:
         self.previous_combat_alerts=active_combat
 
     @staticmethod
-    def _squads(own):
+    def _squads(own,limit=16):
         bins={}
         for u in own:bins.setdefault((u.flying,int(u.x//24),int(u.y//24)),[]).append(u)
         groups={}
@@ -208,7 +224,7 @@ class BattleAgent:
             group.sort(key=lambda u:u.tag)
             for start in range(0,len(group),32):
                 part=group[start:start+32];groups['squad_'+str(part[0].tag)]=part
-        return dict(list(sorted(groups.items()))[:16]),max(0,len(groups)-16)
+        return dict(list(sorted(groups.items()))[:limit]),max(0,len(groups)-(limit or len(groups)))
 
     @staticmethod
     def _unit(u):
@@ -240,6 +256,7 @@ class BattleAgent:
         return self._shared_prefix(recent[0], recent[1])
 
     def _request(self,w,own,bases):
+        if self.strategy.get('scope')=='all':return  # Explicit full-army order is executed mechanically.
         now=self.clock()
         ready=getattr(self.client,'ready_for_request',None)
         if self.thinking or not own or now<self.next_request or (callable(ready) and not ready()):return
@@ -296,7 +313,7 @@ class BattleAgent:
         self.audit(dict(record='tactical_request_finished',request_id=r['request_id'],game_s=w.seconds,
             response=r['response'],error=r['error'],latency_s=r['latency_s'],usage=r['usage']))
         self.request_trace.setdefault(r['request_id'],{}).update(received_wall=self.clock(),latency_s=r['latency_s'])
-        if r['generation']!=self.generation or self.clock()-r['wall']>self.max_age_wall or w.seconds-r['game_s']>self.max_age_game:
+        if self.strategy.get('scope')=='all' or r['generation']!=self.generation or self.clock()-r['wall']>self.max_age_wall or w.seconds-r['game_s']>self.max_age_game:
             self.expired+=1;self.dirty=True
             self._event('tactical_plan_expired',request_id=r['request_id'],reason='主任务已变或回复超过12秒；未执行旧回复');return
         try:
@@ -387,7 +404,8 @@ class BattleAgent:
                     raise ValueError('movement ability unavailable; no fabricated dispatch')
                 out.append(command(ability,tags,pos=point))
                 self.action_contexts.append(dict(source='army_tactics',mode=a['mode'],task_id=None,
-                    request_id=a['request_id'],squad=a['squad'],base=a['base'],decision_source='battle_llm'))
+                    request_id=a['request_id'],squad=a['squad'],base=a['base'],
+                    decision_source=a.get('decision_source','battle_llm')))
                 for tag in tags:self.assignments[tag].update(issued=True,actual_point=point)
                 trace=self.request_trace.setdefault(a['request_id'],{})
                 trace.setdefault('first_order_wall',self.clock());trace.setdefault('first_order_game_s',w.seconds)
@@ -409,15 +427,80 @@ class BattleAgent:
         for tag in set(self.assignments)-self.tags:
             self._event('tactical_unit_released',unit_tag=tag,reason='单位消失或其他任务接管；没有擅自补员')
             del self.assignments[tag];self.dirty=True
+            self.all_army_progress.pop(tag,None)
         bases=[u for u in w.my_units if u.type_id in TOWNHALLS and not u.flying]
         self._scan(w,bases)
         shape=(tuple(sorted(self.tags)),tuple(sorted(b.tag for b in bases)))
         if shape!=self.last_shape:self.dirty=True;self.last_shape=shape
         self._receive(w,own,bases)
+        if self.strategy.get('scope')=='all':self._assign_all_army(w,own)
         actions=self._orders(w,own,bases)
+        if self.all_army_stops:
+            stopped=sorted(self.all_army_stops & self.tags)
+            if stopped:
+                actions.insert(0,command(3665,stopped))
+                self.action_contexts.insert(0,dict(source='army_tactics',mode='stop',task_id=None,
+                    decision_source='explicit_all_army_mission_replaced'))
+            self.all_army_stops.clear()
+        if self.strategy.get('scope')=='all':self._report_all_army(w,own)
         self.fighting={tag for tag,a in self.assignments.items() if a['mode'] in ('defend','attack') and not a['failed']}
         self._request(w,own,bases)
         return actions
+
+    def _assign_all_army(self,w,own):
+        if self.objective=='visible_enemy':
+            if not w.enemy_units:return  # No fabricated target or implicit fog search.
+            enemy=min(w.enemy_units,key=lambda u:u.distance(self.backend.homes[self.index]))
+            target=enemy.pos;goal=('visible_enemy',enemy.tag)
+        else:
+            target=tuple(self.backend.enemy_start(self.index));goal=('enemy_start',)
+        # No prompt squad limit: every controllable unit, including newly produced
+        # reinforcements, belongs to this explicitly ordered persistent mission.
+        groups,_=self._squads(own,limit=None)
+        for sid,units in groups.items():
+            for u in units:
+                old=self.assignments.get(u.tag)
+                if old and old.get('goal')==goal and math.dist(old['requested_point'],target)<=6:continue
+                self.assignments[u.tag]=dict(squad=sid,mode='attack',target=list(target),
+                    goal=goal,requested_point=target,base=None,reason='执行主指挥显式全军进攻，包含后续可调动增援',
+                    decision_source='explicit_all_army_order',
+                    request_id='all-army-%d-%d'%(self.generation,w.game_loop),issued=False,arrived=False,failed=False,
+                    created_game_s=w.seconds)
+                self.all_army_progress[u.tag]=dict(origin=u.pos,last_pos=u.pos,last_progress=w.seconds,departed=False)
+
+    def _report_all_army(self,w,own):
+        eligible={u.tag for u in own};rows=[]
+        for u in w.my_units:
+            if not self._combat_unit(u):continue
+            a=self.assignments.get(u.tag);p=self.all_army_progress.get(u.tag)
+            if u.tag not in eligible:
+                state='excluded';reason='other_task_owner' if self._eligible(u) else 'not_mobile_or_supported'
+            elif not a:
+                state='waiting_for_target';reason='no_current_visible_enemy'
+            elif a['failed']:
+                state='failed';reason='inspect tactical_order_failed'
+            elif not a['issued']:
+                state='unassigned';reason='not_dispatched'
+            else:
+                if math.dist(u.pos,p['last_pos'])>=.5:
+                    p['last_pos']=u.pos;p['last_progress']=w.seconds
+                if math.dist(u.pos,p['origin'])>2:p['departed']=True
+                point=a.get('actual_point',a['requested_point'])
+                engaged=any(u.can_attack(e) and u.distance(e)<=max(8,u.attack_range+2) for e in w.enemy_units)
+                state=('at_target' if u.distance(point)<=6 else 'engaged' if engaged else
+                       'stalled' if w.seconds-p['last_progress']>=8 else 'departed' if p['departed'] else 'dispatched')
+                reason='Observed position/contact; dispatch alone does not prove departure or arrival'
+            rows.append(dict(tag=u.tag,state=state,reason=reason))
+        counts=dict(Counter(row['state'] for row in rows))
+        self.all_army_report=dict(enabled=True,objective=self.objective,total=len(rows),eligible=len(own),
+            dispatched=sum(bool(self.assignments.get(u.tag,{}).get('issued')) for u in own),
+            departed=sum(bool(self.all_army_progress.get(u.tag,{}).get('departed')) for u in own),
+            counts=counts,units=rows,
+            meaning='Full controllable army plus reinforcements. Other task owners and immobile units are explicit exclusions; stalled is no observed progress, not proof of a building obstruction.')
+        signature=tuple(sorted(counts.items()))
+        if signature!=self.all_army_signature:
+            self.all_army_signature=signature
+            self._event('all_army_coverage',**self.all_army_report)
 
     def _assignment_rows(self):
         rows={}
@@ -434,22 +517,26 @@ class BattleAgent:
     PUBLIC_KEYS = ('enabled','kind','planner_enabled','mode','objective','min_group','unit_tags','fighting_tags',
                    'rally','thinking','requests','accepted','errors','expired','last_decision','strategic_order',
                    'base_alerts','combat_alerts','assignments','recent_feedback','prompt_chars',
-                   'shared_prefix_chars','ownership','safety')
+                   'shared_prefix_chars','ownership','safety','all_army')
 
     # Give the model the newest outcomes only; older ones are in the audit journal.
     PUBLIC_FEEDBACK_ITEMS = 6
 
     def public(self):
-        return dict(enabled=True,kind='independent_battle_llm',planner_enabled=True,mode=self.mode,
+        return dict(enabled=True,kind='independent_battle_llm',planner_enabled=True,
+            mode='all_army_attack' if self.strategy.get('scope')=='all' else self.mode,
             objective=self.objective,min_group=0,unit_tags=sorted(self.tags),fighting_tags=sorted(self.fighting),rally=None,
             thinking=self.thinking,requests=self.requests,accepted=self.accepted,errors=self.errors,expired=self.expired,
             last_decision=self.last_decision,strategic_order=self.strategy,base_alerts=self.alerts,
             combat_alerts=self.combat_alerts,
+            all_army=self.all_army_report,
             assignments=self._assignment_rows(),recent_feedback=list(self.recent)[-self.PUBLIC_FEEDBACK_ITEMS:],
             prompt_chars=len(self.request_bodies[-1]) if self.request_bodies else 0,
             shared_prefix_chars=self.cache_prefix_chars(),
             ownership='Unassigned army only; custom/economic/transport tasks excluded',
-            safety='LLM decides support/attack/withdraw; no global auto-retreat, assembly detour or scripted reinforcement')
+            safety=('Explicit all-army order executes its selected objective and includes reinforcements; other task owners remain excluded'
+                    if self.strategy.get('scope')=='all' else
+                    'LLM decides support/attack/withdraw; no global auto-retreat, assembly detour or scripted reinforcement'))
 
     def close(self):
         self.closed.set();self.worker.join(timeout=.3)

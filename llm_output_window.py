@@ -128,6 +128,21 @@ class Feed:
                     body=event.get('error') or event.get('reason') or json.dumps(event.get('contacts',event.get('observation',event.get('report',event))),ensure_ascii=False),
                     raw=json.dumps(event,ensure_ascii=False,indent=2),
                     error=name=='spatial_mission_error' or event.get('state')=='failed',status=labels[name]))
+            elif name=='all_army_coverage':
+                counts=event.get('counts',{})
+                blocked=counts.get('failed',0)+counts.get('stalled',0)
+                self.entries.append(dict(title=game_time(event.get('game_loop',0)/22.4)+' · 全军进攻',
+                    body='已下令 %d/%d，观察到出发 %d，受阻或停滞 %d，其他任务占用或无法调动 %d。'%(
+                        event.get('dispatched',0),event.get('total',0),event.get('departed',0),blocked,counts.get('excluded',0)),
+                    raw=json.dumps(event,ensure_ascii=False),error=bool(blocked),status='按实际位置核对，已下令不等于已出发'))
+            elif name in ('mineral_transfer_dispatched','mineral_transfer_arrived','mineral_transfer_unconfirmed'):
+                label={'mineral_transfer_dispatched':'已派遣富余矿工，等待到达',
+                       'mineral_transfer_arrived':'观察到矿工到达矿点并持有采集指令',
+                       'mineral_transfer_unconfirmed':'转移未确认，已释放分配预留'}[name]
+                body=('%d人 → 基地%s'%(len(event.get('workers',[])),event.get('destination'))
+                      if name=='mineral_transfer_dispatched' else '工人%s → 基地%s'%(event.get('worker'),event.get('destination')))
+                self.entries.append(dict(title=game_time(event.get('game_loop',0)/22.4)+' · 矿工调配',body=body,
+                    raw=json.dumps(event,ensure_ascii=False),error=name=='mineral_transfer_unconfirmed',status=label))
             elif name in ('macro_plan_set','economy_reservation','economy_milestone'):
                 states={'not_requested':'尚未设置预算','saving':'正在为扩张存钱',
                     'expired':'预算预留到期，已释放','base_goal_started':'基地数量达到开工目标',
@@ -329,7 +344,14 @@ class Window:
             self.text(thinking+'   ·   已接收 %d   错误 %d'%(c.get('decisions',0),c.get('errors',0)),x+16,top+52,MUTED,16)
             d=c.get('defense_adjutant',{})
             tactics=c.get('army_tactics',{})
-            if tactics.get('enabled'):
+            coverage=tactics.get('all_army',{})
+            if coverage.get('enabled'):
+                counts=coverage.get('counts',{})
+                self.text('全军：已发 %d/%d · 出发 %d · 受阻 %d · 占用 %d'%(
+                    coverage.get('dispatched',0),coverage.get('total',0),coverage.get('departed',0),
+                    counts.get('failed',0)+counts.get('stalled',0),counts.get('excluded',0)),
+                    x+16,top+78,MUTED,16)
+            elif tactics.get('enabled'):
                 label={'assemble':'集结','attack':'进攻','hold':'固守','withdraw':'撤退'}.get(tactics.get('mode'),'模型调兵' if tactics.get('kind')=='independent_battle_llm' else '待命')
                 self.text('战术指挥：'+label+(' · 等待回复' if tactics.get('thinking') else '')+
                           ' · 部队 %d · 每批 %d · 回复 %d'%(len(tactics.get('unit_tags',[])),tactics.get('min_group',6),tactics.get('accepted',0)),

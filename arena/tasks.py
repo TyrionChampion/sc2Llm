@@ -1,6 +1,6 @@
 """Persistent, bounded high-level task queue; observe results, don't spam orders."""
 from dataclasses import dataclass,field
-from collections import deque
+from collections import Counter,deque
 import math
 from copy import deepcopy
 import json
@@ -66,6 +66,7 @@ class TaskQueue:
         self.tech_tree=getattr(backend,'tech_tree',None)
         self.race=backend.races[index] if hasattr(backend,'races') else 'terran'
         self.gas_workers_per_refinery=None;self.gas_assignments={};self.gas_worker_tags=set();self.gas_next_at=0;self.gas_release_pending=set()
+        self.mineral_transfers={}
         self.gas_bank=0;self.supply_bank=0
         self.economy=Economy(self.tech_tree,self.race,self.event)
         if self.tech_tree is None:self.emit('[capability-profile] legacy Terran adapter without engine tech_tree; new three-race macros unavailable')
@@ -366,6 +367,11 @@ class TaskQueue:
             elif skill=='rally_units':
                 try:args=self._validate_rally_args(args)
                 except (ValueError,KeyError,TypeError) as e:invalid(field+'.args',args,str(e))
+            elif skill in ('attack_nearest','move_out'):
+                if set(args)-{'scope'} or ('scope' in args and args['scope'] not in ('available','all')):
+                    invalid(field+'.args',args,'optional scope: available or all')
+                if args.get('scope')=='all' and getattr(self,'army_tactics',None) is not None and not getattr(self.army_tactics,'supports_all_army',False):
+                    invalid(field+'.args.scope','all','this tactical backend cannot enforce all-army coverage')
             elif skill in MACROS and skill not in SPECS:
                 invalid(field+'.skill',skill,'backend with an engine-bound three-race tech_tree')
             else:
@@ -387,12 +393,19 @@ class TaskQueue:
             if skill=='train_unit' and isinstance(args,dict) and args.get('unit') in ('nuke','interceptor') and count!=1:
                 invalid(field+'.count',count,'1 for ammo restocking; raw API does not expose an exact stored-ammo count')
             clean.append((skill,count,args))
+        if any(skill in ('attack_nearest','move_out') and args.get('scope')=='all' for skill,count,args in clean):
+            if any(skill=='defend_base' for skill,count,args in clean):
+                invalid('tasks',items,'all-army attack conflicts with a new standing base-defense order')
+            # A full-army order explicitly replaces routine base guards. Custom
+            # missions still own their units and are reported as exclusions.
+            cancellations.update(t.id for t in self.tasks if t.active and t.skill=='defend_base')
         if issues: raise PlanValidationError(issues)
         casters=[args['caster'] for skill,count,args in clean if skill=='use_ability']
         if len(set(casters))!=len(casters):
             raise PlanValidationError([dict(field='tasks',received=casters,
                 expected='at most one explicit ability order per caster in a reply')])
         def key(skill,args):
+            if skill in ('attack_nearest','move_out'):return (skill,args.get('scope'))
             if skill in ('cancel_native_building','cancel_native_queue','cancel_native_morph'):return (skill,args['task_id'])
             if skill=='use_ability':return (skill,json.dumps(args,sort_keys=True))
             if skill=='defend_base':
@@ -585,7 +598,7 @@ class TaskQueue:
     def protected(self):
         return {t.worker for t in self.tasks if t.active and t.worker}|{
             tag for t in self.tasks if t.active and t.program and getattr(t,'skill',None)!='rally_units'
-            for tag in t.program.tags}|self.gas_worker_tags|set(self.gas_assignments)|self.defense_tags
+            for tag in t.program.tags}|self.gas_worker_tags|set(self.gas_assignments)|self.defense_tags|set(self.mineral_transfers)
     def take_defense(self,tags,now):
         from arena.python_skills import PythonSkillRun
         self.defense_tags=set(tags)
@@ -640,6 +653,8 @@ class TaskQueue:
         return result
     def tick(self,w,reserved):
         self.clock=w.seconds; now=w.seconds; output=[]; used=set(reserved)
+        self.refresh_mineral_transfers(w)
+        used.update(self.mineral_transfers)
         self.defense_tags_snapshot=None   # first defence order this tick fills it in
         self.economy.observe(w)
         self.economy.refresh(w,self.tasks)
@@ -720,7 +735,9 @@ class TaskQueue:
                 self.update(t,'completed','mineral allocation dispatched; idle-worker gathering maintained'); continue
             if t.skill in ('attack_nearest','move_out'):
                 if getattr(self,'army_tactics',None) is not None:
-                    self.army_tactics.mission(t.skill)
+                    if 'scope' in t.args and getattr(self.army_tactics,'supports_all_army',False):
+                        self.army_tactics.mission(t.skill,scope=t.args['scope'])
+                    else:self.army_tactics.mission(t.skill)
                     self.update(t,'completed','persistent tactical mission accepted; execution and outcome require observation')
                     continue
                 army=[u for u in w.my_units if u.done and not u.hallucination
@@ -842,19 +859,56 @@ class TaskQueue:
         self.gas_worker_tags=set(self.gas_assignments)|self.gas_release_pending;used.update(self.gas_worker_tags)
 
     def rebalance_minerals(self,w,used,out,t):
+        self.refresh_mineral_transfers(w)
         bases=[u for u in w.my_units if u.type_id in TOWNHALLS and u.done and not u.flying]
         workers=[u for u in w.my_units if u.type_id in WORKERS and u.tag not in self.protected() and u.tag not in used]
+        outgoing=Counter(r['source'] for r in self.mineral_transfers.values())
+        incoming=Counter(r['destination'] for r in self.mineral_transfers.values())
+        # Observations can lag dispatched orders. Reserve BOTH ends until arrival;
+        # a source with one surplus worker must never donate an entire destination deficit.
+        surplus={b.tag:max(0,b.assigned_harvesters-b.ideal_harvesters-outgoing[b.tag]) for b in bases}
+        sources={}
+        patches={m.tag:m for m in w.units if m.mineral}
+        for u in workers:
+            targets=[patches[tag] for tag in u.order_targets if tag in patches]
+            origin=min(bases,key=lambda b:b.distance(targets[0] if targets else u)) if bases else None
+            if origin and origin.distance(targets[0] if targets else u)<14:sources[u.tag]=origin.tag
         destinations=[]
         for base in bases:
-            deficit=max(0,base.ideal_harvesters-base.assigned_harvesters)
+            deficit=max(0,base.ideal_harvesters-base.assigned_harvesters-incoming[base.tag])
             if deficit:destinations.append((base,deficit))
         for base,deficit in destinations:
             patches=[m for m in w.units if m.mineral and m.distance(base)<12]
             if not patches:continue
-            choices=[u for u in workers if u.distance(base)>14 and any(b.assigned_harvesters>b.ideal_harvesters and u.distance(b)<14 for b in bases)]
+            choices=[u for u in workers if sources.get(u.tag)!=base.tag and surplus.get(sources.get(u.tag),0)>0]
             choices.sort(key=base.distance)
-            for u in choices[:deficit]:
-                patch=min(patches,key=u.distance);self.issue(t,command(3666,[u.tag],target=patch.tag),out);used.add(u.tag);workers.remove(u)
+            moved=[]
+            for u in choices:
+                source=sources[u.tag]
+                if not deficit:break
+                if not surplus[source]:continue
+                patch=min(patches,key=u.distance)
+                if not self.issue(t,command(3666,[u.tag],target=patch.tag),out):continue
+                self.mineral_transfers[u.tag]=dict(source=source,destination=base.tag,patch=patch.tag,sent=w.seconds)
+                surplus[source]-=1;deficit-=1
+                used.add(u.tag);workers.remove(u);moved.append(dict(worker=u.tag,source=source))
+            if moved:self.event('mineral_transfer_dispatched',task_id=t.id,destination=base.tag,workers=moved,
+                source_surplus_remaining=dict(surplus),confirmed=False,
+                handling='Surplus-only transfer; source and destination reserved until observed arrival. Dispatch is not mining confirmation.')
+
+    def refresh_mineral_transfers(self,w):
+        for tag,row in list(self.mineral_transfers.items()):
+            worker=w.by_tag(tag);patch=w.by_tag(row['patch']);base=w.by_tag(row['destination'])
+            arrived=bool(worker and worker.alliance==1 and patch and worker.distance(patch)<=2 and row['patch'] in worker.order_targets)
+            invalid=(tag in w.dead_units or (worker is not None and (worker.type_id not in WORKERS or worker.alliance!=1))
+                     or base is None or base.alliance!=1 or patch is None)
+            timed_out=w.seconds-row['sent']>30
+            if arrived or invalid or timed_out:
+                del self.mineral_transfers[tag]
+                self.event('mineral_transfer_arrived' if arrived else 'mineral_transfer_unconfirmed',worker=tag,
+                    source=row['source'],destination=row['destination'],
+                    reason='Observed worker at the ordered mineral patch with a matching gather target' if arrived else
+                           'Transfer timed out or its worker/base/mineral is no longer observed; no mining success assumed')
 
     def close(self):
         for t in self.tasks:

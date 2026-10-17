@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from arena.commander import Commander
 from arena.defense_orders import base_threats
 from arena.raw_engine import ATTACK
-from test_rally_orders import engine_backend, HATCHERY
+from test_rally_orders import engine_backend, HATCHERY, RALLY_ABILITY
 from test_realtime_runtime import unit, world
 
 TOWNHALL, MARINE, VIKING, ENEMY_MARINE = 18, 48, 34, 48
@@ -35,7 +35,9 @@ class ScriptedModel:
 
 class TwoFrontDefense(unittest.TestCase):
     def setUp(self):
-        self.fixture, self.backend = engine_backend('terran')
+        # The engine-bound defense executor checks native Attack availability;
+        # the default rally-only fixture cannot execute a combat order.
+        self.fixture, self.backend = engine_backend('terran',available=(ATTACK,RALLY_ABILITY))
         self.home = unit(1, TOWNHALL, 30, 30, is_building=True, progress=1.0)
         self.far = unit(2, TOWNHALL, 150, 150, is_building=True, progress=1.0)
         # Commander 需要一份初始观测;真正的世界由每个用例单独构造
@@ -85,15 +87,17 @@ class TwoFrontDefense(unittest.TestCase):
             try:
                 # 决策间隔 6 游戏秒:推进必须够大,否则只发一次请求
                 step = 134
+                out = []
                 for i in range(6):
-                    commander.tick(replace(w, game_loop=w.game_loop + step * i))
+                    # Initial guard orders can be issued while the asynchronous
+                    # reply is first consumed. Do not discard that half of the trace.
+                    out += commander.tick(replace(w, game_loop=w.game_loop + step * i))
                     time.sleep(0.03)      # 让异步工作线程把回包放进 outbox
                 self.assertIn('payload', seen, '模型必须收到一次请求')
                 report = {r['label']: r for r in seen['payload']['defense_report']}
                 attacked = sorted(report[l]['visible_attackers'] for l in report if report[l]['visible_attackers'] > 0)
                 self.assertEqual(attacked, [1, 3], '两处压力必须如实反映')
                 # 让脚本执行模型的两条令
-                out = []
                 for i in range(6, 12):
                     out += commander.tick(replace(w, game_loop=w.game_loop + step * i))
                     time.sleep(0.02)

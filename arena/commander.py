@@ -155,6 +155,7 @@ class Commander:
             self.system+='\nWhen strategic_intent_policy.required is true, include top-level strategic_intent as exactly attack_nearest, move_out, or defend. Use defend for a deliberate defensive hold; attack_nearest and move_out authorize the corresponding persistent tactical mission.'
             if getattr(self.tactics,'uses_assembly_anchor',True) is False:
                 self.control_policy['army_tactics'].update(kind='independent_battle_llm',
+                    all_army_attack=True,
                     standing_order='Battle LLM may select distant free squads to defend threatened bases; no scripted strategic dispatch or retreat')
                 self.system+='\nBattle agent controls free combat squads. Avoid persistent order_units/Python ownership for routine army movement because that prevents its defense recall. Use attack_nearest/move_out to authorize strategic attack; it decides local defense, reinforcement and retreat. Explicit custom missions still keep ownership.'
         self.emit('[control] combat reflex %s; idle-worker gathering ON' % ('ON' if combat_reflex else 'OFF'))
