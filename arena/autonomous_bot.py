@@ -65,13 +65,13 @@ cancel_expansion args={task_id:活动且尚未下令的expand ID}；已下令建
 stance:"hold|trade|screen",timeout_s:30..900,reason:"依据"}。防守占有单位；reason里的“守坡”不派兵，须下defend_base，出击前撤防。
 cancel_task/stop_production args={task_id:己方ID}。前者撤控兵/未发单宏；后者停后续工人/部队购买，在途保留，不退款；append仅加新量。
 scout外层count=1，args={unit:真实选择器,count:1..8,targets:["enemy_start"]或坐标/地标列表或字符串"expansion_sites",timeout_s:1..600,reason:"侦察"}。
-args.count必填；expansion_sites用整个字符串，不能放数组。
+args.count必填；expansion_sites可单用或置于路线数组，按序展开矿区组。
 scout默认遇敌含工人即停；args.stop_on_contact:false则报告接触并沿原路线move。接触≠到达。另可order_units move续行。
 order_units args={unit:"army"等真实选择器,count:1..200或"all",mode:"move|attack_move",target:地标或[x,y],timeout_s:1..600,reason:"意图"}；外层count=1。
 army按战斗单位数选人，不保证配比；达标仍检查支援产出/自由，必要时按兵种同点集结；数值count等够自由兵才出发。
 全军进攻用move_out args={scope:"all"}；否则只派自由军队，集结侦察自选。
 集结令等待时勿抢同批单位；调整须按活动ID取消重下。
-cancel_unit_order args={task_id:活动scout/order_units ID}。
+cancel_unit_order args={task_id:己方空间任务ID}；已结束任务no-op。
 空间任务同参数（除reason）合并，不自动派第二队；按自由兵力增援。
 idle≠自由。timeout_s含排队、等兵、赶路、交战；对局延长不延单任务。
 rally_units args={producers:"all"或rally_producers的label列表,target:地标或[x,y],
@@ -89,6 +89,10 @@ prepared_strategy是开局目标；旧局举例非本局，以当前decision_mem
 当control_policy.surrender_allowed=true且clear_disadvantage有持续败势证据，本轮必须以唯一
 surrender任务立即认输：args={reason:"具体观测败势"}。短暂缺钱、单次拒绝或网络错误不等于败势。
 '''
+
+# The bounded Go adapter intentionally replaces the full Commander system. It
+# must still advertise the same offensive operations as the direct planners.
+from arena.raids import PROTOCOL as RAID_PROTOCOL
 
 
 class BudgetExhausted(RuntimeError):
@@ -425,6 +429,9 @@ class BotPlanner:
             raise BudgetExhausted('Per-match request budget exhausted')
         from arena.context_tables import decode_tables
         source=decode_tables(json.loads(user));schema_chars=0
+        battle_rules=BOT_RULES
+        if source.get('offensive_operations',{}).get('enabled'):
+            battle_rules+='\n'+RAID_PROTOCOL
         schema_builder=getattr(self.client,'response_schema_for',None)
         if callable(schema_builder):
             schema=schema_builder(source);self.client.response_schema=schema
@@ -450,7 +457,7 @@ class BotPlanner:
         for section,field,keep in (('decision_memory','milestones',1),
                 ('decision_memory','recent',1),('economy_report','checkpoints',1),
                 ('economy_report','recent_requested_spending',0)):
-            if len(BOT_RULES)+len(compact)<=self.context_limit:break
+            if len(battle_rules)+len(compact)<=self.context_limit:break
             values=payload.get(section,{}).get(field)
             if isinstance(values,list) and len(values)>keep:
                 payload[section][field]=values[-keep:] if keep else []
@@ -458,7 +465,7 @@ class BotPlanner:
                     dict(field=section+'.'+field,omitted=len(values)-keep,
                          reason='Full system and iteration metadata included in budget'))
                 compact=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
-        if len(BOT_RULES) + len(compact) > self.context_limit:
+        if len(battle_rules) + len(compact) > self.context_limit:
             # Share repeated values/field names before refusing dense current combat.
             # Unlike history pruning this retains every current fact and its order.
             from arena.context_tables import object_pool, key_table
@@ -470,10 +477,10 @@ class BotPlanner:
                 'Decode these wrappers before nested columns/rows tables; all values retained.')
             payload = object_pool(payload,integer_refs=True)
             compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
-            if len(BOT_RULES) + len(compact) > self.context_limit:
+            if len(battle_rules) + len(compact) > self.context_limit:
                 payload = key_table(payload,base36=True)
                 compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
-        if len(BOT_RULES) + len(compact) > self.context_limit:
+        if len(battle_rules) + len(compact) > self.context_limit:
             self.fatal_error = 'Battle context exceeds %s-character hard limit'%format(self.context_limit,',')
             self.fatal_kind = 'context_budget'
             raise BudgetExhausted(self.fatal_error)
@@ -481,10 +488,10 @@ class BotPlanner:
         # Encoded envelopes do not have a top-level world. Cadence must use
         # the original current observation, never depend on wire representation.
         self.last_request_game_s = source.get('world',{}).get('game_s')
-        self.input_chars += len(BOT_RULES) + len(compact)
+        self.input_chars += len(battle_rules) + len(compact)
         self.schema_transport_chars += schema_chars
         try:
-            raw = self.client.chat(BOT_RULES, compact)
+            raw = self.client.chat(battle_rules, compact)
         except Exception as error:
             self.consecutive_errors += 1
             detail = str(error)

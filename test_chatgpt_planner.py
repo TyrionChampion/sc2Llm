@@ -107,7 +107,7 @@ class ChatGPTPlannerTests(unittest.TestCase):
         self.assertEqual(scout['properties']['count']['enum'],[1])
         targets=scout['properties']['args']['properties']['targets']['anyOf']
         self.assertEqual(targets[0]['enum'],['expansion_sites'])
-        self.assertNotIn('expansion_sites',targets[1]['items']['anyOf'][0]['enum'])
+        self.assertIn('expansion_sites',targets[1]['items']['anyOf'][0]['enum'])
         self.assertNotIn('target',scout['properties']['args']['properties'])
         order=next(v for v in variants if v['properties']['skill']['enum']==['order_units'])
         self.assertEqual(order['properties']['count']['enum'],[1])

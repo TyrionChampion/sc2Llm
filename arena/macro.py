@@ -116,7 +116,9 @@ class MacroRun:
         self.issued=0;self.born=set();self.baseline=None;self.next_at=0;self.last_issue=0
         self.gas_before=None;self.gas_tags=set();self.research_unconfirmed_since=None;self.failure=None;self.retries=0;self.relocation=None;self.relocations=0
         self.placement_feedback=None
+        self.position_wait_reason=None
         self.bound_products=set()
+        self.last_observation_game_s=None;self.observation_gap_s=0
     def close(self):self.tags.clear()
     def product_units(self,w):
         product=self.spec['entry']['id']
@@ -129,6 +131,7 @@ class MacroRun:
         result=dict(kind='macro',operation=self.spec['kind'],product=self.spec.get('entry',{}).get('name'),
                     args=self.args,unit_tags=sorted(self.tags),issued_quantity=self.issued,observed_completed=len(self.born),relocation=self.relocation)
         if self.placement_feedback:result['placement_feedback']=self.placement_feedback
+        if self.position_wait_reason:result['position_wait_reason']=self.position_wait_reason
         if getattr(self,'cancelled_unissued',0):result['cancelled_unissued']=self.cancelled_unissued
         blocked=[p['blocked_output'] for p in self.pending if p.get('blocked_output')]
         if blocked:result['blocked_outputs']=deepcopy(blocked)
@@ -163,17 +166,23 @@ class MacroRun:
         return min(w.enemy_units,key=lambda u:u.distance(home)).pos
     def _positions(self,w,q,t,actor,recipe,allow_dense_supply=False):
         tree=q.backend.tech_tree;product=self.spec['entry']['id'];home=q.backend.homes[q.index]
+        self.position_wait_reason=None
         if 'warp_target' in self.spec:anchors=[self.spec['warp_target']]
         elif self.spec['kind']=='form':anchors=[self._landmark(w,q,self.spec['target'])]
         elif self.spec.get('base')=='expansion' or self.spec.get('base','').startswith('site_'):
             groups=expansion_clusters(w)
-            if self.spec['base'].startswith('site_'):groups=[g for g in groups if g[0]==self.spec['base']]
+            if self.spec['base'].startswith('site_'):
+                groups=[g for g in groups if g[0]==self.spec['base']]
+                if not groups:self.position_wait_reason='selected site '+self.spec['base']+' is not in current resource sites; check observed site IDs and vision'
             if product in TOWNHALLS:
-                groups=[g for g in groups if not any(u.type_id in TOWNHALLS and any(u.distance(m)<12 for m in g[1]) for u in w.my_units)]
+                unoccupied=[g for g in groups if not any(u.type_id in TOWNHALLS and any(u.distance(m)<12 for m in g[1]) for u in w.my_units)]
+                if groups and not unoccupied:
+                    self.position_wait_reason='selected expansion site already has an own town hall; choose another site or cancel this task'
+                groups=unoccupied
             elif self.spec['base']=='expansion':
                 groups=[g for g in groups if any(u.type_id in TOWNHALLS and u.done and u.distance(home)>15 and any(u.distance(m)<12 for m in g[1]) for u in w.my_units)]
             groups.sort(key=lambda g:min(m.distance(home) for m in g[1]))
-            anchors=[(sum(m.x for m in g)/len(g),sum(m.y for m in g)/len(g)) for _,g in groups if not any(any(e.distance(m)<12 for m in g) for e in w.enemy_units)]
+            anchors=[(sum(m.x for m in g)/len(g),sum(m.y for m in g)/len(g)) for _,g in groups if self.spec['base'].startswith('site_') or not any(any(e.distance(m)<12 for m in g) for e in w.enemy_units)]
         else:
             anchors=[u.pos for u in w.my_units if u.type_id in TOWNHALLS and u.done]
             anchors.sort(key=lambda p:math.dist(p,home))
@@ -210,8 +219,12 @@ class MacroRun:
         return result[:512]
     def _gas(self,w,q,t,used,bank,out):
         desired=self.spec['per_refinery'];q.gas_workers_per_refinery=desired
-        refineries=[u for u in w.my_units if u.gas_building and u.done and u.vespene_contents>0]
-        if desired and not refineries:q.update(t,'waiting','need completed gas building on a geyser');return bank
+        completed=[u for u in w.my_units if u.gas_building and u.done]
+        refineries=[u for u in completed if u.vespene_contents>0]
+        if desired and not refineries:
+            reason=('all observed completed gas buildings are depleted (remaining=0); worker allocation cannot restore gas; choose/build a non-depleted geyser'
+                    if completed else 'need completed gas building on a geyser')
+            q.update(t,'waiting',reason);return bank
         q.balance_gas(w,used,out,t)
         if self.gas_before is None:self.gas_before=w.vespene
         if desired==0 and not q.gas_worker_tags and all(u.assigned_harvesters==0 for u in refineries):
@@ -222,6 +235,9 @@ class MacroRun:
         else:q.update(t,'running','assigning gas workers; awaiting observed refinery saturation')
         return bank
     def tick(self,w,q,t,used,bank,out):
+        self.observation_gap_s=(max(0,w.seconds-self.last_observation_game_s)
+                                if self.last_observation_game_s is not None else 0)
+        self.last_observation_game_s=w.seconds
         try:return self._tick(w,q,t,used,bank,out)
         except Exception as e:self.fail(q,t,type(e).__name__+': '+str(e),w);return bank
     def _tick(self,w,q,t,used,bank,out):
@@ -275,7 +291,10 @@ class MacroRun:
         if kind!='research':
             # Units from pre-existing queues may finish while this goal waits
             # for its first eligible producer. They are not this goal's output.
-            if self.baseline is None or not self.issued:self.baseline={u.tag for u in self.product_units(w)}
+            if self.baseline is None or not self.issued:
+                self.baseline={u.tag for u in self.product_units(w)}
+                if kind=='production' and not entry.get('structure'):
+                    self.baseline.update(getattr(q,'observed_units_by_type',{}).get(product,set()))
             fresh=[u for u in self.product_units(w) if u.tag not in self.baseline]
             if kind=='form' or kind=='production' and entry.get('structure'):
                 for pending in self.pending:
@@ -296,6 +315,13 @@ class MacroRun:
                             self.bound_products.add(actor.addon_tag)
                 fresh=[u for u in fresh if u.tag in self.bound_products]
             elif kind=='production' and any(r['producer']==133 for r in entry['recipes']):
+                # Ordinary Gateway output can already be walking to its rally
+                # on the first observation, especially with adaptive 64-frame
+                # steps. Metadata speeds use normal seconds (16 loops); our
+                # game seconds use 22.4. Only the actual last observation gap
+                # contributes travel, never the age of this goal/receipt.
+                speed=getattr(q.backend.types.get(product),'movement_speed',0)
+                local_radius=5+max(0,speed)*1.4*self.observation_gap_s
                 runs=[task.program for task in q.tasks if isinstance(task.program,MacroRun)
                     and task.program.spec.get('entry',{}).get('id')==product
                     and (task.active or task.status=='failed')]
@@ -307,7 +333,7 @@ class MacroRun:
                         for p in run.pending)]
                     if not owners:
                         owners=[run for run in runs if unit.tag not in (run.baseline or set()) and any(
-                            not p.get('native_rejected') and not p.get('warp_in') and p.get('producer_pos') and unit.distance(p['producer_pos'])<5
+                            not p.get('native_rejected') and not p.get('warp_in') and p.get('producer_pos') and unit.distance(p['producer_pos'])<local_radius
                             for p in run.pending)]
                     unique={id(run):run for run in owners}
                     if len(unique)==1:next(iter(unique.values())).bound_products.add(unit.tag)
@@ -589,7 +615,7 @@ class MacroRun:
                 actor=clear[0];chosen=[actor];pos=(actor.x+2.5,actor.y-.5)
             elif r.get('placement'):
                 candidates=self._positions(w,q,t,actor,r)
-                if not candidates and product!=60:hints.append('no candidate sites; need vision, power/creep or another expansion');continue
+                if not candidates and product!=60:hints.append(self.position_wait_reason or 'no candidate sites; need vision, power/creep or another expansion');continue
                 pos=((q.backend.placement_with_addon(q.index,r['ability'],actor.tag,candidates) if product in (21,27,28)
                       else q.backend.placement(q.index,r['ability'],actor.tag,candidates)) if candidates else None)
                 if pos is None and product==60:
@@ -599,7 +625,7 @@ class MacroRun:
                     previous=set(candidates)
                     dense=[p for p in self._positions(w,q,t,actor,r,allow_dense_supply=True) if p not in previous]
                     if not candidates and not dense:
-                        hints.append('no candidate sites; need vision, power/creep or another expansion');continue
+                        hints.append(self.position_wait_reason or 'no candidate sites; need vision, power/creep or another expansion');continue
                     if dense:
                         pos=q.backend.placement(q.index,r['ability'],actor.tag,dense)
                         if pos is not None:

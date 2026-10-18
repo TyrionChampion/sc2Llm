@@ -165,7 +165,7 @@ def revalidate(plan, before, w, tasks, home, age, max_age=70):
             known=before.get('known',before['active'])
             if not target or target.id not in known:
                 reason='cancellation target not owned/known in original observation'
-            elif target.skill not in ('defend_base','scout','order_units','rally_units') and not tasks.unissued_macro(target):
+            elif target.skill not in ('defend_base','scout','order_units','raid','drop_raid','rally_units') and not tasks.unissued_macro(target):
                 reason='macro already issued an order/relocation; cannot cancel native work here'
         elif name=='rally_units':
             # Revalidate has no backend handle, so it checks the requested type#N selector
@@ -351,11 +351,13 @@ from arena.economy import PROTOCOL as ECONOMY_PROTOCOL
 SYSTEM += '\n' + ECONOMY_PROTOCOL
 
 from arena.spatial import PROTOCOL as SPATIAL_PROTOCOL
+from arena.raids import PROTOCOL as RAID_PROTOCOL
 from arena.defense_orders import PROTOCOL as DEFENSE_PROTOCOL
 SYSTEM = SYSTEM.replace('No coordinates/tags in commands.',
     'Coordinates are accepted only by the explicitly documented spatial, scan and rally interfaces; no invented unit tags.')
 SYSTEM = SYSTEM.replace('scripts select units/coordinates/placement',
     'scripts allocate units, resolve your spatial goals, and handle placement')
+SPATIAL_PROTOCOL += '\n' + RAID_PROTOCOL
 SYSTEM += '\n' + SPATIAL_PROTOCOL
 SYSTEM += '\n' + DEFENSE_PROTOCOL
 SYSTEM += '\ncancel_task also cancels an owned macro that has issued_quantity=0, no pending native order and no relocation. It stops waiting work, never native construction/training/research already sent, and never refunds spent resources. Re-read active_tasks before changing production or build location.'

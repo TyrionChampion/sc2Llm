@@ -22,7 +22,10 @@ scout args={unit:selector,count:1..8,targets:[named places/site_N/[x,y],...]
 or "expansion_sites",stop_on_contact:true|false optional(default true),timeout_s:1..600,reason:short Chinese intent}.
 scout only runs after YOUR command. With expansion_sites it visits known resource
 clusters without an owned base, ordered by distance from the selected squad. With
-an explicit list it follows YOUR order. Both use move, report actual arrivals/current
+an explicit list it follows YOUR order. The expansion_sites marker is also allowed
+inside that list: insert the known non-owned resource cluster group at that position,
+ordered by distance from the preceding waypoint (or selected squad for the first group).
+Empty groups add no point; no hidden occupancy is queried. Both use move, report actual arrivals/current
 visibility, and by default stop the mission at visible enemy contact, including workers.
 Set stop_on_contact:false to report contacts and continue YOUR route using move, even
 past enemies; this does not attack or retreat automatically. Repeating a default scout
@@ -66,12 +69,14 @@ def task_schemas(payload):
         'scout': obj(dict(common, count={'type': 'integer', 'minimum': 1, 'maximum': 8},
             stop_on_contact={'type': 'boolean', 'default': True},
             targets={'anyOf': [{'type': 'string', 'enum': ['expansion_sites']},
-                {'type': 'array', 'minItems': 1, 'maxItems': 16, 'items': target}]}),
+                {'type': 'array', 'minItems': 1, 'maxItems': 16, 'items': {'anyOf':[
+                    {'type':'string','enum':names+['expansion_sites']},target['anyOf'][1]]}}]}),
             ['unit', 'count', 'reason', 'targets']),
         'cancel_unit_order': obj({'task_id': {'type': 'integer', 'minimum': 1}}, ['task_id'])}
+    from arena.raids import task_schemas as raid_schemas
     return [obj({'skill': {'type': 'string', 'enum': [name]},
         'count': {'type': 'integer', 'enum': [1]}, 'args': args}, ['skill', 'args'])
-        for name, args in specs.items()]
+        for name, args in specs.items()] + raid_schemas(target)
 
 
 def validate_target(value, size):
@@ -112,7 +117,7 @@ def validate_args(skill, args, size):
         targets = args['targets']
         if targets != 'expansion_sites':
             if not isinstance(targets, list) or not 1 <= len(targets) <= 16: raise ValueError('targets requires 1..16 points or expansion_sites')
-            result['targets'] = [validate_target(v, size) for v in targets]
+            result['targets'] = [v if v=='expansion_sites' else validate_target(v, size) for v in targets]
     return result
 
 
@@ -276,6 +281,7 @@ class Battlefield:
         return facts
 
     def public(self, w):
+        from arena.tech_tree import WORKERS, TOWNHALLS
         self.update(w)
         groups = {}
         for u in w.my_units:
@@ -296,6 +302,10 @@ class Battlefield:
                 enemy_count_radius=10,
                 **area_visibility(w, point), last_fully_visible_game_s=self.last_seen.get(name),
                 visible_enemy_buildings=sum(u.is_building for u in near),
+                visible_enemy_workers=sum(u.type_id in WORKERS for u in near),
+                visible_enemy_townhalls=sum(u.type_id in TOWNHALLS for u in near),
+                visible_enemy_combat_defenders=sum(u.type_id not in WORKERS and
+                    (u.ground_dps>0 or u.air_dps>0 or u.type_id==24) for u in near),
                 visible_enemy_units=sum(not u.is_building for u in near),
                 own_units_near=sum(u.distance(point) <= 10 for u in w.my_units)))
         limit = 288
@@ -323,6 +333,8 @@ class SpatialMission:
         self.contact_tags=set()
         self.requested_route=None
         self.engaged_target_health={}
+        self.unit_progress_positions={}
+        self.redispatched_tags=set()
         self.native_paths=None;self.path_query_next_at=0;self.reported_blocked=set()
         self.native_ability_wait=None;self.ability_query_next_at=0
 
@@ -395,6 +407,27 @@ class SpatialMission:
             self.finish(w, q, t, out, 'failed', type(error).__name__+': '+str(error), stop=True)
         return bank
 
+    def prepare_ground_movement(self,w,q,t,out,units):
+        """Only the mechanical tank stance required by an explicit move."""
+        from arena.combat_micro import UNSIEGE
+        if q.tech_tree is None:raise ValueError('spatial mission requires engine ability catalogue')
+        # The same raid may move, siege while attacking, then withdraw again.
+        # Retire only OBSERVED completed transitions, never assume an ACK did it.
+        for tag in list(self.stance_pending):
+            actor=w.by_tag(tag)
+            if actor is not None and actor.type_id==33:del self.stance_pending[tag]
+        sieged=[u for u in units if u.type_id==32]
+        if not sieged:return True
+        available=q.backend.available_abilities(q.index,[u.tag for u in sieged])
+        for u in sieged:
+            if u.tag in self.stance_pending:
+                if w.seconds-self.stance_pending[u.tag]>8:raise ValueError('tank unsiege not observed in 8 game seconds')
+                continue
+            if not q.tech_tree.ability_available(UNSIEGE,available.get(u.tag,set())):raise ValueError('tank cannot currently unsiege')
+            if q.issue(t,command(UNSIEGE,[u.tag]),out):self.stance_pending[u.tag]=w.seconds
+        q.update(t,'waiting','explicit movement awaits observed tank unsiege')
+        return False
+
     def advance(self, w, q, t, used, out):
         if w.seconds-t.created > self.args['timeout_s']:
             self.finish(w, q, t, out, 'failed', 'mission game-time deadline; fresh model decision required', stop=True); return
@@ -406,14 +439,16 @@ class SpatialMission:
                 q.update(t,'waiting','awaiting explicit defense release stop before binding all free units')
                 return
             targets = self.args.get('targets', [self.args.get('target')])
-            if targets == 'expansion_sites':
+            entries=['expansion_sites'] if targets=='expansion_sites' else targets
+            groups=[]
+            if self.skill=='scout' and 'expansion_sites' in entries:
                 from arena.tech_tree import TOWNHALLS
                 own_bases = [u for u in w.my_units if u.type_id in TOWNHALLS]
-                self.route = [p for p in resource_sites(w).values() if not any(u.distance(p) < 15 for u in own_bases)]
-                if not self.route: raise ValueError('no observed resource clusters without owned base')
-                if len(self.route)>64:raise ValueError('more than 64 sites; model must supply a bounded explicit route')
-            else:
-                self.route = [resolve_target(v, w, q) for v in targets]
+                groups = [p for p in resource_sites(w).values() if not any(u.distance(p) < 15 for u in own_bases)]
+            sections=[list(groups) if v=='expansion_sites' else [resolve_target(v,w,q)] for v in entries]
+            self.route=[p for section in sections for p in section]
+            if not self.route:raise ValueError('no observed resource clusters without owned base')
+            if len(self.route)>64:raise ValueError('more than 64 route points; model must supply a bounded explicit route')
             candidates = [u for u in w.my_units if not u.is_building and u.type_id in KINDS[self.args['unit']]
                           and u.done and u.tag not in used and u.tag not in q.protected()]
             candidates.sort(key=lambda u: (u.distance(self.route[0]), u.tag))
@@ -424,11 +459,13 @@ class SpatialMission:
             chosen = candidates[:required]
             self.tags = {u.tag for u in chosen}; used.update(self.tags)
             self.allocated_count=len(chosen)
-            if targets == 'expansion_sites':
-                remaining = self.route; self.route = []; here = chosen[0].pos
+            self.route=[];here=chosen[0].pos
+            for entry,section in zip(entries,sections):
+                remaining=list(section)
                 while remaining:
-                    point = min(remaining, key=lambda p: (math.dist(here,p),p)); remaining.remove(point)
-                    self.route.append(point); here = point
+                    point=(min(remaining,key=lambda p:(math.dist(here,p),p))
+                           if entry=='expansion_sites' else remaining[0])
+                    remaining.remove(point);self.route.append(point);here=point
             self.started = w.seconds
             self.requested_route=list(self.route)
             q.event('spatial_mission_started', task_id=t.id, skill=self.skill, report=self.summary())
@@ -499,6 +536,14 @@ class SpatialMission:
             center = tuple(sum(getattr(u,k) for u in units)/len(units) for k in ('x','y'))
             if self.last_pos is None or math.dist(self.last_pos,center) >= 1:
                 self.last_pos = center; self.changed_at = w.seconds
+            # A large arrived group can hide one slow Queen in its centroid;
+            # opposite-moving members can cancel each other's center motion.
+            # Accumulate each owned member's displacement, not sub-frame noise.
+            for u in units:
+                previous=self.unit_progress_positions.setdefault(u.tag,u.pos)
+                if math.dist(previous,u.pos)>=1:
+                    self.unit_progress_positions[u.tag]=u.pos
+                    self.changed_at=w.seconds
             visible = {e.tag: e for e in w.enemy_units}
             current_health = {}
             for u in units:
@@ -511,8 +556,25 @@ class SpatialMission:
                    for tag, health in current_health.items()):
                 self.changed_at = w.seconds
             self.engaged_target_health = current_health
-            if self.changed_at is not None and w.seconds-self.changed_at > 20:
+            stalled_for=w.seconds-self.changed_at if self.changed_at is not None else 0
+            if stalled_for>20:
                 raise ValueError('no observed movement progress for 20 game seconds; combat/obstruction cause unknown')
+            if stalled_for>5:
+                # Native group movement/engagement can end before every member
+                # reaches the requested point. Retry that SAME explicit order
+                # once per idle member/leg; dispatch is never observed progress.
+                idle=[u for u in units if u.tag not in self.redispatched_tags
+                    and not u.orders and not u.engaged_target and u.distance(point)>4+u.radius
+                    and not any(u.can_attack(e) and u.distance(e)<=u.attack_range+u.radius+e.radius+.1
+                                for e in w.enemy_units)]
+                if idle:
+                    ability=ATTACK if self.args.get('mode')=='attack_move' else MOVE
+                    tags=[u.tag for u in idle]
+                    if q.issue(t,command(ability,tags,pos=point),out):
+                        self.redispatched_tags.update(tags)
+                        q.event('spatial_order_redispatched',task_id=t.id,skill=self.skill,unit_tags=tags,
+                            target=list(point),ability_id=ability,confirmed=False,
+                            handling='Same owned squad and explicit target; one retry/member/leg. No deadline extension, replacement or arrival assumed.')
             return
         if self.native_ability_wait is not None and w.seconds<self.ability_query_next_at:
             q.update(t,'waiting','allocated squad native control not ready; no partial dispatch or replacement');return
@@ -524,19 +586,7 @@ class SpatialMission:
                     reason='walkable tile/local reachable approach; no strategic target substitution')
         self.observe_native_paths(w,q,t,units,point)
         mode = self.args.get('mode','move')
-        # Mechanical stance change required by an explicit movement order, not strategy.
-        from arena.combat_micro import UNSIEGE
-        if q.tech_tree is None:raise ValueError('spatial mission requires engine ability catalogue')
-        sieged=[u for u in units if u.type_id==32]
-        if sieged:
-            available=q.backend.available_abilities(q.index,[u.tag for u in sieged])
-            for u in sieged:
-                if u.tag in self.stance_pending:
-                    if w.seconds-self.stance_pending[u.tag]>8:raise ValueError('tank unsiege not observed in 8 game seconds')
-                    continue
-                if not q.tech_tree.ability_available(UNSIEGE,available.get(u.tag,set())):raise ValueError('tank cannot currently unsiege')
-                if q.issue(t,command(UNSIEGE,[u.tag]),out):self.stance_pending[u.tag]=w.seconds
-            q.update(t,'waiting','explicit movement awaits observed tank unsiege');return
+        if not self.prepare_ground_movement(w,q,t,out,units):return
         ability=ATTACK if mode=='attack_move' else MOVE
         available=q.backend.available_abilities(q.index,sorted(self.tags))
         if q.tech_tree is None:raise ValueError('spatial mission requires engine ability catalogue')
@@ -554,6 +604,8 @@ class SpatialMission:
         self.native_ability_wait=None;self.ability_query_next_at=0
         if q.issue(t,command(ability,sorted(self.tags),pos=point),out):
             self.issued = True; self.sent = w.seconds; self.last_pos = None; self.changed_at = w.seconds
+            self.unit_progress_positions={u.tag:u.pos for u in units}
+            self.redispatched_tags=set()
             self.engaged_target_health = {e.tag: e.health for e in w.enemy_units
                 if any(u.engaged_target == e.tag and u.can_attack(e) and
                        u.distance(e) <= u.attack_range + u.radius + e.radius + .1

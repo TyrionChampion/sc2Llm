@@ -126,7 +126,7 @@ class Commander:
             from arena.economy import PROTOCOL as ECONOMY_PROTOCOL
             self.system=self.system.replace(ECONOMY_PROTOCOL,'')
             self.system+='\nThis legacy backend has no engine tech_tree: macro_plan and cancel_expansion are unavailable; do not issue them.'
-            from arena.spatial import PROTOCOL as SPATIAL_PROTOCOL
+            from arena.battle_plans import SPATIAL_PROTOCOL
             self.system=self.system.replace(SPATIAL_PROTOCOL,'')
             from arena.defense_orders import PROTOCOL as DEFENSE_PROTOCOL
             self.system=self.system.replace(DEFENSE_PROTOCOL,'')
@@ -493,7 +493,7 @@ class Commander:
                       if self.compact_battle else self.feedback.batch())
             payload={'world':w.summary(),'intelligence':self.intelligence.public(w),'battlefield':self.battlefield.public(w),'defensive_rally':self.rally.public(),'engagement_log':self.engagements.public(),
                      'strategic_intent':self.strategic_intent,'strategic_intent_policy':self._strategic_intent_status(w),
-                     'spatial_reports':[t.program.result(t) for t in self.tasks.tasks if not t.active and t.skill in ('scout','order_units')][-8:],
+                     'spatial_reports':[t.program.result(t) for t in self.tasks.tasks if not t.active and t.skill in ('scout','order_units','raid','drop_raid')][-8:],
                      'defense_orders':[dict(t.program.summary(),task_id=t.id,task_state=t.status)
                          for t in self.tasks.tasks if t.skill=='defend_base' and t.active and t.program],
                      'defense_report':base_threats(w,self.backend,self.index,
@@ -506,6 +506,9 @@ class Commander:
                      'live_skill_development':self.development.public() if self.development else {'enabled':False},
                      'python_skill_library':self.tasks.python_catalog.public() if self.tasks.python_catalog else [],
                      'skill_library':list(self.tasks.library.values())}
+            if self.tasks.tech_tree is not None:
+                from arena.raids import report as offensive_report
+                payload['offensive_operations']=offensive_report(w,self.tasks)
             if self.defense:payload['defense_adjutant']=self.defense.public()
             if self.combat_micro:payload['combat_micro']=self.combat_micro.public()
             if w.race=='zerg' and self.tasks.tech_tree is not None:

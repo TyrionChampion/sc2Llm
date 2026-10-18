@@ -10,6 +10,7 @@ from arena.rally import RallyOrder, RALLY_NAMES, named_rally_point, parse_produc
 from arena.tech_tree import WORKERS,TOWNHALLS
 from arena.economy import Economy, validate_plan
 from arena.spatial import validate_args as spatial_args, SpatialMission
+from arena.raids import SKILLS as RAID_SKILLS, validate_args as raid_args, RaidMission
 from arena.composite_skills import PlanValidationError, SkillRun, validate_definitions
 from arena.raw_engine import (SCV, MARINE, CC, DEPOT, BARRACKS,
     TRAIN_SCV, TRAIN_MARINE, BUILD_DEPOT, BUILD_BARRACKS, ATTACK, command)
@@ -22,6 +23,8 @@ SPECS={
  'expand':(CC,318,400,None),
 }
 ALLOWED=set(SPECS)|MACROS|{'attack_nearest','move_out','gather','no_op','macro_plan','cancel_expansion','rally_units','scout','order_units','cancel_unit_order','defend_base','cancel_task','stop_production','use_ability','cancel_native_building','cancel_native_queue','cancel_native_morph'}
+ALLOWED |= RAID_SKILLS
+SPATIAL_SKILLS = {'scout', 'order_units'} | RAID_SKILLS
 TERMINAL={'completed','failed','cancelled'}
 
 @dataclass
@@ -56,6 +59,7 @@ class TaskQueue:
     def __init__(self,backend,index,emit=print,feedback=None,python_catalog=None):
         self.backend=backend; self.index=index; self.emit=emit
         self.tasks=[]; self.next_id=1; self.clock=0; self.library={}
+        self.observed_units_by_type={}
         self.production_append_receipts=deque(maxlen=128)
         self.last_larva_purchase_task=0
         self.larva_unacknowledged_at_tick_start=False
@@ -336,8 +340,8 @@ class TaskQueue:
             elif skill=='cancel_unit_order':
                 task_id=args.get('task_id')
                 target=next((t for t in self.tasks if t.id==task_id),None)
-                if set(args)!={'task_id'} or type(task_id) is not int or not target or target.skill not in ('scout','order_units'):
-                    invalid(field+'.args',args,'task_id of a known scout/order_units mission owned by this player')
+                if set(args)!={'task_id'} or type(task_id) is not int or not target or target.skill not in SPATIAL_SKILLS:
+                    invalid(field+'.args',args,'task_id of a known scout/order_units/raid/drop_raid mission owned by this player')
                 else:cancellations.add(task_id)
             elif skill=='defend_base':
                 try:args=self._validate_defend_args(args)
@@ -356,13 +360,16 @@ class TaskQueue:
                 task_id=args.get('task_id')
                 target=next((t for t in self.tasks if t.id==task_id),None)
                 if set(args)!={'task_id'} or type(task_id) is not int or not target \
-                        or not (target.skill in ('defend_base','scout','order_units','rally_units')
+                        or not (target.skill in SPATIAL_SKILLS | {'defend_base','rally_units'}
                                 or self.unissued_macro(target)):
                     invalid(field+'.args',args,
-                            'task_id of an owned defend_base/scout/order_units/rally_units mission or wholly unissued macro; issued native orders/relocations cannot be cancelled here')
+                            'task_id of an owned defend_base/scout/order_units/raid/drop_raid/rally_units mission or wholly unissued macro; issued native orders/relocations cannot be cancelled here')
                 else:cancellations.add(task_id)
             elif skill in ('scout','order_units'):
                 try:args=spatial_args(skill,args,self.backend.size)
+                except (ValueError,KeyError,TypeError) as e:invalid(field+'.args',args,str(e))
+            elif skill in RAID_SKILLS:
+                try:args=raid_args(skill,args,self.backend.size)
                 except (ValueError,KeyError,TypeError) as e:invalid(field+'.args',args,str(e))
             elif skill=='rally_units':
                 try:args=self._validate_rally_args(args)
@@ -416,7 +423,7 @@ class TaskQueue:
                     units='all' if units=='all' else sorted(units or ()),
                     count=args.get('count'),stance=args.get('stance','hold')),
                     sort_keys=True,ensure_ascii=False))
-            if skill in ('scout','order_units'):
+            if skill in SPATIAL_SKILLS:
                 return (skill,json.dumps({k:v for k,v in args.items() if k!='reason'},sort_keys=True,ensure_ascii=False))
             if skill=='rally_units':
                 requested=args.get('producers')
@@ -475,7 +482,7 @@ class TaskQueue:
                         request_id=request_id,original_request_id=t.request_id,
                         native_cancellation_complete=False,refund_confirmed=False)
                     self.update(t,'cancelled','Explicit macro goal stopped; linked native '+cancel_kind+' cancellation still pending')
-                elif t.skill in python_names or t.skill in ('scout','order_units','defend_base'):
+                elif t.skill in python_names or t.skill in SPATIAL_SKILLS | {'defend_base'}:
                     self.pending_stops.append(t)
                     self.update(t,'cancelled',
                         'superseded by a new order for the same base; its units are inherited'
@@ -535,6 +542,7 @@ class TaskQueue:
                 t.program=RallyOrder(self.backend,self.index,self.event,grid=grid,
                                      build_spec=lambda world, args=args, grid=grid, skill=skill: self._rally_spec(world,skill,args,grid))
             elif skill in ('scout','order_units'):t.program=SpatialMission(skill,args)
+            elif skill in RAID_SKILLS:t.program=RaidMission(skill,args)
             elif skill=='use_ability':
                 from arena.native_abilities import NativeAbilityRun
                 t.program=NativeAbilityRun(args)
@@ -653,6 +661,9 @@ class TaskQueue:
         return result
     def tick(self,w,reserved):
         self.clock=w.seconds; now=w.seconds; output=[]; used=set(reserved)
+        # Own identities remain known while mining inside gas/embarked. Their
+        # return is not a production birth. Keep types separate for paid morphs.
+        for u in w.my_units:self.observed_units_by_type.setdefault(u.type_id,set()).add(u.tag)
         self.refresh_mineral_transfers(w)
         used.update(self.mineral_transfers)
         self.defense_tags_snapshot=None   # first defence order this tick fills it in
@@ -683,7 +694,7 @@ class TaskQueue:
                     for tag in getattr(cancelled.program, 'tags', ()))
         for cancelled in self.pending_stops:
             cancelled.program.stop_orders(w,self,cancelled,output)
-            self.event('spatial_cancel_stop_requested' if cancelled.skill in ('scout','order_units','defend_base') else
+            self.event('spatial_cancel_stop_requested' if cancelled.skill in SPATIAL_SKILLS | {'defend_base'} else
                        'python_skill_cancel_stop_requested',task_id=cancelled.id,confirmed=False)
         self.pending_stops.clear()
         pending=self.pending_purchase_reservations()

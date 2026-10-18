@@ -7,6 +7,19 @@ from arena.tasks import TaskQueue,PlanValidationError
 
 
 class ProductSpelling(unittest.TestCase):
+    def test_single_observed_defense_kind_can_be_a_singleton_list_without_changing_intent(self):
+        plan={'tasks':[{'skill':'defend_base','args':{'base':'home','units':'probe','count':24,
+            'stance':'trade','timeout_s':60,'reason':'Nexus危急，探机协防拖延'}}]}
+        result,changes=translate_plan(plan,{'world':{'own':{'Probe':18}}})
+        self.assertEqual(result['tasks'][0]['args']['units'],['Probe'])
+        self.assertEqual(result['tasks'][0]['args']['count'],24)
+        self.assertEqual(plan['tasks'][0]['args']['units'],'probe')
+        self.assertEqual(changes[0]['kind'],'singleton_defense_unit_list')
+        for selected in ('probe,scv','unknown','all'):
+            plan['tasks'][0]['args']['units']=selected
+            result,_=translate_plan(plan,{'world':{'own':{'Probe':18}}})
+            self.assertEqual(result['tasks'][0]['args']['units'],selected)
+
     def setUp(self):
         self.f=fixtures.MultiRace();self.f.setUp()
         self.payload=dict(tech_tree=self.f.tree.public('terran'),world=dict(own={'Marine':3,'SiegeTank':1}))

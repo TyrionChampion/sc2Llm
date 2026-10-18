@@ -15,6 +15,7 @@
   官方 API、OpenCode 会话和原生对战入口。
 - `arena/commander.py`、`arena/battle_agent.py`、`arena/tasks.py`：模型指挥、
   战斗决策、任务调度、实时微操和反馈。
+- `raid`、`drop_raid`：分兵袭击远矿、空投经济点，按模型指定的守军门槛撤到指定地点；见 [OFFENSIVE_MISSIONS.md](OFFENSIVE_MISSIONS.md)。
 - `arena/economy.py`、`arena/technology.py`、`arena/tactics.py`、
   `arena/defense_orders.py`：运营、技术树、战术和防守。
 - `arena/python_skills.py`、`arena/skill_lab.py`、`arena/live_skills.py`：
@@ -156,6 +157,21 @@ Go 保持已验证的 `json_object` 格式；原生 `json_schema` 在实战被�
 模型的独立探针脚本。技能隔离测试需要可用的 Bubblewrap；游戏速度测试
 需要本机地图。`verify_*`、`probe_*`、`smoke_*` 和部分独立 `test_*` 脚本
 用于实际引擎/模型验证，运行前请阅读源码及参数。
+
+### Linux 云端四场非实时模型互战
+
+安装 Linux SC2 API 引擎和 `.venv` 依赖、配置 Go 凭据后：
+
+```bash
+./run_sc2.sh .venv/bin/python go_step_series.py
+# 每次执行一场；使用上次打印的绝对系列目录继续下一场
+./run_sc2.sh .venv/bin/python go_step_series.py --resume /绝对路径/logs/go-step-duels/four-xxxx
+```
+
+这是云端 headless 实战入口，TvP、PvZ、ZvT、TvZ共4场，双方正常迷雾，任一模型思考时共同暂停。
+默认每方64次请求、1800游戏秒/2400墙钟秒、120秒请求窗口；失败尝试也计数。
+独立账本与旧实时系列分别保留，未完成活动局拒绝静默重开。源码快照、完整请求、暂停检查、回放和
+结果来源保存在新系列目录；达到时间上限没有胜负时记作未确认。逐场观察与修复见[STEP_DUELS.md](STEP_DUELS.md)。
 
 ## 进一步阅读
 

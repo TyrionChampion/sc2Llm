@@ -30,7 +30,7 @@ def translate_plan(plan, payload):
                 task['count']=selected;del args['count'];quantity=selected
                 changes.append(dict(task=index,kind='quantity_field_location',source='task.args.count',
                     destination='task.count',value=selected))
-        if skill in ('scout','order_units','defend_base','rally_units') and isinstance(task.get('reason'),str):
+        if skill in ('scout','order_units','raid','drop_raid','defend_base','rally_units') and isinstance(task.get('reason'),str):
             outer=task['reason'];inner=args.get('reason')
             if inner is None or isinstance(inner,str):
                 combined=outer if not inner or inner==outer else outer+'；'+inner
@@ -55,7 +55,7 @@ def translate_plan(plan, payload):
                     args[field]=matches[0]
                     changes.append(dict(task=index,kind='catalogue_product_name_spelling',field=field,
                         original=name,canonical=matches[0]))
-        if skill in ('scout','order_units') and isinstance(args.get('unit'),str):
+        if skill in ('scout','order_units','raid','drop_raid') and isinstance(args.get('unit'),str):
             name=args['unit']
             selectors={value for value in payload.get('battlefield',{}).get('unit_selectors',[])
                        if isinstance(value,str)}
@@ -74,7 +74,7 @@ def translate_plan(plan, payload):
                     args['exempt_products'][entry_index]=matches[0]
                     changes.append(dict(task=index,kind='catalogue_product_name_spelling',
                         field='exempt_products',original=name,canonical=matches[0]))
-        maximum={'scout':8,'order_units':200,'defend_base':32}.get(skill)
+        maximum={'scout':8,'order_units':200,'raid':32,'drop_raid':32,'defend_base':32}.get(skill)
         explicit=(type(quantity) is int and maximum is not None and 1<=quantity<=maximum)
         explicit=explicit or (skill=='order_units' and quantity=='all')
         if maximum is not None and 'count' not in args and 'count' in task and explicit:
@@ -85,6 +85,13 @@ def translate_plan(plan, payload):
             task['count']=1
             changes.append(dict(task=index,kind='redundant_quantity_field',source='task.count',
                 destination='task.args.count',value=quantity))
+        if skill=='defend_base' and isinstance(args.get('units'),str) and args['units']!='all':
+            selected=args['units']
+            matches=[name for name in names if token(name)==token(selected)]
+            if len(matches)==1:
+                args['units']=[matches[0]]
+                changes.append(dict(task=index,kind='singleton_defense_unit_list',
+                    original=selected,canonical=args['units'].copy(),strategy_changes=False))
         if skill=='defend_base' and isinstance(args.get('units'),list):
             for unit_index,name in enumerate(args['units']):
                 if not isinstance(name,str) or name in names:continue

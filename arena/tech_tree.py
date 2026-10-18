@@ -190,7 +190,7 @@ class TechTree:
             research=[dict(name=e['name'],effect=effect(e['name']),minerals=e['minerals'],gas=e['gas'],recipes=recipes(e)) for e in self.research.values() if e['race']==race],
             forms=[name for name,rs in self.forms.items() if self.types[rs[0]['target']].race=={'terran':1,'zerg':2,'protoss':3}[race]],
             limitations=['A catalogue entry is not proof of current prerequisites, resources, placement or game effect.',
-                         "requires token '" + self.POWER_TOKEN + "' means the producer needs pylon or phasing-prism power"],
+                         "requires token '" + self.POWER_TOKEN + "' means the producer needs pylon or phasing-prism power"] + (['train_unit.count是目标成品数，不是幼虫/施法数；recipes.quantity为每单产量，费用也是每单。跳虫count=12用6幼虫，奇数向上成对；不按count再翻倍。'] if race=='zerg' else []),
             auxiliary_units=[dict(name=self.names[int(uid)],role=role['role']) for uid,role in ROLES.items() if int(uid) in self.types and self.types[int(uid)].race=={'terran':1,'zerg':2,'protoss':3}[race] and self.names[int(uid)] not in self.units])
         # data_adjustments (raw ability-id rebinding diagnostics) is intentionally not published:
         # it never drove a decision, it is already printed as '[tech-data adjustment]' at load

@@ -196,7 +196,13 @@ class Economy:
         if self.current.get("supply_blocked"):warnings.append("当前达到人口上限。")
         if any(r["surplus"] for r in self.current.get("mineral_saturation",[])):
             warnings.append("矿区工人过饱和，检查二矿进度并显式gather转移。")
-        return deepcopy(dict(budget_supported=self.tree is not None,plan=p,goal_progress=(dict(
+        # Keep this standard-melee rule as compact current report metadata even
+        # when the bounded planner omits the long static game-knowledge prose.
+        # It reports feasibility; it never cancels/blocks a model's supply order.
+        return deepcopy(dict(budget_supported=self.tree is not None,
+            standard_supply_limit=200,
+            can_increase_supply_cap=(self.current["supply_cap"]<200 if "supply_cap" in self.current else None),
+            plan=p,goal_progress=(dict(
                 bases_started=self.current.get("bases",0),target_bases=p["target_bases"],
                 base_start_goal_met=self.current.get("bases",0)>=p["target_bases"],
                 base_completion_goal_met=self.current.get("completed_bases",0)>=p["target_bases"],
