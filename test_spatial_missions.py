@@ -423,7 +423,9 @@ class SpatialFacts(unittest.TestCase):
             try:
                 c.last_request=10
                 c.record_feedback('scout_contact',task_id=1,contacts=[{'unit':'Marine','pos':[80,80]}])
-                self.assertEqual(c.last_request,float('-inf'))
+                self.assertEqual(c.last_request,10)
+                self.assertFalse(c._request_due(11))
+                self.assertTrue(c._request_due(16))
                 self.assertTrue(c.control_policy['spatial_missions_available'])
             finally:c.stop()
         feed=Feed();feed.consume({'record':'feedback_event','event':{'kind':'scout_contact','game_loop':224,'contacts':[{'unit':'Marine','pos':[80,80]}]}})

@@ -1,7 +1,7 @@
 """Native GPU API players: 1v1 LLMs, or one LLM against a built-in computer.
 
 Uses the existing raw snapshot/parser, placement queries and task/reflex contract.
-No SC2Env, RGB readback, RequestStep, fog cheats or camera writes in this backend.
+Non-realtime matches use explicit RequestStep; no RGB readback, fog cheats or camera writes.
 """
 import concurrent.futures
 from dataclasses import replace
@@ -17,7 +17,7 @@ import portpicker
 from pysc2 import maps
 from pysc2.lib import remote_controller
 from s2clientprotocol import sc2api_pb2 as pb, common_pb2 as common, debug_pb2 as debug, error_pb2
-from arena.native_runtime import ROOT, RUNTIME, GAME, prepare
+from arena.native_runtime import ROOT, RUNTIME, GAME, prepare, game_executable, installation_version
 from arena.raw_engine import RawArena, GameClock, CC
 from arena.game_speed import map_for_speed, LOOPS_PER_SECOND as SPEED_LOOPS
 
@@ -31,7 +31,13 @@ BOT_DIFFICULTIES={name:pb.Difficulty.Value(value) for name,value in (
 
 
 class NativeArena(RawArena):
-    def __init__(self,map_name="Acropolis",names=("P1","P2"),seed=7,control_hz=10,difficulty=None,render=True,races=None,bot_race="terran",game_speed="faster"):
+    def __init__(self,map_name="Acropolis",names=("P1","P2"),seed=7,control_hz=10,difficulty=None,render=True,races=None,bot_race="terran",game_speed="faster",realtime=True,step_loops=8):
+        if type(realtime) is not bool:raise ValueError('realtime must be boolean')
+        if type(step_loops) is not int or not 1<=step_loops<=224:raise ValueError('step_loops must be 1..224')
+        self.realtime=realtime;self.step_loops=step_loops;self.render=render
+        self.stepped_loops=0;self.paused_polls=0;self.pause_loop_checks=0;self.pause_loop_violations=0
+        self.last_advance=True
+        self.last_step_loops=0;self.step_counts={}
         if difficulty is not None and difficulty not in BOT_DIFFICULTIES:
             raise ValueError('unsupported built-in bot difficulty: '+str(difficulty))
         map_path=map_for_speed(map_name,game_speed)
@@ -57,22 +63,24 @@ class NativeArena(RawArena):
             self.directory=Path(tempfile.mkdtemp(prefix="match-",dir=RUNTIME))
             self.ports=[portpicker.pick_unused_port() for _ in range(1 if count==1 else 6)]
             api=self.ports[:count]; network=self.ports[count:]
-            executable=win(GAME/"Versions/Base97579/SC2_x64.exe")
+            self.installation_version=installation_version()
+            self.base_build=int(self.installation_version.rsplit('.',1)[1])
+            executable=win(game_executable())
             batch_lines=["@echo off",f'cd /d "{win(GAME/"Support64")}"']
             for i,port in enumerate(api):
                 temp=self.directory/f"p{i+1}";temp.mkdir()
                 command=[executable,"-listen","127.0.0.1","-port",str(port),
-                    "-dataDir",win(GAME)+"\\","-tempDir",win(temp)+"\\","-displayMode","0",
-                    "-windowwidth","1600","-windowheight","900",
-                    "-windowx",str(80+180*i),"-windowy",str(80+120*i),"-verbose"]
-                if not render: command.append("-headlessNoRender")
+                    "-dataDir",win(GAME)+"\\","-tempDir",win(temp)+"\\","-verbose"]
+                if not render:command.append("-headlessNoRender")
+                else:command.extend(["-displayMode","0","-windowwidth","1600","-windowheight","900",
+                    "-windowx",str(80+180*i),"-windowy",str(80+120*i)])
                 batch_lines.append(('start "" /b ' if i<count-1 else '')+subprocess.list2cmdline(command))
             batch=self.directory/"match.cmd";batch.write_bytes(("\r\n".join(batch_lines)+"\r\n").encode())
             env=os.environ.copy();env["WINEDEBUG"]="-all"
             self.output=open(self.directory/"process.log","w")
             self.process=subprocess.Popen([sys.executable,str(ROOT/"arena/native_runtime.py"),
                 "cmd.exe","/c",win(batch)],env=env,stdout=self.output,stderr=subprocess.STDOUT)
-            print('[native] realtime=True; %s; opponent=%s; normal fog' % (('%d GPU participant window(s)' % count) if render else 'headless validation',difficulty or 'LLM'),flush=True)
+            print('[native] realtime=%s; %s; opponent=%s; normal fog' % (realtime,('%d GPU participant window(s)' % count) if render else '%d headless clients (no rendering)'%count,difficulty or 'LLM'),flush=True)
             print('[native] process logs:',self.directory,flush=True)
             for port in api:
                 controller=remote_controller.RemoteController("127.0.0.1",port,self,timeout_seconds=150)
@@ -80,11 +88,14 @@ class NativeArena(RawArena):
             pings=[c.ping() for c in self.controllers]
             if len({(p.base_build,p.data_version) for p in pings})!=1:
                 raise RuntimeError("native clients have different engine/data builds")
+            if any(p.base_build!=self.base_build for p in pings):
+                raise RuntimeError("Native engine build disagrees with active installation manifest; refusing this match")
             self.version=pings[0].game_version
+            self.data_version=pings[0].data_version
             print('[native] engine',self.version,flush=True)
             print("[native] requested game speed:",game_speed,"map:",map_path,flush=True)
             if not map_path.is_file(): raise FileNotFoundError(map_path)
-            create=pb.RequestCreateGame(realtime=True,disable_fog=False,random_seed=seed,
+            create=pb.RequestCreateGame(realtime=realtime,disable_fog=False,random_seed=seed,
                 local_map=pb.LocalMap(map_path=win(map_path)))
             for name in names: create.player_setup.add(type=pb.Participant,player_name=name)
             if difficulty is not None:
@@ -109,12 +120,13 @@ class NativeArena(RawArena):
             while True:
                 self.last=self._parallel(lambda c:c.observe(),self.controllers)
                 if min(o.observation.game_loop for o in self.last)>=112: break
-                if time.monotonic()-warmup>45: raise RuntimeError("native realtime simulation did not start")
-                time.sleep(.1)
+                if time.monotonic()-warmup>45: raise RuntimeError("native simulation did not start")
+                if not realtime:self._parallel(lambda c:c.step(step_loops),self.controllers)
+                else:time.sleep(.1)
             self.initial=self.snapshots()
             self.homes=[next(u.pos for u in w.my_units if u.type_id in (18,132,130,59,86,100,101)) for w in self.initial]
             self.configure_start_locations(infos)
-            if game_speed!="faster":
+            if realtime and game_speed!="faster":
                 started=time.monotonic();first_loop=self.initial[0].game_loop
                 while time.monotonic()-started<8:
                     time.sleep(.1)
@@ -144,10 +156,13 @@ class NativeArena(RawArena):
     def match_control_pending(self):return self._pending_surrender is not None
     def __exit__(self,*args): self.close()
 
-    def step(self,batches):
+    def step(self,batches,advance=True,step_loops=None):
         if self.ended: raise RuntimeError('cannot step a finished native match')
         if len(batches)!=len(self.controllers): raise ValueError('action batch count must match API players')
         if self.match_control_pending:return self._finish_surrender()
+        count=self.step_loops if step_loops is None else step_loops
+        if type(count) is not int or not 1<=count<=224:raise ValueError('step_loops must be 1..224')
+        if step_loops is not None and getattr(self,'realtime',True):raise ValueError('variable steps require non-realtime mode')
         before=self.snapshots()
         pending=[[] for _ in batches]; response_failures=[[] for _ in batches]; sent_at=[None for _ in batches]
         def send(pair):
@@ -166,9 +181,26 @@ class NativeArena(RawArena):
                         pending[i].append((tag,raw.ability_id,code))
                     print('[native action-response] P%d %s' % (i+1,error_pb2.ActionResult.Name(code)),flush=True)
         self._parallel(send,list(enumerate(batches)))
-        time.sleep(max(0,self.next_poll-time.monotonic()))
-        self.next_poll=time.monotonic()+self.period
+        if not getattr(self,'realtime',True):
+            self.last_advance=advance
+            if advance:
+                self._parallel(lambda c:c.step(count),self.controllers)
+                self.stepped_loops+=count
+                self.last_step_loops=count
+                self.step_counts=getattr(self,'step_counts',{})
+                self.step_counts[count]=self.step_counts.get(count,0)+1
+            else:self.paused_polls+=1
+        # Running step-mode simulation is CPU/RPC bounded, not wall-clock paced.
+        # Frozen-frame polling and realtime observation retain their rate limit.
+        if getattr(self,'realtime',True) or not advance:
+            time.sleep(max(0,self.next_poll-time.monotonic()))
+            self.next_poll=time.monotonic()+self.period
         self.last=self._parallel(lambda c:c.observe(),self.controllers)
+        if not getattr(self,'realtime',True) and not advance:
+            self.pause_loop_checks+=1
+            if any(o.observation.game_loop!=w.game_loop for o,w in zip(self.last,before)):
+                self.pause_loop_violations+=1
+                raise RuntimeError('non-realtime engine advanced while model thinking; pause guarantee violated')
         for i,errors in enumerate(pending):
             existing={(e.unit_tag,e.ability_id,e.result) for e in self.last[i].action_errors}
             for tag,ability,code in errors:
@@ -253,7 +285,14 @@ class NativeArena(RawArena):
         timing=self.clock.report()
         timing['game_speed']=self.game_speed
         timing['control_hz']=timing.pop('fps')
-        timing['display_fps']='native DXVK HUD; not API polling rate'
+        timing['display_fps']='native DXVK HUD; not API polling rate' if getattr(self,'render',True) else 'disabled (headless)'
+        timing['realtime']=getattr(self,'realtime',True)
+        if not timing['realtime']:
+            timing.update(speed_check='step_mode',step_loops=self.step_loops,stepped_loops=self.stepped_loops,
+                last_step_loops=getattr(self,'last_step_loops',0),step_counts=dict(getattr(self,'step_counts',{})),
+                advance_wall_throttled=False,
+                paused_for_llm=not self.last_advance,paused_polls=self.paused_polls,
+                pause_loop_checks=self.pause_loop_checks,pause_loop_violations=self.pause_loop_violations)
         return timing
 
     def overlay(self,rows):

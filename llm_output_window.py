@@ -324,6 +324,7 @@ class Window:
         self.text('双方决策输出',24,18,size=28)
         data=self.data or {};samples=data.get('samples') or [];sample=samples[-1] if samples else {};timing=sample.get('timing',{})
         outcome=data.get('outcome','starting');status=match_status_label(outcome)
+        if data.get('realtime') is False:status+=' · 非实时'+('（等待模型）' if timing.get('paused_for_llm') else '（步进中）')
         speed_label={'slower':'最慢速度','normal':'普通速度','faster':'更快速度'}.get(data.get('game_speed'))
         if speed_label:status+=' · '+speed_label
         self.text(status+'  ·  游戏 '+game_time((sample.get('worlds') or [{}])[0].get('game_s'))+'  ·  %.3f×'%timing.get('game_wall_ratio',0),265,29,MUTED,size=16)

@@ -15,6 +15,17 @@ from arena.autonomous_bot import RequestBudget
 
 
 class GoTests(unittest.TestCase):
+    def test_explicit_glm_uses_go_and_cannot_return_a_deepseek_identity(self):
+        request=self.request();request['requested_model']='opencode-go/glm-5.3-flash'
+        post=Mock(return_value=self.response(model='glm-5.3-flash'))
+        with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            result=perform_request(request,post)
+            mismatch=perform_request(request,Mock(return_value=self.response(model='deepseek/glm-5.3-flash')))
+        self.assertEqual(post.call_args.args[0],GO_ENDPOINT+'/chat/completions')
+        self.assertEqual(post.call_args.kwargs['json']['model'],'glm-5.3-flash')
+        self.assertEqual(result['metadata']['returned_model'],'glm-5.3-flash')
+        self.assertIn('identity mismatch',mismatch['error'])
+
     def test_explicit_pro_uses_same_go_endpoint_and_exact_requested_identity(self):
         request=self.request();request['requested_model']='opencode-go/deepseek-v4-pro'
         post=Mock(return_value=self.response(model='deepseek-v4-pro'))

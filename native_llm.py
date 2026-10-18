@@ -1,8 +1,9 @@
-"""LLM vs LLM or built-in bot in native GPU player windows, always realtime.
+"""LLM vs LLM or built-in bot in native GPU player windows.
 
 ./run_sc2.sh .venv311/bin/python native_llm.py
 Optional ARENA_P1/P2_PROVIDER, ARENA_P1/P2_API_KEY and ARENA_P1/P2_MODEL.
 No independent observer: each native window has its player's normal fog.
+Use --no-realtime to pause simulation while decision models think.
 """
 import argparse
 import json
@@ -13,12 +14,35 @@ from arena.native_engine import NativeArena, BOT_DIFFICULTIES
 from arena.commander import Commander
 from arena.player_config import make_player
 from arena.lifecycle import ShutdownSignals, write_json_atomic
+from arena.step_scheduler import PlannerBatcher, AdaptiveSteps
+
+
+def planners_thinking(commanders):
+    return any(getattr(planner,'thinking',False) for c in commanders
+               for planner in (c,getattr(c,'tactics',None),getattr(c,'defense',None)))
+
+
+def save_replay_checkpoint(arena,target):
+    replay=Path(target).with_suffix('.SC2Replay')
+    temporary=replay.with_suffix('.SC2Replay.tmp')
+    try:
+        arena.save_replay(temporary)
+        temporary.replace(replay)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return replay
 
 
 def main(players_override=None,catalogs_override=None,argv=None,opening=True,repairs_override=None,defense_clients_override=None,developments_override=None,tactical_clients_override=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--map',default='Acropolis')
     parser.add_argument('--game-speed',choices=['slower','normal','faster'],default='normal',help='real simulation speed; Slower/Normal currently require Acropolis')
+    parser.add_argument('--realtime',action=argparse.BooleanOptionalAction,default=True,help='--no-realtime pauses the engine during model requests')
+    parser.add_argument('--step-loops',type=int,default=8,help='combat step in adaptive mode, fixed step with --no-adaptive-step (1..224)')
+    parser.add_argument('--adaptive-step',action=argparse.BooleanOptionalAction,default=True,help='in step mode use small combat steps and larger quiet steps')
+    parser.add_argument('--max-step-loops',type=int,default=64,help='maximum adaptive quiet step (default: 64)')
+    parser.add_argument('--planner-batch-game-seconds',type=float,default=2,help='align ordinary step-mode requests; 0 disables epoch alignment')
+    parser.add_argument('--headless',action='store_true',help='run native clients without rendering; SC2 replays are still saved')
     parser.add_argument('--p1-race',choices=['terran','zerg','protoss'],default='terran')
     parser.add_argument('--p2-race',choices=['terran','zerg','protoss'],default='terran')
     parser.add_argument('--bot-race',choices=['terran','zerg','protoss'],default='terran')
@@ -27,6 +51,7 @@ def main(players_override=None,catalogs_override=None,argv=None,opening=True,rep
     parser.add_argument('--p2-skills',help='P2 pregame Python skill manifest directory')
     parser.add_argument('--bot',choices=sorted(BOT_DIFFICULTIES),help='built-in Terran bot instead of P2 LLM')
     parser.add_argument('--seconds',type=float,default=5400,help='maximum match wall seconds after startup (default: 90 minutes)')
+    parser.add_argument('--replay-interval',type=float,default=0,help='save a replay checkpoint every N wall seconds; 0 saves only at exit')
     parser.add_argument('--no-overlay',action='store_true',help='hide the native status text')
     parser.add_argument('--delay',type=float,default=0,help='explicit mock planner latency only')
     parser.add_argument('--output',default='logs/native_llm_result.json')
@@ -37,6 +62,13 @@ def main(players_override=None,catalogs_override=None,argv=None,opening=True,rep
     parser.add_argument('--verify-chain',action='store_true',help='verify own-race supply, basic production and a basic combat unit')
     args=parser.parse_args(argv)
     if args.seconds<=0:parser.error('--seconds must be positive')
+    if args.replay_interval<0:parser.error('--replay-interval must be nonnegative')
+    if not 1<=args.step_loops<=224:parser.error('--step-loops must be 1..224')
+    import math
+    if not math.isfinite(args.planner_batch_game_seconds) or args.planner_batch_game_seconds<0:parser.error('planner batch interval must be finite and nonnegative')
+    if not 1<=args.max_step_loops<=224:parser.error('--max-step-loops must be 1..224')
+    if not args.realtime and args.adaptive_step and args.max_step_loops<args.step_loops:parser.error('--max-step-loops must be >= --step-loops')
+    if not args.realtime and (args.defense or defense_clients_override is not None):parser.error('non-realtime currently supports --tactics, not legacy --defense')
     if args.tactics and (args.defense or defense_clients_override is not None):parser.error('--tactics replaces --defense')
     if args.bot and args.p2_skills:parser.error('--p2-skills requires a P2 LLM')
     if args.bot and args.p2:parser.error('--bot and --p2 are mutually exclusive')
@@ -76,37 +108,68 @@ def main(players_override=None,catalogs_override=None,argv=None,opening=True,rep
             print('[config] Both players use the same OpenCode login; model sessions and player state are independent.',flush=True)
         else:
             print('[config] Both players use the same configured provider key; planners/state are independent. Set ARENA_P1_API_KEY / ARENA_P2_API_KEY for separate credentials.',flush=True)
-    report={'identities':identities,'races':[args.p1_race] if args.bot else [args.p1_race,args.p2_race],'map':args.map,'seed':7,'realtime':True,'max_wall_seconds':args.seconds,'game_speed':args.game_speed,'view':'native player window(s); normal fog',
+    report={'identities':identities,'races':[args.p1_race] if args.bot else [args.p1_race,args.p2_race],'map':args.map,'seed':7,'realtime':args.realtime,'step_loops':args.step_loops if not args.realtime else None,'max_wall_seconds':args.seconds,'game_speed':args.game_speed,'view':'native player window(s); normal fog',
             'opponent':{'kind':'SC2 built-in bot','race':args.bot_race,'difficulty':args.bot} if args.bot else {'kind':'LLM'},
             'defense_enabled':defenders is not None,'combat_micro_enabled':args.combat_micro,'tactics_enabled':args.tactics,
             'python_skill_catalogs':[c.public() if c else [] for c in catalogs],
+            'headless':args.headless,'replay_interval_wall_s':args.replay_interval,
+            'adaptive_step':bool(not args.realtime and args.adaptive_step),
+            'max_step_loops':args.max_step_loops if not args.realtime and args.adaptive_step else None,
+            'planner_batch_game_s':args.planner_batch_game_seconds if not args.realtime else None,
             'outcome':'starting','validated_chain':False,'samples':[],'llm_replies':[]}
+    if args.headless:report['view']='native headless clients; normal fog'
     commanders=[];arena=None
     target=Path(args.output);target.parent.mkdir(parents=True,exist_ok=True)
     shutdown=ShutdownSignals();shutdown.install()
     try:
-        arena=NativeArena(args.map,names=[i['side']+' '+i['model'] for i in identities],difficulty=args.bot,races=report['races'],bot_race=args.bot_race,game_speed=args.game_speed)
-        report.update(engine=arena.version,process_logs=str(arena.directory),map_targets=arena.start_location_report,
+        step_options={} if args.realtime else dict(realtime=False,step_loops=args.step_loops)
+        if args.headless:step_options['render']=False
+        arena=NativeArena(args.map,names=[i['side']+' '+i['model'] for i in identities],difficulty=args.bot,races=report['races'],bot_race=args.bot_race,game_speed=args.game_speed,**step_options)
+        report.update(engine=arena.version,engine_installation=getattr(arena,'installation_version',None),
+                      engine_base_build=getattr(arena,'base_build',None),engine_data_version=getattr(arena,'data_version',None),
+                      process_logs=str(arena.directory),map_targets=arena.start_location_report,
                       speed_verification=getattr(arena,'speed_verification',None))
         worlds=arena.initial
         commanders=[Commander(arena,i,client,feedback_dir=args.feedback_dir,python_catalog=catalogs[i],opening=opening and report['races'][i]=='terran',repair=repairs_override[i] if repairs_override else None,defense_client=defenders[i] if defenders else None,combat_micro=args.combat_micro,development=developments_override[i] if developments_override else None,tactics_enabled=args.tactics,tactical_client=tacticians[i] if tacticians else None) for i,(client,_) in enumerate(players)]
-        started=time.monotonic();last_ui=0;last_log=0;seen_calls=[0,0]
+        batcher=PlannerBatcher(commanders,args.planner_batch_game_seconds) if not args.realtime else None
+        adaptive=AdaptiveSteps(args.step_loops,args.max_step_loops) if not args.realtime and args.adaptive_step else None
+        started=time.monotonic();last_ui=0;last_log=0;last_replay=float('-inf');seen_calls=[0,0]
         while not arena.ended and time.monotonic()-started<args.seconds:
             batches=[c.tick(w) for c,w in zip(commanders,worlds)]
-            worlds=arena.step(batches)
+            for i,c in enumerate(commanders):
+                if getattr(c,'client_fatal',None):raise RuntimeError('P%d model account rejected: HTTP %s; no provider fallback'%(i+1,c.client_fatal))
+            if batcher:batcher.dispatch(worlds)
+            if args.realtime:worlds=arena.step(batches)
+            else:
+                advance=not planners_thinking(commanders)
+                options=dict(advance=advance)
+                if adaptive and advance:options['step_loops']=adaptive.choose(worlds,batcher.next_deadline(worlds))
+                worlds=arena.step(batches,**options)
             for c,w in zip(commanders,worlds):c.ingest_feedback(w)
             now=time.monotonic();timing=arena.timing()
-            if now-last_ui>=1 and not arena.ended and not args.no_overlay:
+            if batcher:timing['planner_batches']=batcher.public()
+            if adaptive:timing['adaptive_steps']=adaptive.public()
+            if args.replay_interval and now-last_replay>=args.replay_interval:
+                try:
+                    replay=save_replay_checkpoint(arena,target)
+                    report.update(replay=str(replay),replay_checkpoint_game_s=worlds[0].seconds,
+                                  replay_checkpoint_wall_s=timing['wall_s'])
+                except Exception as error:
+                    report['replay_checkpoint_errors']=(report.get('replay_checkpoint_errors',[])+[
+                        dict(wall_s=timing['wall_s'],error=type(error).__name__)])[-10:]
+                last_replay=now
+            if now-last_ui>=1 and not arena.ended and not args.no_overlay and not args.headless:
                 rows=[]
                 for i,(c,identity,w) in enumerate(zip(commanders,identities,worlds)):
                     s=c.stats();warning=s['errors']>0 or s['engine_errors']>0 or s['failed']>0 or s.get('defense_adjutant',{}).get('errors',0)>0 or timing['speed_check']=='DRIFT'
                     status=('MOCK' if identity['provider']=='mock' else 'LLM')+(' THINKING' if s['thinking'] else ' ACTIVE')
                     lines=[identity['side']+' | '+identity['provider']+' / '+identity['model']+' | '+status,
-                        'REALTIME '+args.game_speed+' %.2fx | plans=%d errors=%d stale=%d | queue=%d done=%d failed=%d' %
+                        ('REALTIME ' if args.realtime else 'STEP MODE ')+args.game_speed+' %.2fx | plans=%d errors=%d stale=%d | queue=%d done=%d failed=%d' %
                         (timing['game_wall_ratio'],s['decisions'],s['errors'],s['stale_plans'],len(s['active_tasks']),s['completed'],s['failed']),
                         'Engine rejects=%d | feedback pending=%d delivered=%d' % (s['engine_errors'],s['feedback']['pending'],s['feedback']['delivered']),
                         'Combat reflex %s | Idle worker mining ON' % ('ON' if s['combat_reflex_enabled'] else 'OFF'),
                         'Player perspective / normal fog | Camera is independent of bot orders']
+                    if not args.realtime:lines.append('Simulation PAUSED for LLM' if timing.get('paused_for_llm') else 'Simulation advancing %d loops/step'%(timing.get('last_step_loops') or args.step_loops))
                     defense=s.get('defense_adjutant',{})
                     tactics=s.get('army_tactics',{})
                     if tactics.get('enabled'):
@@ -118,7 +181,7 @@ def main(players_override=None,catalogs_override=None,argv=None,opening=True,rep
                             len(defense['unit_tags']),defense['accepted'],defense['errors']))
                     request=s.get('planner_request',{})
                     if s['thinking'] and request.get('state') in ('waiting','slow'):
-                        lines.append('LLM %s %.1fs / hard %.0fs | existing tasks continue' %
+                        lines.append(('LLM %s %.1fs / hard %.0fs | '+('existing tasks continue' if args.realtime else 'simulation paused')) %
                             ('SLOW, waiting' if request['state']=='slow' else 'waiting',request['elapsed_s'],request['hard_timeout_s']))
                     if s.get('skill_repairs'):lines.append('Skill repairs: '+', '.join(n+'='+v['state'] for n,v in s['skill_repairs'].items()))
                     if args.bot:lines.append('Opponent: SC2 built-in '+args.bot_race+' / '+args.bot)
@@ -152,6 +215,8 @@ def main(players_override=None,catalogs_override=None,argv=None,opening=True,rep
             if args.verify_chain and chain and all(c.decisions>0 for c in commanders): break
         report['outcome']=arena.result() if arena.ended else ('verified' if args.verify_chain and report['validated_chain'] else 'time limit')
         report['timing']=arena.timing();report['commanders']=[c.stats() for c in commanders]
+        if batcher:report['timing']['planner_batches']=batcher.public()
+        if adaptive:report['timing']['adaptive_steps']=adaptive.public()
         report['worlds']=[w.summary() for w in worlds];report['action_errors']=arena.action_errors
         if args.verify_chain and not report['validated_chain']:raise RuntimeError('API player construction chain did not complete')
         for i,(c,identity) in enumerate(zip(commanders,identities)):

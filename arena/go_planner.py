@@ -12,7 +12,7 @@ import uuid
 from arena.chatgpt_planner import ChatGPTSubscriptionPlanner
 
 GO_MODEL = 'opencode-go/deepseek-v4.1-flash'
-GO_MODELS = (GO_MODEL, 'opencode-go/deepseek-v4-pro')
+GO_MODELS = (GO_MODEL, 'opencode-go/deepseek-v4-pro', 'opencode-go/glm-5.3-flash')
 GO_ENDPOINT = 'https://opencode.ai/zen/go/v1'
 KEY_ENV = 'open_api_key'
 GO_BATTLE_MAX_TOKENS = 16000
@@ -213,7 +213,8 @@ def perform_request(request, post):
     metadata = dict(requested_model=request['requested_model'], returned_model=data.get('model'),
                     finish_reason=choice.get('finish_reason'), usage=usage, endpoint=GO_ENDPOINT,
                     response_format=format_spec['type'])
-    if data.get('model') not in (wire_model, 'deepseek/'+wire_model):
+    accepted_models = (wire_model, 'deepseek/'+wire_model) if wire_model.startswith('deepseek-') else (wire_model,)
+    if data.get('model') not in accepted_models:
         return dict(error='OpenCode Go model identity mismatch; no fallback', error_kind='model_identity_mismatch',metadata=metadata)
     if choice.get('finish_reason') != 'stop':
         return dict(error='OpenCode Go incomplete response',error_kind='transient_model_output',response_stage='public_answer',metadata=metadata)

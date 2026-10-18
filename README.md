@@ -53,8 +53,11 @@ Git 仓库包含代码、技能契约和参考数据；本机游戏及运行工�
 3. 安装 GE-Proton、Steam、Bubblewrap（`bwrap`）及可用显卡驱动。
    默认 GE-Proton 位置为
    `~/.local/share/Steam/compatibilitytools.d/GE-Proton11-7-x86_64`，可用
-   `ARENA_PROTON_PATH` 和 `ARENA_STEAM_PATH` 覆盖。当前原生接口使用
-   `Versions/Base97579/SC2_x64.exe`，需要匹配的游戏版本。
+   `ARENA_PROTON_PATH` 和 `ARENA_STEAM_PATH` 覆盖。原生接口根据隔离安装
+   `.build.info` 的活动版本选择 `Versions/Base<build>/SC2_x64.exe`，并核对
+   引擎返回的构建号。战网更新后，先运行
+   `.venv311/bin/python tools/sync_native_runtime.py` 同步本地隔离副本；
+   数据和启动文件复制完成后才更新版本清单。源游戏目录只读，不自动降级到旧构建。
 4. Linux RGB 观察入口还需要 `osmesa-lib/libOSMesa.so.8` 及相应动态库。
    隔离技能执行需要允许 Bubblewrap 创建命名空间。
 
@@ -69,6 +72,26 @@ Git 仓库包含代码、技能契约和参考数据；本机游戏及运行工�
 
 浏览器地址为 <http://127.0.0.1:8767/>。控制台监听本机回环地址；点击开始
 后才启动模型和游戏。详细行为、运行记录及模型限制见 [LAUNCHER.md](LAUNCHER.md)。
+
+原生单局入口 `native_llm.py` 默认使用实时模式。显式传入 `--no-realtime`
+可让游戏在主指挥或战斗模型请求期间暂停，决策返回后通过原生 `RequestStep`
+推进；默认启用自适应步长：`--step-loops 8` 为接敌步长，行军/远距离可见敌人
+时最多 32 帧，平静时最多 `--max-step-loops 64` 帧；接敌、受伤、己方已观察死亡
+或当前效果出现时缩到小步长，并维持 2 游戏秒。下一次决策到期前会缩短步长，
+双方每次推进相同帧数。`--no-adaptive-step` 恢复固定 `--step-loops`（1..224）。仍使用正常战争迷雾和
+原生玩家窗口，双方按同一引擎步进。报告记录暂停检查次数与违规次数，非实时
+模式不套用墙钟速度漂移判定。该选项目前在命令行入口使用，不支持旧 `--defense`
+副官；`--tactics` 的独立战斗模型可在同一冻结帧接收回复，避免等待死锁。
+非实时推进阶段没有固定墙钟休眠；模型等待期间仍限制轮询频率。主指挥与战术
+请求在双方执行器更新后统一准备，通过同一闸门释放工作线程。普通请求默认对齐
+到 2 游戏秒批次（最多增加 2 秒加一个游戏循环的对齐延迟），基地等紧急主指挥
+唤醒及有基地/前线告警的战术请求保留原截止时间。传入
+`--planner-batch-game-seconds 0` 可关闭批次时间对齐，仍统一释放当前到期请求。
+每个模型仍只获得己方观测。报告中 `planner_batches`、`adaptive_steps`、
+`last_step_loops` 和 `step_counts` 记录实际批次与步长；这些设置只影响新启动的对局。
+传入 `--headless` 可关闭原生客户端渲染，仍运行相同版本的 SC2 引擎和战争迷雾。
+`--replay-interval 120` 每两分钟按现实时间原子保存一份最新回放；退出时仍保存最终
+`.SC2Replay`。检查点保存失败会记录错误并保留上一份完整文件，不中断对局。
 
 ## 验证
 

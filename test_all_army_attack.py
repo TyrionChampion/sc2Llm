@@ -2,12 +2,13 @@
 import unittest
 import json
 import tempfile
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
 from arena.battle_agent import BattleAgent
 from arena.battle_plans import output_schema
-from arena.raw_engine import ATTACK
+from arena.raw_engine import ATTACK, MOVE
 from arena.tasks import TaskQueue,PlanValidationError
 from arena.commander import Commander
 from test_battle_agent import Idle
@@ -17,7 +18,7 @@ from test_realtime_runtime import unit,world
 
 class AllArmyAttackTests(unittest.TestCase):
     def setUp(self):
-        _,self.b=engine_backend('terran',(ATTACK,3673))
+        _,self.b=engine_backend('terran',(ATTACK,3673,MOVE))
         self.events=[]
         self.q=TaskQueue(self.b,0,lambda _:None)
         self.t=BattleAgent(self.b,0,SimpleNamespace(grid=self.b.grid),
@@ -35,6 +36,74 @@ class AllArmyAttackTests(unittest.TestCase):
         self.assertEqual(self.tags(actions),{10,11})
         self.assertEqual(self.t.public()['all_army']['dispatched'],2)
         self.assertEqual(self.t.requests,0)
+
+    def reply(self,mode='attack',target=(80,80)):
+        groups,_=self.t._squads(self.army)
+        sid=next(iter(groups))
+        self.t.outbox.put(dict(request_id=1,generation=self.t.generation,wall=self.t.clock(),game_s=20.,
+            response=json.dumps(dict(orders=[dict(squad=sid,mode=mode,target=list(target),reason='绕路后重新进攻')],reason='复核前线')),
+            error=None,latency_s=1.,usage=None,squads={k:[u.tag for u in us] for k,us in groups.items()}))
+
+    def test_all_army_review_is_accepted_and_route_survives_mechanical_dispatch(self):
+        self.attack();self.t.tick(self.w());self.reply()
+        actions=self.t.tick(self.w(sec=21))
+        self.assertEqual(self.t.accepted,1);self.assertEqual(self.t.expired,0)
+        self.assertIn(10,self.tags(actions))
+        self.assertEqual(self.t.assignments[10]['requested_point'],(80,80))
+        self.t.tick(self.w(sec=22))
+        self.assertEqual(self.t.assignments[10]['requested_point'],(80,80))
+        self.assertTrue(self.t.strategy['attack_authorized'])
+        self.assertEqual(self.t.strategy['scope'],'all')
+
+    def test_reinforcement_joins_reviewed_regroup_and_reports_real_target(self):
+        self.attack();self.t.tick(self.w());self.reply(mode='withdraw',target=(40,40))
+        self.t.tick(self.w(sec=21))
+        new=unit(12,48,31,35,ground_dps=7)
+        actions=self.t.tick(self.w(sec=22,extra=[new]))
+        withdrawal=next(a.action_raw.unit_command for a in actions if 12 in a.action_raw.unit_command.unit_tags)
+        self.assertEqual(withdrawal.ability_id,MOVE)
+        self.assertEqual(self.t.assignments[12]['requested_point'],(40,40))
+        arrived=[replace(u,x=40,y=40) if u.tag==10 else u for u in self.army]
+        self.t.tick(self.w(sec=23,army=arrived,extra=[new]))
+        row=next(r for r in self.t.public()['all_army']['units'] if r['tag']==10)
+        self.assertEqual(row['state'],'at_target');self.assertEqual(row['mode'],'withdraw')
+        self.assertEqual(row['requested_point'],[40,40])
+        self.assertEqual(self.t.strategy['scope'],'all')
+
+    def test_full_army_periodic_requests_continue_in_game_time_despite_dirty_frames(self):
+        prompts=[];self.b.realtime=False;now=[100.]
+        self.t.clock=lambda:now[0]
+        self.t.client=SimpleNamespace(ready_for_request=lambda:True,
+            chat=lambda system,prompt:prompts.append(json.loads(prompt)) or json.dumps(dict(orders=[],reason='继续当前进攻')))
+        self.attack();self.t.tick(self.w())
+        for sec in range(20,51):
+            deadline=time.monotonic()+1
+            while self.t.thinking and self.t.outbox.empty() and time.monotonic()<deadline:time.sleep(.001)
+            self.assertFalse(self.t.thinking and self.t.outbox.empty())
+            now[0]+=30  # API wall time cannot use up the game-time cooldown.
+            self.t.dirty=True  # Combat observations used to bypass the cooldown.
+            self.t.tick(self.w(sec=sec))
+        self.assertGreaterEqual(self.t.requests,3)
+        times=[p['game_s'] for p in prompts]
+        self.assertTrue(all(b-a>=8 for a,b in zip(times,times[1:])))
+        self.assertTrue(all(p['strategic_order']['scope']=='all' for p in prompts))
+        self.assertTrue(all(p['all_army']['execution']=='mechanical_dispatch_with_periodic_llm_review' for p in prompts))
+
+    def test_review_cannot_revoke_full_army_authorization(self):
+        self.attack();self.t.tick(self.w());self.reply()
+        r=self.t.outbox.get_nowait();plan=json.loads(r['response']);plan['strategic_order']={'attack_authorized':False}
+        r['response']=json.dumps(plan);self.t.outbox.put(r)
+        self.t.tick(self.w(sec=21))
+        self.assertEqual(self.t.errors,1)
+        self.assertTrue(self.t.strategy['attack_authorized']);self.assertEqual(self.t.strategy['scope'],'all')
+
+    def test_nearest_enemy_reinforcements_wait_when_reviewed_enemy_leaves_vision(self):
+        enemy=unit(99,48,90,90,alliance=4,ground_dps=7)
+        self.t.mission('attack_nearest',scope='all');self.t.tick(self.w(extra=[enemy]))
+        self.reply();self.t.tick(self.w(sec=21,extra=[enemy]))
+        reinforcement=unit(12,48,31,35,ground_dps=7)
+        self.assertNotIn(12,self.tags(self.t.tick(self.w(sec=22,extra=[reinforcement]))))
+        self.assertNotIn(12,self.t.assignments)
 
     def test_previous_hold_orders_are_replaced(self):
         for u in self.army:self.t.assignments[u.tag]=dict(failed=False,mode='hold')

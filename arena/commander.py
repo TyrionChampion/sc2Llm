@@ -9,7 +9,7 @@ from arena.composite_skills import PROTOCOL
 from arena.match_control import surrender_blockers, surrender_reason, SURRENDER_PROTOCOL
 from s2clientprotocol import error_pb2
 from arena.reflex import ReflexNet
-from arena.raw_engine import GATHER
+from arena.raw_engine import GATHER, LOOPS_PER_SECOND
 from arena import battle_plans
 from arena.intelligence import Intelligence
 from arena.rally import DefensiveRally, RALLY_NAMES
@@ -17,6 +17,7 @@ from arena.defense_orders import base_threats
 from arena.context import battle_payload, DecisionMemory, EngagementLog
 from arena.spatial import Battlefield
 from arena.operator_advice import OperatorAdvice
+from arena.tech_tree import TOWNHALLS, WORKERS
 
 SYSTEM = battle_plans.SYSTEM
 OPENING=[{'skill':'train_worker','count':2},{'skill':'supply_depot'},
@@ -69,6 +70,10 @@ class Commander:
         self.engagements=EngagementLog(self.record_feedback); self.decision_memory=DecisionMemory()
         self.max_plan_age=max_plan_age; self.log=[]; self.decisions=0; self.errors=0
         self.plans_rejected=0; self.thinking=False; self.last_request=float("-inf")
+        self.next_request_game_s=float('inf')
+        self.urgent_request_game_s=float('inf')
+        self.defer_planner_requests=False;self.request_gate=None;self.request_batch=None
+        self._threatened_bases=set();self._base_health={};self._combat_tags=set()
         self.client_fatal=None  # set when the provider refuses at account level; stops new requests
         self.tasks=TaskQueue(backend,index,self.emit,self.record_feedback,python_catalog=python_catalog)
         if defense_client is not None:
@@ -159,6 +164,11 @@ class Commander:
                     standing_order='Battle LLM may select distant free squads to defend threatened bases; no scripted strategic dispatch or retreat')
                 self.system+='\nBattle agent controls free combat squads. Avoid persistent order_units/Python ownership for routine army movement because that prevents its defense recall. Use attack_nearest/move_out to authorize strategic attack; it decides local defense, reinforcement and retreat. Explicit custom missions still keep ownership.'
         self.emit('[control] combat reflex %s; idle-worker gathering ON' % ('ON' if combat_reflex else 'OFF'))
+        self.control_policy['main_planner_schedule']=dict(interval_game_s=self.interval,
+            ordinary_min_gap_game_s=min(self.interval,10),wake_delay_game_s=2,retry_delay_game_s=3,
+            urgent_min_gap_game_s=min(self.interval,2),
+            urgent_events=['new_base_threat','new_enemy_base','observed_army_eliminated'],
+            rule='Coalesce wakeups without resetting the last send time or postponing a pending decision')
         self.record_feedback('control_policy',**self.control_policy)
         self.reflex.size=backend.size
         self.inbox=queue.Queue(maxsize=1); self.outbox=queue.Queue(maxsize=1)
@@ -206,18 +216,47 @@ class Commander:
             return
         event=self.feedback.add(kind,self.game_loop,**details)
         if kind in ('scout_contact','spatial_mission_report'):
-            self.last_request=float('-inf')  # Wake the next model decision; never dispatch a new mission here.
+            self._wake_request(self.game_loop/LOOPS_PER_SECOND)
         if kind=='python_skill_failed' and self.repair:self.repair.on_failure(details)
         if kind=='python_skill_failed' and self.development:self.development.on_failure(details)
         return event
+    def _wake_request(self,game_s,delay=2,urgent=False):
+        # Keep the actual send time intact. Coalesce bursts without moving an
+        # already scheduled decision later (a sliding debounce can starve it).
+        gap=min(self.interval,2 if urgent else 10)
+        due=max(self.last_request+gap,game_s+delay)
+        self.next_request_game_s=min(self.next_request_game_s,due)
+        if urgent:self.urgent_request_game_s=min(getattr(self,'urgent_request_game_s',float('inf')),due)
+
+    def request_deadline(self):
+        if self.client_fatal is not None or self.thinking or self.surrender or getattr(self.backend,'match_control_pending',False):
+            return float('inf')
+        if getattr(self.client,'on_demand',False):return float('-inf')
+        return min(self.last_request+self.interval,self.next_request_game_s)
+
+    def _request_due(self,game_s):
+        return game_s+1e-9>=min(self.last_request+self.interval,self.next_request_game_s)
+
     def ingest_feedback(self,w):
         self.game_loop=w.game_loop
         if w is self._seen_feedback_world: return
         self._seen_feedback_world=w
         self.engagements.update(w)
         self.battlefield.update(w)
-        if self.intelligence.update(w) and self.defense is None:
-            self.last_request=float("-inf")  # Next decision gets new intel, even if the current request is busy.
+        if w.game_loop>self.intelligence.last_loop:
+            new_base=any(u.type_id in TOWNHALLS and u.tag not in self.intelligence.enemies for u in w.enemy_units)
+            bases=[u for u in w.my_units if u.type_id in TOWNHALLS and not u.flying]
+            threatened={b.tag for b in bases if b.health<self._base_health.get(b.tag,b.health)
+                        or any((e.ground_dps>0 or e.air_dps>0) and e.distance(b)<=26 for e in w.enemy_units)}
+            combat={u.tag for u in w.my_units if not u.is_building and u.type_id not in WORKERS
+                    and (u.ground_dps>0 or u.air_dps>0)}
+            army_lost=bool(self._combat_tags and not combat and self._combat_tags<=set(w.dead_units))
+            urgent=bool(new_base or threatened-self._threatened_bases or army_lost)
+            changed=self.intelligence.update(w)
+            if self.defense is None and (changed or urgent):
+                self._wake_request(w.seconds,urgent=urgent)
+            self._threatened_bases=threatened
+            self._base_health={b.tag:b.health for b in bases};self._combat_tags=combat
         if w.feedback:
             for event in w.feedback:
                 self.record_feedback(event['kind'],**{k:v for k,v in event.items() if k!='kind'})
@@ -243,6 +282,10 @@ class Commander:
         while not self.stop_event.is_set():
             try: sent,prompt,request_id,feedback_ids=self.inbox.get(timeout=.2)
             except queue.Empty: continue
+            gate=self.request_gate
+            while gate is not None and not gate.wait(.1):
+                if self.stop_event.is_set():return
+            if self.stop_event.is_set():return
             start=time.monotonic(); answer=None; delivered=False
             try:
                 self.feedback.audit(dict(record='request_started',request_id=request_id,feedback_ids=feedback_ids))
@@ -289,7 +332,7 @@ class Commander:
         old_generation=self.defense.generation if self.defense else 0
         defense_actions=self.defense.tick(w) if self.defense else []
         if self.defense and self.defense.generation!=old_generation and not self.defense.active:
-            self.last_request=float('-inf')  # Fresh strategy after handback, not a resumption of a stale plan.
+            self._wake_request(w.seconds,urgent=True)
         try: sent,plan,error,latency,delivered,raw,request_id,feedback_ids=self.outbox.get_nowait()
         except queue.Empty: pass
         else:
@@ -327,7 +370,7 @@ class Commander:
                                  'executing, but no new plan can arrive: top up / fix the credential and restart the match.',
                         account_level=account_failure)
             elif ownership_changed and combat_plan:
-                self.plans_rejected+=1;self.last_request=float('-inf')
+                self.plans_rejected+=1;self._wake_request(w.seconds,delay=3)
                 self.record_feedback('plan_expired',request_id=request_id,plan=plan,
                     error='Defense ownership changed while main planner was thinking; combat plan requires fresh observation',
                     handling='Entire plan rejected atomically. Economic-only plans remain admissible.')
@@ -335,7 +378,7 @@ class Commander:
             elif late and (not self.compact_battle or late_issues):
                 self.plans_rejected+=1
                 self.emit('[planner] discarded stale plan age=%.1fs; %s' % (w.seconds-sent,'; '.join(late_issues) or 'existing queue continues'))
-                self.last_request=float('-inf')
+                self._wake_request(w.seconds,delay=3)
                 self.record_feedback('plan_expired',request_id=request_id,plan=plan,
                     age_game_s=w.seconds-sent,max_age_game_s=70 if self.compact_battle else self.max_plan_age,
                     revalidation_issues=late_issues,
@@ -399,6 +442,7 @@ class Commander:
                     self.emit('[planner] accepted latency=%.2fs reason=%s' % (latency,str(plan.get('reason',''))[:120]))
                 except (ValueError,KeyError,TypeError,OSError) as e:
                     self.errors+=1; self.emit('[planner-error] '+str(e))
+                    self._wake_request(w.seconds,delay=3)
                     self.record_feedback('plan_rejected',request_id=request_id,plan=plan,
                         error=str(e),issues=e.issues if isinstance(e,PlanValidationError) else [],
                         handling='Entire plan rejected atomically; existing tasks continue.')
@@ -436,8 +480,14 @@ class Commander:
             blockers=self._surrender_blockers(w)
             self.control_policy['surrender_allowed']=not blockers
             self.control_policy['surrender_blockers']=blockers
+        if not self.defer_planner_requests:self.request_plan(w)
+        return batch
+
+    def request_plan(self,w,due_at=None):
+        if self.surrender or getattr(self.backend,'match_control_pending',False):return False
         if (self.client_fatal is None and not self.thinking
-                and (w.seconds-self.last_request>=self.interval or getattr(self.client,"on_demand",False))
+                and (self._request_due(w.seconds) or getattr(self.client,"on_demand",False))
+                and (due_at is None or w.seconds+1e-9>=due_at)
                 and (not callable(getattr(self.client,"ready_for_request",None)) or self.client.ready_for_request())):
             feedback=(self.feedback.batch(max_events=8,max_chars=8000,prioritize_failures=True)
                       if self.compact_battle else self.feedback.batch())
@@ -490,7 +540,7 @@ class Commander:
             ids=[e['id'] for e in feedback['events']]
             self.request_intel_revisions[request_id]=self.intelligence.revision
             if self.defense:self.request_defense_generations[request_id]=self.defense.generation
-            self.feedback.audit(dict(record='request_queued',request_id=request_id,game_loop=w.game_loop,
+            self.feedback.audit(dict(record='request_queued',request_id=request_id,game_loop=w.game_loop,request_batch=self.request_batch,
                 feedback_ids=ids,system=self.system,prompt=payload))
             if self.compact_battle:self.request_observations[request_id]=battle_plans.capture(w,self.tasks)
             advice_ids=[m['id'] for m in advice['messages']]
@@ -498,7 +548,10 @@ class Commander:
             if advice_ids:self.operator_advice.sent(advice_ids,request_id)
             self.inbox.put_nowait((w.seconds,prompt,request_id,ids))
             self.thinking=True; self.last_request=w.seconds
-        return batch
+            self.next_request_game_s=float('inf')
+            self.urgent_request_game_s=float('inf')
+            return True
+        return False
     def stats(self):
         return {'army_tactics':self.tactics.public() if self.tactics else {'enabled':False},
                 'operator_advice':self.operator_advice.public(),

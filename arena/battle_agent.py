@@ -20,6 +20,9 @@ attack必须遵守strategic_order；初始授权只允许保卫基地，主指�
 landmarks.enemy_start是地图已知出生点，不保证仍有敌军。move_out已获授权且没有当前可见敌人时，先在安全前线集结或向该已知点推进；attack_nearest没有可见目标时不要擅自搜索。
 hold和withdraw可以使用己方基地ID或地图内坐标；请综合威胁选择守备或撤退位置。
 orders=[]保留已有命令。已经有人增援且局势未变时不要重复派遣所有小队。
+strategic_order.scope=all表示主指挥持续授权全军进攻和增援，不是关闭战术模型。
+all模式下每12游戏秒复核；新告警或局势变化时最早8游戏秒复核。查看all_army中的stalled、failed和实际目标，选择绕路、集结、攻击或撤退重组；每次调整至少维持8游戏秒。
+你只能调整小队战术，不能取消全军进攻授权；临时hold/withdraw后仍须复核并寻找恢复进攻的方案。新增援会跟随附近已有的战术命令。
 基地受袭应考虑远处援军，不能因为附近没有兵就忽略，也不要因一名伤兵召回全军。
 你只控制输入提供的小队；经济工人、自定义技能、运输任务和其他任务的单位不可抢用。
 visible_enemies仅当前己方视野，不可编造雾中敌人。基地受伤但敌人不可见时原因未知。
@@ -47,6 +50,8 @@ class BattleAgent:
         self.previous_combat_state={};self.combat_deaths_seen=set();self.previous_nearby_enemy_tags=set()
         self.combat_threats={};self.previous_combat_alerts=set();self.combat_alerts=[]
         self.last_loop=-1;self.next_request=0;self.next_review=0;self.dirty=True
+        self.next_review_game_s=0
+        self.defer_planner_requests=False;self.request_gate=None;self.request_batch=None
         self.thinking=False;self.requests=0;self.accepted=0;self.errors=0;self.expired=0
         self.last_decision=None;self.recent=deque(maxlen=12);self.action_contexts=[]
         self.request_trace={};self.last_shape=None;self.first_alert={};self.empty_move_out_orders=0
@@ -84,6 +89,7 @@ class BattleAgent:
             self.assignments.clear();self.all_army_progress.clear();self.all_army_signature=None
         self.all_army_report={'enabled':scope=='all'}
         self.strategy=new;self.objective=objective;self.generation+=1;self.dirty=True
+        self.next_review_game_s=0
         self._event('tactical_mission',strategic_order=new,reason=new['reason'])
 
     @staticmethod
@@ -126,6 +132,10 @@ class BattleAgent:
         while not self.closed.is_set():
             try:item=self.inbox.get(timeout=.2)
             except queue.Empty:continue
+            gate=self.request_gate
+            while gate is not None and not gate.wait(.1):
+                if self.closed.is_set():return
+            if self.closed.is_set():return
             started=self.clock();answer=None;error=None
             try:answer=self.client.chat(SYSTEM,item['prompt'])
             except Exception as exc:error=type(exc).__name__+': '+str(exc)
@@ -255,15 +265,36 @@ class BattleAgent:
         if len(recent) < 2:return 0
         return self._shared_prefix(recent[0], recent[1])
 
-    def _request(self,w,own,bases):
-        if self.strategy.get('scope')=='all':return  # Explicit full-army order is executed mechanically.
+    def request_deadline(self):
+        if self.thinking or not self.tags or (not self.alerts and not self.combat_alerts and not self.strategy['attack_authorized']):
+            return float('inf')
+        last=getattr(self,'last_request_game_s',float('-inf'))
+        if self.strategy.get('scope')=='all':
+            return max(self.next_review_game_s,last+(8 if self.dirty else 12))
+        return last+(6 if self.dirty or self.alerts or self.combat_alerts else 12)
+
+    def request_plan(self,w,due_at=None):
+        own=[u for u in w.my_units if u.tag in self.tags]
+        bases=[u for u in w.my_units if u.type_id in TOWNHALLS and not u.flying]
+        return self._request(w,own,bases,due_at)
+
+    def _request(self,w,own,bases,due_at=None):
+        if due_at is not None and w.seconds+1e-9<due_at:return False
         now=self.clock()
+        all_army=self.strategy.get('scope')=='all'
         ready=getattr(self.client,'ready_for_request',None)
         if self.thinking or not own or now<self.next_request or (callable(ready) and not ready()):return
+        # Game-time bounds still apply when fresh contacts/deaths mark every
+        # frame dirty. Paused API latency must not spend the review cooldown.
+        if all_army:
+            if w.seconds+1e-9<self.next_review_game_s:return
+            if w.seconds-getattr(self,'last_request_game_s',-1e9)+1e-9<(8 if self.dirty else 12):return
+        elif not getattr(self.backend,'realtime',True):
+            if w.seconds-getattr(self,'last_request_game_s',-1e9)+1e-9<(6 if self.dirty or self.alerts or self.combat_alerts else 12):return
         if not self.alerts and not self.combat_alerts and not self.strategy['attack_authorized'] and not self.dirty:return
         if not self.alerts and not self.combat_alerts and not self.strategy['attack_authorized']:
             self.dirty=False;return  # No task requiring inference. No periodic empty API calls.
-        if not self.dirty and now<self.next_review:return
+        if getattr(self.backend,'realtime',True) and not all_army and not self.dirty and now<self.next_review:return
         squads,omitted=self._squads(own)
         rows=[]
         for sid,units in squads.items():
@@ -290,13 +321,14 @@ class BattleAgent:
             actual_alerts=self.alerts,combat_alerts=self.combat_alerts,
             bases=[dict(id='base_'+str(b.tag),pos=list(b.pos),hp=b.health,max_hp=b.health_max) for b in bases[:16]],
             squads=rows,omitted_squads=omitted,visible_enemies=[self._unit(u) for u in w.enemy_units[:48]],
-            omitted_enemies=max(0,len(w.enemy_units)-48),assignments=self._assignment_rows(),recent_feedback=list(self.recent)[-6:])
+            omitted_enemies=max(0,len(w.enemy_units)-48),assignments=self._assignment_rows(),recent_feedback=list(self.recent)[-6:],
+            all_army=self.all_army_report)
         prompt=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
         self.request_bodies.append(prompt);self.request_bodies=self.request_bodies[-4:]
         item=dict(request_id=self.requests+1,prompt=prompt,
             squads={sid:[u.tag for u in us] for sid,us in squads.items()},generation=self.generation,
             game_s=w.seconds,wall=now)
-        self.audit(dict(record='tactical_request_queued',request_id=item['request_id'],prompt=payload))
+        self.audit(dict(record='tactical_request_queued',request_id=item['request_id'],request_batch=self.request_batch,prompt=payload))
         self.audit(dict(record='tactical_prompt_layout',request_id=item['request_id'],
                         prompt_chars=len(prompt),
                         fixed_head_chars=self._fixed_head_chars(),
@@ -304,7 +336,9 @@ class BattleAgent:
         self.request_trace[item['request_id']]=dict(queued_wall=now,queued_game_s=w.seconds)
         self.request_trace=dict(list(self.request_trace.items())[-16:])
         self.inbox.put_nowait(item);self.requests+=1;self.thinking=True;self.dirty=False
+        self.last_request_game_s=w.seconds
         self.next_request=now+1.5;self.next_review=now+(6 if self.alerts else 12)
+        return True
 
     def _receive(self,w,own,bases):
         try:r=self.outbox.get_nowait()
@@ -313,7 +347,7 @@ class BattleAgent:
         self.audit(dict(record='tactical_request_finished',request_id=r['request_id'],game_s=w.seconds,
             response=r['response'],error=r['error'],latency_s=r['latency_s'],usage=r['usage']))
         self.request_trace.setdefault(r['request_id'],{}).update(received_wall=self.clock(),latency_s=r['latency_s'])
-        if self.strategy.get('scope')=='all' or r['generation']!=self.generation or self.clock()-r['wall']>self.max_age_wall or w.seconds-r['game_s']>self.max_age_game:
+        if r['generation']!=self.generation or (getattr(self.backend,'realtime',True) and self.clock()-r['wall']>self.max_age_wall) or w.seconds-r['game_s']>self.max_age_game:
             self.expired+=1;self.dirty=True
             self._event('tactical_plan_expired',request_id=r['request_id'],reason='主任务已变或回复超过12秒；未执行旧回复');return
         try:
@@ -362,7 +396,11 @@ class BattleAgent:
             for adjustment in dead_adjustments:self._event('tactical_squad_adjusted',**adjustment,reason='仅使用已观察存活成员，不补员')
             for order in clean:
                 for tag in order['tags']:
-                    self.assignments[tag]=dict(order,issued=False,arrived=False,failed=False,created_game_s=w.seconds)
+                    self.assignments[tag]=dict(order,decision_source='battle_llm',issued=False,arrived=False,failed=False,created_game_s=w.seconds)
+                    if self.strategy.get('scope')=='all':
+                        u=available[tag]
+                        self.all_army_progress[tag]=dict(origin=u.pos,last_pos=u.pos,last_progress=w.seconds,departed=False)
+            if self.strategy.get('scope')=='all':self.next_review_game_s=w.seconds+8
             self.accepted+=1;self.last_decision=dict(p,request_id=r['request_id'],game_s=w.seconds)
             self._event('tactical_plan',request_id=r['request_id'],orders=p['orders'],reason=p['reason'])
         except (ValueError,TypeError,KeyError) as error:
@@ -420,7 +458,8 @@ class BattleAgent:
 
     def tick(self,w,protected=()):
         self.action_contexts=[]
-        if w.game_loop==self.last_loop:return []
+        same_frame=w.game_loop==self.last_loop
+        if same_frame and getattr(self.backend,'realtime',True):return []
         self.last_loop=w.game_loop;self.game_s=w.seconds
         own=[u for u in w.my_units if u.tag not in protected and self._eligible(u)]
         self.tags={u.tag for u in own}
@@ -444,28 +483,44 @@ class BattleAgent:
             self.all_army_stops.clear()
         if self.strategy.get('scope')=='all':self._report_all_army(w,own)
         self.fighting={tag for tag,a in self.assignments.items() if a['mode'] in ('defend','attack') and not a['failed']}
-        self._request(w,own,bases)
+        if not same_frame and not self.defer_planner_requests:self._request(w,own,bases)
         return actions
 
     def _assign_all_army(self,w,own):
+        reviewed=[(u,self.assignments[u.tag]) for u in own if u.tag in self.assignments
+                  and self.assignments[u.tag].get('decision_source') in ('battle_llm','battle_llm_reinforcement')
+                  and not self.assignments[u.tag]['failed']]
         if self.objective=='visible_enemy':
-            if not w.enemy_units:return  # No fabricated target or implicit fog search.
-            enemy=min(w.enemy_units,key=lambda u:u.distance(self.backend.homes[self.index]))
-            target=enemy.pos;goal=('visible_enemy',enemy.tag)
+            enemy=min(w.enemy_units,key=lambda u:u.distance(self.backend.homes[self.index]),default=None)
+            target=enemy.pos if enemy else None;goal=('visible_enemy',enemy.tag) if enemy else None
         else:
             target=tuple(self.backend.enemy_start(self.index));goal=('enemy_start',)
+        if target is None:
+            reviewed=[(u,a) for u,a in reviewed if a['mode']!='attack']
         # No prompt squad limit: every controllable unit, including newly produced
         # reinforcements, belongs to this explicitly ordered persistent mission.
         groups,_=self._squads(own,limit=None)
         for sid,units in groups.items():
             for u in units:
                 old=self.assignments.get(u.tag)
+                if old and old.get('decision_source') in ('battle_llm','battle_llm_reinforcement'):
+                    continue  # A periodic review owns its local route/hold/regroup until the next review.
                 if old and old.get('goal')==goal and math.dist(old['requested_point'],target)<=6:continue
-                self.assignments[u.tag]=dict(squad=sid,mode='attack',target=list(target),
-                    goal=goal,requested_point=target,base=None,reason='执行主指挥显式全军进攻，包含后续可调动增援',
-                    decision_source='explicit_all_army_order',
-                    request_id='all-army-%d-%d'%(self.generation,w.game_loop),issued=False,arrived=False,failed=False,
-                    created_game_s=w.seconds)
+                if not old and reviewed:
+                    leader,order=min(reviewed,key=lambda item:u.distance(item[0]))
+                    inherited={k:v for k,v in order.items() if k not in ('actual_point','tags')}
+                    self.assignments[u.tag]=dict(inherited,squad=sid,
+                        decision_source='battle_llm_reinforcement',
+                        request_id='all-army-reinforce-%d-%d-%d'%(self.generation,w.game_loop,leader.tag),
+                        issued=False,arrived=False,failed=False,created_game_s=w.seconds)
+                elif target is None:
+                    continue  # No current visible target and no reviewed route to join.
+                else:
+                    self.assignments[u.tag]=dict(squad=sid,mode='attack',target=list(target),
+                        goal=goal,requested_point=target,base=None,reason='执行主指挥显式全军进攻，包含后续可调动增援',
+                        decision_source='explicit_all_army_order',
+                        request_id='all-army-%d-%d'%(self.generation,w.game_loop),issued=False,arrived=False,failed=False,
+                        created_game_s=w.seconds)
                 self.all_army_progress[u.tag]=dict(origin=u.pos,last_pos=u.pos,last_progress=w.seconds,departed=False)
 
     def _report_all_army(self,w,own):
@@ -490,13 +545,19 @@ class BattleAgent:
                 state=('at_target' if u.distance(point)<=6 else 'engaged' if engaged else
                        'stalled' if w.seconds-p['last_progress']>=8 else 'departed' if p['departed'] else 'dispatched')
                 reason='Observed position/contact; dispatch alone does not prove departure or arrival'
-            rows.append(dict(tag=u.tag,state=state,reason=reason))
+            rows.append(dict(tag=u.tag,state=state,reason=reason,
+                mode=a['mode'] if a else None,
+                requested_point=list(a['requested_point']) if a else None,
+                actual_point=list(a.get('actual_point',a['requested_point'])) if a else None))
         counts=dict(Counter(row['state'] for row in rows))
+        if counts.get('stalled',0)>self.all_army_report.get('counts',{}).get('stalled',0):
+            self.dirty=True  # Ask at the next bounded review; never re-route mechanically.
         self.all_army_report=dict(enabled=True,objective=self.objective,total=len(rows),eligible=len(own),
             dispatched=sum(bool(self.assignments.get(u.tag,{}).get('issued')) for u in own),
             departed=sum(bool(self.all_army_progress.get(u.tag,{}).get('departed')) for u in own),
-            counts=counts,units=rows,
-            meaning='Full controllable army plus reinforcements. Other task owners and immobile units are explicit exclusions; stalled is no observed progress, not proof of a building obstruction.')
+            counts=counts,units=rows,execution='mechanical_dispatch_with_periodic_llm_review',
+            review_interval_game_s=12,minimum_review_gap_game_s=8,
+            meaning='Full controllable army plus reinforcements. at_target refers to each unit current command, including assembly/withdrawal, not proof of enemy-base damage. Other task owners and immobile units are explicit exclusions; stalled is no observed progress, not proof of a building obstruction.')
         signature=tuple(sorted(counts.items()))
         if signature!=self.all_army_signature:
             self.all_army_signature=signature
@@ -534,7 +595,7 @@ class BattleAgent:
             prompt_chars=len(self.request_bodies[-1]) if self.request_bodies else 0,
             shared_prefix_chars=self.cache_prefix_chars(),
             ownership='Unassigned army only; custom/economic/transport tasks excluded',
-            safety=('Explicit all-army order executes its selected objective and includes reinforcements; other task owners remain excluded'
+            safety=('All-army authorization persists with mechanical dispatch and periodic battle LLM review (12 game seconds, earliest 8 on changes). LLM adjusts routes/targets/regrouping; only the commander can revoke authorization. Reinforcements follow nearby reviewed orders; other task owners remain excluded'
                     if self.strategy.get('scope')=='all' else
                     'LLM decides support/attack/withdraw; no global auto-retreat, assembly detour or scripted reinforcement'))
 
