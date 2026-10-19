@@ -2,6 +2,7 @@
 import copy
 from arena.raw_engine import CC, SCV, MARINE, DEPOT, BARRACKS
 from arena.tasks import SPECS
+from arena.offensive_policy import PROTOCOL as OFFENSIVE_PROTOCOL
 
 COMBAT_MICRO_PROTOCOL = '\nFor Terran attack_nearest/move_out/order_units and defense squads, the executor automatically handles researched healthy-unit stim and tank siege/unsiege from fresh local observations. Decide objectives, technology and force composition; do not repeatedly morph tanks or define a Python task just to obtain these basic combat abilities. Active custom Python/JSON tactics retain full control and must implement their own abilities.'
 
@@ -13,6 +14,7 @@ Surrender only if control_policy.surrender_available: sole task {"skill":"surren
 
 LANGUAGE_RULES = "所有面向观众的自然语言说明使用简体中文，包括 reason、strategy、修复解释及新技能描述。每个战斗计划包含非空 reason，用100字以内中文简述行动意图，不输出内部推理过程。JSON字段名、技能/API名、参数键、枚举值、代码标识符、文件路径保持协议原样；原始错误保留原文，解释用中文。"
 SYSTEM += "\n" + LANGUAGE_RULES
+SYSTEM += '\n' + OFFENSIVE_PROTOCOL
 SYSTEM += '\nProduction quantities: train_worker args may include queue_mode="append"; train_unit args={"unit":name,"queue_mode":"append"} explicitly ADDS count units to the active batch or starts a finite batch. Omit queue_mode (or coalesce) to keep an existing batch WITHOUT adding units. At most one append per product per reply; each append count=1..200, outstanding remaining<=200. Completed products free queue capacity; requested retains cumulative history. Ammo, forms and buildings do not support append. Read active_tasks.production_quantity (requested/issued/observed_completed/unissued/awaiting_completion/remaining) and blocking reason. Repeating a statement in reason does not issue a command. No automatic batch repetition after completion or after request exhaustion; supply, prerequisites, further capacity and finite replenishment remain your explicit choices. Invalid task parameters reject the ENTIRE plan, including otherwise valid production; correct and resubmit commands you still want.'
 SYSTEM += '\n资源转化是持续运营目标：比较当前矿气、近期库存趋势、实际成军数量与产能，把没有明确近期用途的余钱及时转成有效兵力、匹配的生产设施和关键升级。待产数量不等于已花钱或已有战力；反复append巨大队列不会增加并行生产槽位。库存持续增长且军力不足时，逐项检查人口、矿气配比、科技/附件前置、可见产能、在建进度与任务阻塞：有空闲且可用的产能就安排生产；产能忙且不足就显式补合适产能；缺气时同时评估采气与可行的低耗气单位。依据实际观测和反馈判断，不把need idle producer当成所有生产设施均已有效运转的证明。工人与供给按目标和实际需求补充，避免持续补工挤占作战人口，或堆无用补给/科技消耗库存。预留资金须有具体近期用途、金额和期限；人口封顶时按战损补兵及当前战术需要安排资金。简短reason说明主要花钱瓶颈、实际下达的消化计划和下次核对条件；之后检查开工、完成与库存变化，失败要纠正。'
 SYSTEM += '\nArmy attack scope: attack_nearest/move_out accept optional args={"scope":"all"|"available"}. When the operator requests 全军进攻/all-army attack, issue move_out with scope="all" to advance the whole controllable army toward the known enemy start even without visible enemies. A strategic_intent or reason alone is NOT an all-army order. With independent_battle_llm, scope=all replaces routine defend_base/hold orders and persists for new reinforcements until defend or explicit scope=available; other custom/scout/transport owners remain excluded and must be reported. Inspect army_tactics.all_army coverage, failed/stalled/excluded units rather than claiming everyone departed. attack_nearest only targets CURRENT visible enemies and waits if none; choose move_out for an authorized advance/search toward the known start. Without a tactical coordinator these tasks dispatch the current free army once.'
@@ -328,10 +330,16 @@ def output_schema(payload):
     reserved=[name for variant in variants for name in variant['properties']['skill']['enum']]
     new_task=task([]);new_task['properties']['skill']={'type':'string','not':{'enum':reserved}}
     custom['properties']['tasks']['items']={'anyOf':variants+[new_task]}
+    if payload.get('offensive_policy',{}).get('enabled'):
+        from arena.offensive_policy import plan_schema
+        for branch in (known,custom):
+            branch['properties']['offensive_plan']=plan_schema()
     if payload.get('live_skill_development',{}).get('enabled'):
         from arena.live_skills import request_schema
         development=obj({'tasks':{'type':'array','maxItems':0},'reason':reason,
                          'develop_skill':request_schema()},['tasks','reason','develop_skill'])
+        if payload.get('offensive_policy',{}).get('enabled'):
+            development['properties']['offensive_plan']=plan_schema()
         return {'type':'object','anyOf':[known,custom,development]}
     return {'type':'object','anyOf':[known,custom]}
 

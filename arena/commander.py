@@ -18,6 +18,7 @@ from arena.context import battle_payload, DecisionMemory, EngagementLog
 from arena.spatial import Battlefield
 from arena.operator_advice import OperatorAdvice
 from arena.tech_tree import TOWNHALLS, WORKERS
+from arena.offensive_policy import OffensiveMemory, validate_plan as validate_offensive_plan
 
 SYSTEM = battle_plans.SYSTEM
 OPENING=[{'skill':'train_worker','count':2},{'skill':'supply_depot'},
@@ -68,6 +69,7 @@ class Commander:
         self.intelligence=Intelligence(self.record_feedback); self.request_intel_revisions={}
         self.battlefield=Battlefield(backend,index)
         self.engagements=EngagementLog(self.record_feedback); self.decision_memory=DecisionMemory()
+        self.offensive_memory=OffensiveMemory()
         self.max_plan_age=max_plan_age; self.log=[]; self.decisions=0; self.errors=0
         self.plans_rejected=0; self.thinking=False; self.last_request=float("-inf")
         self.next_request_game_s=float('inf')
@@ -385,10 +387,11 @@ class Commander:
                     handling='Entire stale plan rejected; existing tasks continue.')
             else:
                 try:
-                    allowed={'tasks','skills','reason','strategic_intent'}
+                    allowed={'tasks','skills','reason','strategic_intent','offensive_plan'}
                     if self.development:allowed.add('develop_skill')
                     extra=set(plan)-allowed
                     if extra: raise ValueError('unsupported plan fields: '+', '.join(sorted(extra)))
+                    validate_offensive_plan(plan.get('offensive_plan'))
                     if 'skills' in plan and not isinstance(plan['skills'],list):
                         raise ValueError('skills must be a list')
                     developing='develop_skill' in plan
@@ -430,6 +433,8 @@ class Commander:
                             self.record_feedback('strategic_intent',intent=intent,request_id=request_id,
                                                  handling='主指挥明确选择战略方向；攻击仍需通过现有任务与动作校验。')
                     self.decisions+=1
+                    if reason is None and not developing:
+                        self.offensive_memory.accept(plan,w.seconds,request_id)
                     self.decision_memory.add(w.game_loop,plan)
                     self.previous_strategy=battle_plans.bounded_note(plan.get('reason',''),600)
                     self.last_decision={'game_s':w.seconds,'reason':plan.get('reason'),'request_id':request_id}
@@ -500,7 +505,7 @@ class Commander:
                          ordered_tags={t.program.base_tag for t in self.tasks.tasks
                                        if t.skill=='defend_base' and t.active and t.program and t.program.base_tag}),
                      'economy_report':self.tasks.economy.public(self.tasks.tasks),
-                     'decision_memory':self.decision_memory.public(),'prepared_strategy':getattr(self.client,'prepared_strategy',None),'active_tasks':self.tasks.summary(),'control_policy':self.control_policy,
+                     'decision_memory':self.decision_memory.public(),'offensive_policy':self.offensive_memory.public(w.seconds),'prepared_strategy':getattr(self.client,'prepared_strategy',None),'active_tasks':self.tasks.summary(),'control_policy':self.control_policy,
                      'recent_events':self.log[-8:],'feedback':feedback,
                      'skill_repairs':self.repair.public() if self.repair else {},
                      'live_skill_development':self.development.public() if self.development else {'enabled':False},
@@ -564,7 +569,7 @@ class Commander:
                 'decisions':self.decisions,'errors':self.errors,'thinking':self.thinking,
                 'model_credentials_failed':self.client_fatal,
                 'model_decisions_available':self.client_fatal is None,
-                'last_decision':self.last_decision,'intelligence_revision':self.intelligence.revision,'defensive_rally':self.rally.public(),
+                'last_decision':self.last_decision,'offensive_policy':self.offensive_memory.public(self.game_loop/LOOPS_PER_SECOND),'intelligence_revision':self.intelligence.revision,'defensive_rally':self.rally.public(),
                 'surrender':self.surrender,'skill_repairs':self.repair.public() if self.repair else {},
                 'live_skill_development':self.development.public() if self.development else {'enabled':False},
                 'planner_request':self.client.request_status() if callable(getattr(self.client,'request_status',None)) else {},

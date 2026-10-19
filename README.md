@@ -175,6 +175,8 @@ Go 保持已验证的 `json_object` 格式；原生 `json_schema` 在实战被�
 
 ## 进一步阅读
 
+主动进攻、等待条件与跨轮计划记录见 [OFFENSIVE_POLICY.md](OFFENSIVE_POLICY.md)。
+
 - [CLOUD_HANDOFF.md](CLOUD_HANDOFF.md)：自主困难 bot 对战的最新代码、提示词、复盘和账本续跑说明。
 - [AI_SKILL_MANUAL.md](AI_SKILL_MANUAL.md)：模型技能契约。
 - [SC2_GAME_KNOWLEDGE.md](SC2_GAME_KNOWLEDGE.md)：游戏知识和种族能力。

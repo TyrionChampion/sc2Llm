@@ -1,5 +1,34 @@
 # 自主 bot 对战交接
 
+## 本轮提交：主动进攻与跨轮计划
+
+基于当前分支codex/lan-ai-rooms的39771ab，用户要求增强进攻性并开始修改。
+用户已要求提交并推送这些改动到当前远端分支；日志和历史账本按既有规则留在本地，不随代码上传。
+新增arena/offensive_policy.py，更新INITIAL_STRATEGY、普通Commander和Go实际系统规则，允许主动选择
+小队试探/袭矿/空投/压扩张，不再把等待完整侦察设为统一前提。当前用户战术建议继续参与决策。
+
+模型可在顶层返回offensive_plan：action、objective、squad、launch_condition、abort_condition、
+review_after_s和revision_reason。仅在整份计划校验、任务入队成功后保存；省略/null保留当前计划和期限。
+offensive_policy随真实后续请求与Commander.stats输出，当前条件/期限在上下文压缩后仍保留。
+连续等待最早复查期限不随反复修订延后。到期只提醒，不增加请求、不自动调兵、不选择目标。
+收到进攻任务请求可结束连续等待记录，但不等同实际分配/出发/胜利。旧tasks/reason调用继续兼容。
+
+普通schema、ChatGPT/Go结构化入口支持新字段；同时补上结构化入口此前漏掉的raid/drop_raid。
+Go只在请求声明offensive_policy.enabled时注入对应契约，45k/90k原有输入上限与请求上限不变。
+首次回归暴露45k边界，已压缩重复说明并按能力注入，新旧大场景均通过；失败日志保留。
+说明与例子见OFFENSIVE_POLICY.md，新增test_offensive_policy.py共11项。
+最终完整回归1104项：1102通过、2原有skip，57.261秒，logs/offensive-policy-final-regressions-20261019.log。
+
+额外模型验证原拟重放历史观察，被自动审批以未明确授权再次外发该批历史观测拒绝，原脚本未执行。
+保留logs/offensive-policy-model/probe-3wgfkmdd/approval-rejection.json，未绕过拒绝。
+改用完全手工合成场景，独立预算2/2：logs/offensive-policy-model/synthetic-13qdw1n5/report.json。
+实际返回模型均deepseek-v4.1-flash；虫族成军前压、神族战后拆分矿，两份进攻计划及任务schema有效。
+该验证未读取历史对局观测、无引擎动作，不是新比赛或胜率证明。源码哈希未变。
+
+上一场PvZ仍100/128（P1=48/P2=52）、finished/time_budget，旧四局342/512与更早181/200均未重置。
+已有11份更早历史文件SHA核验一致。上一场的原生折跃拒绝、进攻停滞等记录保留；本轮未声称修复这些
+独立执行现象。后续实战应比较首攻时间、局部胜利后续目标及残局定位，不把合成场景结果当整局胜利。
+
 ## 2026-10-18 最终：四场非实时实战完成
 
 用户要求的4场已完成，系列`logs/go-step-duels/four-do4lgd37`状态finished，无活动游戏。

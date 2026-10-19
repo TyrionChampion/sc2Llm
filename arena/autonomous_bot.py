@@ -9,7 +9,9 @@ from arena.match_control import surrender_blockers
 from arena.tech_tree import TOWNHALLS, WORKERS
 
 
-INITIAL_STRATEGY = '''自主选择适合当前局势的战略。根据已侦察的信息比较可行方案，制定阶段目标和调整条件。
+INITIAL_STRATEGY = '''主动施压，争取把经济与兵力优势转成地图控制和胜利。根据已侦察的信息比较可行方案，制定阶段目标和调整条件。
+没有紧迫防守威胁时比较小队袭矿、空投、压制分矿与主力推进；情报不足可先小队试探并设置撤退点。
+选择等待必须有具体条件和复查时点，不反复提高成军门槛。打赢后及时评估追击、拆矿或撤回，明确下一目标。
 持续检查经济、产能、科技、兵力与地图控制；发现原计划失效时修订。
 自主设定可量化的阶段军力、产能和关键升级目标与检查时点，用实际产出检查是否落后。
 选择扩张经济时，预留当前明确的扩张和必要前置预算，把余钱尽可能持续转成战斗部队；
@@ -22,11 +24,10 @@ INITIAL_STRATEGY = '''自主选择适合当前局势的战略。根据已侦察�
 
 BOT_RULES = '''自主指挥真实星际对局，在预算内战胜对手。
 只返回JSON：{"tasks":[],"reason":"100字内中文：路线依据、阶段目标或调整"}。
-顶层只需tasks/reason；任务仅skill/count/args。禁止type、response_format和任务级reason。
+顶层tasks/reason，可加offensive_plan跨轮记录；任务仅skill/count/args。禁止type、response_format和任务级reason。
 每轮≤6任务，生产/补给/科技/侦察可并行；空tasks保留任务。仅己方观测，无迷雾敌情。
-开局比较两路（扩张/机械/防反/时机进攻），按地图/侦察/经济/压力定工人、基地、兵种比例。
-设军力/产能/升级目标与检查时点；reason报军力/目标/依据，按观测调整，达标才称成军。
-攻/扩需侦察则先等观测；同轮侦察不等于已有敌情。生产/扩张/科技/侦察/调兵须下令。
+比较开局路线；按地图/情报/压力定工人、矿数、兵种比例、军力/产能/升级目标及检查点，reason报依据。
+攻/扩按当前情报评估风险，未知可用可撤回试探或侦察配合施压，不无限等待完美视野；同轮侦察不等于已有敌情。生产/扩张/科技/侦察/调兵须下令。
 宿主不选战略。下令/到达≠建成/战术成功/胜利；核对world/反馈，无敌情≠安全，用scout补情报。
 
 接口契约：训练/变形/建造/扩张外层count为1..200，其他外层count必须1。
@@ -47,12 +48,8 @@ plan_rejected整批未执行，纠正后重下。
 注卵用inject_larva count=1 args={base:home|expansion|site_N}；看zerg_injection，一次施法不循环。
 use_ability args={caster:己方tag,ability:准确name,target:null或tag或[x,y],timeout_s:1..120}；看native_abilities。
 每caster每轮一单，无自动重施/选目标；购买/研究用宏。
-按饱和/压力/科技选工人、矿数和产能。
-
-仅预留已决定的近期扩张/前置，余钱造兵，不为远期囤钱。
-每轮核对库存/产能/任务/军力/目标；落后补兵，阻塞补供给/气源/前置。经济和科研不代替军队。
-按资源/供给/吞吐/间隔选批量，完成续排。闲设施排兵，忙且不足增设施。
-多矿按饱和补工；受压重估预留/守军，阵容和时机自选。
+每轮核对库存/产能/任务/军力，按资源/人口/吞吐/间隔排批量，闲设施造兵，产能不足增设施；补阻塞前置。
+只预留明确近期用途，余钱转军力；工人按饱和补，多矿受压重估预留/守军。
 
 经济目标可用macro_plan args={opening:"economic|pressure|defend|custom",target_bases:1..8,
 worker_target:1..90,expand_by_game_s:0..5400,reserve_expansion:true或false,reserve_for_s:30..180,
@@ -80,9 +77,9 @@ scan args={target:有效地标或[x,y]}；call_mule/supply_drop args={base:"home
 
 战损后重估阵容/规模/升级/地形/视野/增援，勿重复失败路线。
 见坦克群比较机械/空军/侧翼/守点转科技；生化遭范围火力重创须改阵容/路线，勿只加人数正面撞阵。
-闲兵≠成军，排队≠完成；提前补供给。主矿清空仍ongoing则侦察残余建筑；enemy_start仅出生点。
+闲兵≠成军，排队≠完成；提前补供给，ongoing则继续定位残余建筑。
 combat_micro只对已明确分配的军队使用已研究且可用的兴奋剂、坦克架起/收起，不替你选战略。
-prepared_strategy是开局目标；旧局举例非本局，以当前decision_memory/反馈/契约为准。
+prepared_strategy是开局目标，当前decision_memory/观测/契约为准。
 按iteration_policy的剩余请求、时间与检查间隔批量生产，避免重复等待。
 请求将尽预排生产/部署/增援和时限；末轮须按情报/兵力留下攻守令与集结点，不能只侦察等待。
 编队不吸收新兵，须派增援。限时仍可经济/科技，按阶段进展评估。
@@ -93,6 +90,7 @@ surrender任务立即认输：args={reason:"具体观测败势"}。短暂缺钱�
 # The bounded Go adapter intentionally replaces the full Commander system. It
 # must still advertise the same offensive operations as the direct planners.
 from arena.raids import PROTOCOL as RAID_PROTOCOL
+from arena.offensive_policy import PROTOCOL as OFFENSIVE_PROTOCOL
 
 
 class BudgetExhausted(RuntimeError):
@@ -290,7 +288,7 @@ def economical_payload(payload,threshold=39000):
     # Historical records remain in the journal; never clip a current observation or error event.
     if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold:
         removed=[]
-        for section,key,keep in (('decision_memory','recent',4),
+        for section,key,keep in (('decision_memory','recent',4),('offensive_policy','recent',1),
                 ('economy_report','recent_requested_spending',4),('economy_report','checkpoints',3),
                 ('engagement_log','windows',3)):
             values=result.get(section,{}).get(key)
@@ -323,7 +321,7 @@ def economical_payload(payload,threshold=39000):
         result['context_policy']['scope']='All contacts/history are own observations; left vision is not death; no hidden enemy inference'
     if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold+2000:
         removed=result['context_policy'].setdefault('omitted_history',[])
-        for section,key,keep in (('decision_memory','recent',2),
+        for section,key,keep in (('decision_memory','recent',2),('offensive_policy','recent',0),
                 ('economy_report','recent_requested_spending',0),('economy_report','checkpoints',1)):
             values=result.get(section,{}).get(key)
             if isinstance(values,list) and len(values)>keep:
@@ -337,7 +335,7 @@ def economical_payload(payload,threshold=39000):
             if isinstance(tree.get(group),list):tree[group]=contact_groups(tree[group])
     if len(json.dumps(result,ensure_ascii=False,separators=(',',':'))) > threshold:
         # Keep pruning metadata/history addressable for the full-prompt budget pass.
-        result={key:value if key in ('context_policy','decision_memory','economy_report')
+        result={key:value if key in ('context_policy','decision_memory','economy_report','offensive_policy')
                 else nested_contact_tables(value) for key,value in result.items()}
         # These fixed report descriptions repeat the system contract, not observed state.
         paths=(('control_policy','defense_orders','scope'),('control_policy','defense_orders','order'),
@@ -430,6 +428,8 @@ class BotPlanner:
         from arena.context_tables import decode_tables
         source=decode_tables(json.loads(user));schema_chars=0
         battle_rules=BOT_RULES
+        if source.get('offensive_policy',{}).get('enabled'):
+            battle_rules+='\n'+OFFENSIVE_PROTOCOL
         if source.get('offensive_operations',{}).get('enabled'):
             battle_rules+='\n'+RAID_PROTOCOL
         schema_builder=getattr(self.client,'response_schema_for',None)
@@ -454,7 +454,7 @@ class BotPlanner:
         compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
         # Fit the FULL prompt, including changing system rules and iteration metadata.
         # Only old decision/economy history is eligible; current tasks, errors and war facts stay.
-        for section,field,keep in (('decision_memory','milestones',1),
+        for section,field,keep in (('offensive_policy','recent',0),('decision_memory','milestones',1),
                 ('decision_memory','recent',1),('economy_report','checkpoints',1),
                 ('economy_report','recent_requested_spending',0)):
             if len(battle_rules)+len(compact)<=self.context_limit:break

@@ -32,7 +32,8 @@ def battle_output_schema(payload):
                'research', 'gather_gas', 'expand', 'gather', 'attack_nearest',
                'move_out', 'no_op', 'defend_base', 'cancel_task', 'scout',
                'order_units', 'cancel_unit_order', 'surrender', 'macro_plan',
-               'cancel_expansion', 'morph_unit', 'rally_units', 'scan', 'call_mule', 'supply_drop','inject_larva'}
+               'cancel_expansion', 'morph_unit', 'rally_units', 'scan', 'call_mule', 'supply_drop','inject_larva',
+               'raid','drop_raid'}
     variants = []
     for branch in known['properties']['tasks']['items']['anyOf']:
         names = [name for name in branch['properties']['skill']['enum'] if name in allowed]
@@ -43,6 +44,8 @@ def battle_output_schema(payload):
     schema = dict(type='object', additionalProperties=False, properties=dict(
         tasks=dict(type='array', maxItems=3, items=dict(anyOf=variants)),
         reason=known['properties']['reason']))
+    if 'offensive_plan' in known['properties']:
+        schema['properties']['offensive_plan']=known['properties']['offensive_plan']
     def strict(node):
         if isinstance(node, dict):
             node.pop('uniqueItems',None)  # Host still validates uniqueness; provider schema subset omits it.
