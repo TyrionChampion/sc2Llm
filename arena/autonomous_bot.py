@@ -45,7 +45,7 @@ count为新增1..200，每产品每轮一次，每批待产≤200；默认coales
 建筑/形态/弹药无append。按active_tasks.production_quantity与等待reason续排，完成不循环。
 build_supply count=N造本族N个补给（虫族overlord）；建筑逐个等建成。活动目标重复合并。
 plan_rejected整批未执行，纠正后重下。
-注卵用inject_larva count=1 args={base:home|expansion|site_N}；看zerg_injection，一次施法不循环。
+注卵用inject_larva count=1 args={base:home|expansion|site_N|己方基地tag整数或十进制字符串}；看zerg_injection，一次施法不循环。
 use_ability args={caster:己方tag,ability:准确name,target:null或tag或[x,y],timeout_s:1..120}；看native_abilities。
 每caster每轮一单，无自动重施/选目标；购买/研究用宏。
 每轮核对库存/产能/任务/军力，按资源/人口/吞吐/间隔排批量，闲设施造兵，产能不足增设施；补阻塞前置。
@@ -78,7 +78,7 @@ scan args={target:有效地标或[x,y]}；call_mule/supply_drop args={base:"home
 战损后重估阵容/规模/升级/地形/视野/增援，勿重复失败路线。
 见坦克群比较机械/空军/侧翼/守点转科技；生化遭范围火力重创须改阵容/路线，勿只加人数正面撞阵。
 闲兵≠成军，排队≠完成；提前补供给，ongoing则继续定位残余建筑。
-combat_micro只对已明确分配的军队使用已研究且可用的兴奋剂、坦克架起/收起，不替你选战略。
+combat_micro只在已分配军队执行automatic列出的三族微操，需科技/能量/原生可用；你仍决定战略。
 prepared_strategy是开局目标，当前decision_memory/观测/契约为准。
 按iteration_policy的剩余请求、时间与检查间隔批量生产，避免重复等待。
 请求将尽预排生产/部署/增援和时限；末轮须按情报/兵力留下攻守令与集结点，不能只侦察等待。
@@ -497,7 +497,7 @@ class BotPlanner:
             detail = str(error)
             self.last_request_error = detail
             kind = getattr(error, 'error_kind', None)
-            permanent = kind in ('quota_exhausted', 'account_rejected', 'model_identity_mismatch') or any(word in detail.lower() for word in (
+            permanent = kind in ('quota_exhausted', 'account_rejected', 'model_identity_mismatch', 'privacy_setting_required') or any(word in detail.lower() for word in (
                     'http 401', 'http 402', 'http 403', 'quota', 'usage limit', 'not supported',
                     'unauthorized', 'unexpected codex tool', 'invalid battle plan'))
             transient = (kind in ('transient_transport', 'transient_http', 'transient_model_output')

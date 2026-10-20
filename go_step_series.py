@@ -30,12 +30,16 @@ ROOT=Path(__file__).resolve().parent
 SCHEDULE=[['terran','protoss'],['protoss','zerg'],['zerg','terran'],['terran','zerg']]
 
 
-def play(folder, number, state, budget):
+def play(folder, number, state, budget, planner_factory=None):
+    models=state.get('models',[GO_MODEL]*2)
+    if not isinstance(models,(list,tuple)) or len(models)!=2 or any(not isinstance(m,str) or not m.strip() for m in models):
+        raise ValueError('two explicit model identities required')
     folder.mkdir();races=state['schedule'][number-1];limits=state['limits']
+    factory=planner_factory or GoPlanner
     sources=source_snapshot(folder)
     own_source=Path(__file__).read_bytes();(folder/'source'/Path(__file__).name).write_bytes(own_source)
     sources[Path(__file__).name]=hashlib.sha256(own_source).hexdigest()
-    report=dict(number=number,status='starting',models=[GO_MODEL]*2,races=races,realtime=False,
+    report=dict(number=number,status='starting',models=list(models),races=races,realtime=False,
         engine_kind='Linux SC2 API',debug_used=False,scripted_opening=False,seed=state['seed']+number-1,
         limits=limits,code_sha256=sources,outcomes={},result_source='unverified',termination=None,
         samples=[],players=[],cleanup_complete=False)
@@ -44,7 +48,7 @@ def play(folder, number, state, budget):
     guards=[DefeatGuard(),DefeatGuard()]
     try:
         for i in range(2):
-            client=GoPlanner(GO_MODEL,folder/('p%d'%(i+1))/'planner')
+            client=factory(models[i],folder/('p%d'%(i+1))/'planner')
             planner=BotPlanner(client,PlayerBudget(budget,i),INITIAL_STRATEGY,limits['requests'],adaptive_cadence=True)
             # Step matches pause both clients. Give long reasoning a documented
             # bounded window without changing classic realtime profiles.
@@ -112,7 +116,7 @@ def play(folder, number, state, budget):
             except Exception as error:cleanup.append(type(error).__name__)
         report['players']=[]
         for i,(c,w) in enumerate(zip(commanders,worlds)):
-            own=dict(player=i+1,race=races[i],model=GO_MODEL,outcome=report['outcomes'].get(i+1,'Unknown'),
+            own=dict(player=i+1,race=races[i],model=models[i],outcome=report['outcomes'].get(i+1,'Unknown'),
                 final_world=w.summary(),commander=c.stats(),model_calls=clients[i].calls,model_attempts=clients[i].attempts,
                 fatal_error=clients[i].fatal_error,fatal_kind=clients[i].fatal_kind,journal=str(c.feedback.path),
                 usage=clients[i].usage,realtime=False,termination=report['termination'],timing=report.get('timing'),

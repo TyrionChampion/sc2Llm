@@ -72,19 +72,22 @@ class DefenseCoordinator:
         return min(self.bases,key=lambda b:min((u.distance(b) for u in candidates),default=0))
 
     def _mobile(self,u):
+        from arena.combat_spells import DEPLOYED_FORMS
+        if self.combat_micro_enabled and u.type_id in DEPLOYED_FORMS:return True
         meta=getattr(self.tasks.backend,'types',{}).get(u.type_id)
         name=(getattr(meta,'name',None) or NAMES.get(u.type_id,'')).lower()
         return (u.type_id!=32 and not any(form in name for form in ('burrowed','sieged','liberatorag'))
                 and (meta is None or getattr(meta,'movement_speed',0)>0))
 
     def _choose(self,w):
+        from arena.combat_spells import SUPPORT_TYPES
         from arena.python_skills import PythonSkillRun
         python={t.id:t for t in self.tasks.tasks if t.active and isinstance(t.program,PythonSkillRun)}
         reclaim={tag for t in python.values() for tag in t.program.tags}
         forbidden=self.tasks.protected()-reclaim-self.tags
         candidates=[u for u in w.my_units if u.done and not u.is_building and not u.hallucination
                     and u.type_id not in WORKERS and u.tag not in forbidden and self._mobile(u)
-                    and (u.ground_dps>0 or u.air_dps>0)
+                    and (u.ground_dps>0 or u.air_dps>0 or self.combat_micro_enabled and u.type_id in SUPPORT_TYPES)
                     and any(u.distance(b)<=45 for b in self.bases)]
         front=self._target_base()
         candidates.sort(key=lambda u:(u.tag in reclaim,u.distance(front),u.tag))
@@ -121,7 +124,7 @@ class DefenseCoordinator:
                 and (u.ground_dps>0 or u.air_dps>0) and any(u.distance(b)<=self.radius for b in self.bases)]
         enemies=sorted(self.enemies,key=lambda u:(min(u.distance(b) for b in self.bases),u.tag))
         return dict(game_s=round(w.seconds,2),stim_researched=15 in w.upgrades,
-                    combat_abilities={'enabled':self.combat_micro_enabled,'handling':'Authorized squad uses stim/siege/unsiege locally; decide defend/hold/withdraw only' if self.combat_micro_enabled else 'No automatic combat ability executor'},generation=self.generation,mode=self.mode,
+                    combat_abilities={'enabled':self.combat_micro_enabled,'handling':'Authorized squad uses three-race local combat abilities; decide defend/hold/withdraw only' if self.combat_micro_enabled else 'No automatic combat ability executor'},generation=self.generation,mode=self.mode,
                     bases=[encode(b) for b in self.bases[:8]],squad=[encode(u) for u in own[:32]],
                     enemies=[encode(u) for u in enemies[:16]],allied_support=[encode(u) for u in allies[:8]],
                     omitted=dict(bases=max(0,len(self.bases)-8),enemies=max(0,len(enemies)-16),allies=max(0,len(allies)-8)),

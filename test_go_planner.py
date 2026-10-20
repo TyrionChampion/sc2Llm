@@ -15,6 +15,21 @@ from arena.autonomous_bot import RequestBudget
 
 
 class GoTests(unittest.TestCase):
+    def test_explicit_gemini_uses_go_and_rejects_another_returned_identity(self):
+        model='gemini-4-argon-contributor'
+        request=self.request();request['requested_model']='opencode-go/'+model
+        post=Mock(return_value=self.response(model=model))
+        with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            result=perform_request(request,post)
+            mismatch=perform_request(request,Mock(return_value=self.response()))
+            with tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(GoPlanner(request['requested_model'],directory).model,request['requested_model'])
+        self.assertEqual(post.call_args.args[0],GO_ENDPOINT+'/chat/completions')
+        self.assertEqual(post.call_args.kwargs['json']['model'],model)
+        self.assertEqual(result['metadata']['returned_model'],model)
+        self.assertEqual(mismatch['error_kind'],'model_identity_mismatch')
+        self.assertNotIn('answer',mismatch)
+
     def test_explicit_glm_uses_go_and_cannot_return_a_deepseek_identity(self):
         request=self.request();request['requested_model']='opencode-go/glm-5.3-flash'
         post=Mock(return_value=self.response(model='glm-5.3-flash'))
@@ -114,6 +129,18 @@ class GoTests(unittest.TestCase):
         self.assertEqual(result['error_kind'],'transient_http')
         self.assertNotIn('quota',result['error']);self.assertEqual(post.call_count,1)
         self.assertNotIn('secret',json.dumps(result))
+
+    def test_training_privacy_gate_is_explicit_and_does_not_retry_or_expose_body(self):
+        body={'error':{'type':'server_error','message':'Upstream request failed: This Go model trains on request data. Allow paid endpoints that train on request data in your workspace\'s Privacy settings to use it. test-secret'}}
+        post=Mock(return_value=SimpleNamespace(status_code=400,json=lambda:body,text=json.dumps(body)))
+        request=self.request();request['requested_model']='opencode-go/gemini-4-argon-contributor'
+        with patch.dict(os.environ,{'open_api_key':'test-secret'}):
+            result=perform_request(request,post)
+        self.assertEqual(result['error_kind'],'privacy_setting_required')
+        self.assertIn('trains on request data',result['error'])
+        self.assertNotIn('test-secret',json.dumps(result))
+        self.assertNotIn('answer',result)
+        post.assert_called_once()
 
     def test_confirmed_quota_and_account_rejection_are_permanent(self):
         for code,body,kind in (

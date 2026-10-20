@@ -78,6 +78,7 @@ class Commander:
         self._threatened_bases=set();self._base_health={};self._combat_tags=set()
         self.client_fatal=None  # set when the provider refuses at account level; stops new requests
         self.tasks=TaskQueue(backend,index,self.emit,self.record_feedback,python_catalog=python_catalog)
+        self.tasks.combat_micro_enabled=bool(combat_micro)
         if defense_client is not None:
             from arena.defense import DefenseCoordinator
             self.interval=max(interval,25)
@@ -146,9 +147,12 @@ class Commander:
                 coordination='Python missions pause with frozen deadlines; fresh worker resumes on handback; missing members require redispatch')
             self.system+='\nAn independent defensive adjutant handles local base threats. Read defense_adjutant and paused tasks. You manage economy, technology and strategic missions; do not repeatedly cancel defense. Owned defense units are unavailable for other orders.'
         if self.combat_micro:
-            self.control_policy['combat_micro']=dict(enabled=True,abilities=['stim','siege','unsiege'],
-                scope='After explicit attack_nearest/move_out/order_units or defensive assignment only; scouts and active Python/JSON/morph units excluded',
-                rules='Healthy researched unstimmed bio uses stim individually at contact; tanks deploy at ground contact/arrival and undeploy to advance/withdraw. No automatic strategic attack or retreat.')
+            from arena.combat_spells import RULES
+            abilities=sorted({r.action for r in RULES}|{'stim','siege','unsiege','lurker_burrow','lurker_unburrow',
+                'mine_burrow','mine_unburrow','pulsar_beam_off','afterburners'})
+            self.control_policy['combat_micro']=dict(enabled=True,abilities=abilities,
+                scope=self.combat_micro.public()['scope'],
+                rules='Three-race local abilities require live availability, energy and observed safe targets. Model chooses strategy; spell acknowledgement is not damage.')
             self.system+=battle_plans.COMBAT_MICRO_PROTOCOL
         if development:
             from arena.live_skills import PROTOCOL as DEVELOPMENT_PROTOCOL

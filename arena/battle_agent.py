@@ -120,13 +120,14 @@ class BattleAgent:
                 for sid,tags in candidates[:2]]
 
     def _eligible(self,u):
+        from arena.combat_spells import SUPPORT_TYPES, DEPLOYED_FORMS
         meta=getattr(self.backend,'types',{}).get(u.type_id)
         name=(getattr(meta,'name',None) or NAMES.get(u.type_id,'')).lower()
         return (u.done and not u.is_building and not u.hallucination and u.type_id not in WORKERS
-            and not u.cargo_taken and not u.passengers and (u.ground_dps>0 or u.air_dps>0)
-            and 'burrowed' not in name and 'liberatorag' not in name
+            and not u.cargo_taken and not u.passengers and (u.ground_dps>0 or u.air_dps>0 or self.combat_micro and u.type_id in SUPPORT_TYPES)
+            and ('burrowed' not in name or self.combat_micro and u.type_id in DEPLOYED_FORMS) and 'liberatorag' not in name
             and (u.type_id!=32 or self.combat_micro)
-            and (u.type_id in (32,33) or meta is None or getattr(meta,'movement_speed',0)>0))
+            and (self.combat_micro and u.type_id in DEPLOYED_FORMS or u.type_id in (32,33) or meta is None or getattr(meta,'movement_speed',0)>0))
 
     def _work(self):
         while not self.closed.is_set():
@@ -438,7 +439,9 @@ class BattleAgent:
                 tree=getattr(self.backend,'tech_tree',None)
                 if not callable(query) or tree is None:raise ValueError('engine ability query/catalogue unavailable')
                 abilities=query(self.index,tags)
-                if any(u.type_id!=32 and not tree.ability_available(ability,abilities.get(u.tag,set())) for u in units):
+                from arena.combat_spells import DEPLOYED_FORMS
+                if any(not (self.combat_micro and u.type_id in DEPLOYED_FORMS)
+                       and not tree.ability_available(ability,abilities.get(u.tag,set())) for u in units):
                     raise ValueError('movement ability unavailable; no fabricated dispatch')
                 out.append(command(ability,tags,pos=point))
                 self.action_contexts.append(dict(source='army_tactics',mode=a['mode'],task_id=None,

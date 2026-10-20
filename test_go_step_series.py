@@ -60,5 +60,41 @@ class StepSeriesTests(unittest.TestCase):
         self.assertIn('retreat_target',client.system)
         self.assertEqual(client.payload['offensive_operations']['tasks'],['raid','drop_raid'])
 
+    def test_explicit_planner_factory_keeps_both_requested_model_identities(self):
+        import go_step_series as runner
+        seen=[]
+        class Client:
+            timeout=60;closed=False;calls=0;attempts=0
+            max_battle_context_chars=90000
+            def __init__(self,model,directory):
+                self.model=model;seen.append((model,directory.name))
+            def close(self):self.closed=True
+        models=['chatgpt/gpt-6.1-sol','chatgpt/gpt-6.1-sol']
+        state=dict(schedule=[['protoss','zerg']],models=models,seed=7,
+                   limits=dict(requests=64,wall_s=2400,game_s=1800,model_timeout_s=120))
+        with tempfile.TemporaryDirectory() as root:
+            folder=Path(root)
+            budget=DurableBudget(folder/'budget.json',128)
+            with patch.object(runner,'LinuxStepArena',side_effect=RuntimeError('synthetic startup interruption')):
+                result=runner.play(folder/'match-01',1,state,budget,planner_factory=Client)
+            self.assertEqual(seen,[(models[0],'planner'),(models[1],'planner')])
+            self.assertEqual(result['models'],models)
+            self.assertEqual(result['races'],['protoss','zerg'])
+            self.assertEqual(result['termination'],'environment_error')
+            self.assertEqual(result['outcomes'],{})
+            self.assertTrue(result['cleanup_complete'])
+            self.assertEqual(budget.used,0)
+
+    def test_invalid_model_pair_is_rejected_before_creating_match_or_calling_provider(self):
+        import go_step_series as runner
+        with tempfile.TemporaryDirectory() as root:
+            folder=Path(root);budget=DurableBudget(folder/'budget.json',128)
+            for value in (None,'ab',[],['chatgpt/gpt-6.1-sol'],['', 'chatgpt/gpt-6.1-sol']):
+                with self.subTest(models=value),self.assertRaises(ValueError):
+                    runner.play(folder/'match-01',1,dict(models=value),budget,
+                                planner_factory=lambda *a:self.fail('provider must not be called'))
+                self.assertFalse((folder/'match-01').exists())
+            self.assertEqual(budget.used,0)
+
 
 if __name__=='__main__':unittest.main()

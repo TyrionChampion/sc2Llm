@@ -12,6 +12,7 @@ from collections import Counter
 
 from arena.raw_engine import ATTACK, MOVE, command
 from arena.tech_tree import TOWNHALLS, WORKERS
+from arena.combat_spells import SUPPORT_TYPES, DEPLOYED_FORMS
 
 SYSTEM = '''你是独立战术指挥官。运营指挥负责经济、科技、兵种和生产，你只负责未被自定义技能占用的部队。
 只输出JSON：{"mode":"assemble|attack|hold|withdraw","objective":"enemy_start|visible_enemy|defend_base","min_group":6,"reason":"简短中文说明"}。
@@ -74,9 +75,9 @@ class ArmyTactics:
         meta=getattr(self.backend,'types',{}).get(u.type_id)
         name=getattr(meta,'name','').lower()
         return (u.done and not u.is_building and not u.hallucination and u.type_id not in WORKERS
-                and not u.cargo_taken and not u.passengers and (u.ground_dps>0 or u.air_dps>0)
+                and not u.cargo_taken and not u.passengers and (u.ground_dps>0 or u.air_dps>0 or self.combat_micro and u.type_id in SUPPORT_TYPES)
                 and (u.type_id!=32 or self.combat_micro)
-                and (u.type_id in (32,33) or ('burrowed' not in name and
+                and (self.combat_micro and u.type_id in DEPLOYED_FORMS or u.type_id in (32,33) or ('burrowed' not in name and
                      (meta is None or getattr(meta,'movement_speed',0)>0))))
 
     def _remember(self,w):

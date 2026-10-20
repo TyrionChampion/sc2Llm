@@ -24,6 +24,34 @@ class QueenInjection(unittest.TestCase):
         self.assertEqual(self.q.tasks[0].status,'completed')
         self.assertFalse(next(e for e in self.events if e['kind']=='inject_larva_confirmed')['larva_spawn_confirmed'])
         self.assertEqual(self.q.tick(self.world(seconds=35),set()),[])
+    def test_tag_selects_exact_macro_hatchery_not_another_base_at_home(self):
+        for selector in (4387241986,'4387241986'):
+            with self.subTest(selector=selector):
+                self.setUp();extra=replace(self.base,tag=4387241986,x=35)
+                self.enqueue(selector)
+                out=self.q.tick(self.world([self.base,extra,self.queen]),set())
+                self.assertEqual(out[0].action_raw.unit_command.target_unit_tag,extra.tag)
+                self.assertEqual(self.q.tasks[0].program.spec['base'],extra.tag)
+                self.q.tick(self.world([self.base,replace(extra,buffs=(11,)),replace(self.queen,energy=25)],2),set())
+                self.assertEqual(self.q.tasks[0].status,'completed')
+
+    def test_exact_tag_never_falls_back_to_enemy_unfinished_nonbase_or_missing_tag(self):
+        for candidate in (None,replace(self.base,tag=3,alliance=4),replace(self.base,tag=3,progress=.5),
+                          replace(self.queen,tag=3),replace(self.base,tag=3,hallucination=True)):
+            with self.subTest(candidate=candidate):
+                self.setUp();self.enqueue('3')
+                units=[self.base,self.queen]+([candidate] if candidate else [])
+                self.assertEqual(self.q.tick(self.world(units),set()),[])
+                self.assertEqual(self.q.tasks[0].status,'waiting')
+
+    def test_bad_tag_values_reject_before_any_task_is_enqueued(self):
+        for value in (True,False,0,-1,2**64,1.5,None,'0','-1','1.5','１２','1e3'):
+            with self.subTest(value=value),self.assertRaises(PlanValidationError):self.enqueue(value)
+        self.assertEqual(self.q.tasks,[])
+    def test_integer_and_string_tag_coalesce_into_one_cast(self):
+        self.enqueue('1');self.enqueue(1)
+        self.assertEqual(len(self.q.tasks),1)
+        self.assertEqual(len(self.q.tick(self.world(),set())),1)
     def test_low_energy_allocated_enemy_or_missing_requested_base_never_casts(self):
         cases=[([self.base,replace(self.queen,energy=24)],'home',False),
                ([self.base,replace(self.queen,alliance=4)],'home',False),

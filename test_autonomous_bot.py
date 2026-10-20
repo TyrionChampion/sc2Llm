@@ -176,7 +176,8 @@ class AutonomousTests(unittest.TestCase):
                 ('HTTP 503: OpenCode Go request rejected','transient_http',False),
                 ('HTTP 429: OpenCode Go request rejected','transient_http',False),
                 ('HTTP 429: OpenCode Go quota exceeded','quota_exhausted',True),
-                ('HTTP 401: OpenCode Go request rejected','account_rejected',True)):
+                ('HTTP 401: OpenCode Go request rejected','account_rejected',True),
+                ('OpenCode Go privacy settings block this model: it trains on request data','privacy_setting_required',True)):
             class Broken(Client):
                 def chat(self,*args):
                     self.attempts+=1;raise GoRequestError(message,kind)

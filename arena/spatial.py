@@ -408,24 +408,27 @@ class SpatialMission:
         return bank
 
     def prepare_ground_movement(self,w,q,t,out,units):
-        """Only the mechanical tank stance required by an explicit move."""
-        from arena.combat_micro import UNSIEGE
+        """Leave an immobile combat stance for this explicit movement only."""
+        from arena.combat_spells import DEPLOYED_FORMS
         if q.tech_tree is None:raise ValueError('spatial mission requires engine ability catalogue')
         # The same raid may move, siege while attacking, then withdraw again.
         # Retire only OBSERVED completed transitions, never assume an ACK did it.
         for tag in list(self.stance_pending):
             actor=w.by_tag(tag)
-            if actor is not None and actor.type_id==33:del self.stance_pending[tag]
-        sieged=[u for u in units if u.type_id==32]
+            if actor is not None and actor.type_id not in DEPLOYED_FORMS:del self.stance_pending[tag]
+        sieged=[u for u in units if u.type_id in DEPLOYED_FORMS]
         if not sieged:return True
         available=q.backend.available_abilities(q.index,[u.tag for u in sieged])
         for u in sieged:
+            ability=DEPLOYED_FORMS[u.type_id][1]
+            stance='tank unsiege' if u.type_id==32 else 'combat unit unburrow'
             if u.tag in self.stance_pending:
-                if w.seconds-self.stance_pending[u.tag]>8:raise ValueError('tank unsiege not observed in 8 game seconds')
+                if w.seconds-self.stance_pending[u.tag]>8:raise ValueError(stance+' not observed in 8 game seconds')
                 continue
-            if not q.tech_tree.ability_available(UNSIEGE,available.get(u.tag,set())):raise ValueError('tank cannot currently unsiege')
-            if q.issue(t,command(UNSIEGE,[u.tag]),out):self.stance_pending[u.tag]=w.seconds
-        q.update(t,'waiting','explicit movement awaits observed tank unsiege')
+            if not q.tech_tree.ability_available(ability,available.get(u.tag,set())):
+                raise ValueError('tank cannot currently unsiege' if u.type_id==32 else 'combat unit cannot currently unburrow')
+            if q.issue(t,command(ability,[u.tag]),out):self.stance_pending[u.tag]=w.seconds
+        q.update(t,'waiting','explicit movement awaits observed unsiege/unburrow')
         return False
 
     def advance(self, w, q, t, used, out):

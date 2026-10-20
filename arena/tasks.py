@@ -58,6 +58,7 @@ class Task:
 class TaskQueue:
     def __init__(self,backend,index,emit=print,feedback=None,python_catalog=None):
         self.backend=backend; self.index=index; self.emit=emit
+        self.combat_micro_enabled=False
         self.tasks=[]; self.next_id=1; self.clock=0; self.library={}
         self.observed_units_by_type={}
         self.production_append_receipts=deque(maxlen=128)
@@ -335,7 +336,9 @@ class TaskQueue:
                     invalid(field+'.args',args,'task_id of an active Python task owned by this player')
                 else:cancellations.add(task_id)
             elif skill in MACROS and self.tech_tree is not None:
-                try:specification(self.tech_tree,self.race,skill,args)
+                try:
+                    spec=specification(self.tech_tree,self.race,skill,args)
+                    if skill=='inject_larva':args=dict(args,base=spec['base'])
                 except (ValueError,KeyError,TypeError) as e:invalid(field+'.args',args,str(e))
             elif skill=='cancel_unit_order':
                 task_id=args.get('task_id')
@@ -751,9 +754,10 @@ class TaskQueue:
                     else:self.army_tactics.mission(t.skill)
                     self.update(t,'completed','persistent tactical mission accepted; execution and outcome require observation')
                     continue
+                from arena.combat_spells import SUPPORT_TYPES
                 army=[u for u in w.my_units if u.done and not u.hallucination
                       and not u.is_building and u.type_id not in WORKERS
-                      and (u.ground_dps>0 or u.air_dps>0 or u.type_id in (54,56,81,82,129,126,499,111,77,75))]
+                      and (u.ground_dps>0 or u.air_dps>0 or u.type_id in SUPPORT_TYPES|{81,82,129})]
                 if not army:
                     self.update(t,'waiting','no combat units'); continue
                 tags=[u.tag for u in army if u.tag not in used]

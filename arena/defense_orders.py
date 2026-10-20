@@ -12,7 +12,8 @@ model. This module therefore only executes an explicit order:
 """
 from collections import Counter
 from arena.raw_engine import ATTACK, MOVE, NAMES, command
-from arena.tech_tree import TOWNHALLS, WORKERS
+from arena.tech_tree import TOWNHALLS, WORKERS, snake
+from arena.combat_spells import SUPPORT_TYPES, DEPLOYED_FORMS
 
 PROTOCOL = '''Base defence is YOUR decision; nothing is defended unless you order it.
 defend_base args={base:"home|site_N|[x,y]", units:["marine","tank",...] or "all",
@@ -53,7 +54,8 @@ def task_schemas(payload=None):
     def obj(properties, required=()):
         return {'type': 'object', 'properties': properties, 'required': list(required),
                 'additionalProperties': False}
-    names = sorted((payload or {}).get('world', {}).get('own', {}))
+    display_names=set((payload or {}).get('world', {}).get('own', {}))
+    names=sorted(display_names|{snake(n) for n in display_names})
     base = {'anyOf': [
         {'type': 'string', 'enum': sorted({'home'} | {(b.get('label') or '') for b in (payload or {}).get('defense_report', [])} - {''})},
         {'type': 'array', 'minItems': 2, 'maxItems': 2, 'items': {'type': 'number'}}]}
@@ -84,7 +86,8 @@ def unit_names(type_id, backend=None):
     them rejects the whole plan.
     """
     name = NAMES.get(type_id, str(type_id))
-    return {name, name.lower().replace(' ', '_')}
+    canonical=getattr(getattr(backend,'tech_tree',None),'names',{}).get(type_id)
+    return {n for n in (name,name.lower().replace(' ', '_'),snake(name),canonical) if n}
 
 
 def unit_name(type_id, backend=None):
@@ -142,7 +145,7 @@ def base_threats(w, backend, index, radius=26, ordered_tags=()):
         seconds_to_loss = round(base.health / incoming_dps, 1) if incoming_dps > 0 else None
         own_near = [u for u in w.my_units
                     if not u.is_building and u.type_id not in WORKERS
-                    and (u.ground_dps > 0 or u.air_dps > 0) and u.distance(base) <= radius]
+                    and (u.ground_dps > 0 or u.air_dps > 0 or u.type_id in SUPPORT_TYPES) and u.distance(base) <= radius]
         kinds = Counter(NAMES.get(u.type_id, str(u.type_id)) for u in own_near)
         rows.append(dict(
             label=labels.get(base.tag, 'base_' + str(base.tag)), tag=base.tag,
@@ -300,7 +303,7 @@ class DefendBase:
         free = [u for u in w.my_units
                 if usable(u) and u.done and not u.hallucination
                 and not u.is_building and u.type_id not in WORKERS
-                and (u.ground_dps > 0 or u.air_dps > 0) and self._kind_matches(u)]
+                and (u.ground_dps > 0 or u.air_dps > 0 or u.type_id in SUPPORT_TYPES) and self._kind_matches(u)]
         # Keep the units this order already held, so two orders sharing an army do not alternate
         # ownership every tick (each release used to hand its units to the sibling).
         free.sort(key=lambda u: 0 if u.tag in held_before else 1)
@@ -407,7 +410,8 @@ class DefendBase:
                     try:available=q.backend.available_abilities(q.index,[actor.tag for actor in chosen])
                     except (RuntimeError,TimeoutError,ConnectionError) as error:
                         available={};query_error=type(error).__name__
-                if query_error or not tree.ability_available(ability,available.get(u.tag,set())):
+                stance_release=getattr(q,'combat_micro_enabled',False) and u.type_id in DEPLOYED_FORMS
+                if query_error or not stance_release and not tree.ability_available(ability,available.get(u.tag,set())):
                     reason=('native ability query unavailable: '+query_error if query_error else
                             'native defence ability not ready; completion alone does not establish control readiness')
                     self.command_waiting[u.tag]=dict(unit_tag=u.tag,ability_id=ability,reason=reason,
@@ -421,6 +425,7 @@ class DefendBase:
             receipt.update(pending=True,loop=w.game_loop,sent=w.seconds,ability=ability)
             out.append(command(ability, [u.tag], pos=target.pos))
             q.action_contexts.append(dict(source='defense_guard',task_id=t.id,
-                                          skill=t.skill,request_id=t.request_id))
+                                          skill=t.skill,request_id=t.request_id,
+                                          mode='hold' if self.stance=='hold' else 'defend' if self.stance=='trade' else 'screen'))
             self.issued += 1
         return bank

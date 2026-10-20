@@ -1,5 +1,64 @@
 # 自主 bot 对战交接
 
+## 最新实战：随机 PvZ 三族微操观察（已完成）
+
+用户要求随机挑两个种族打一场，观察模型是否使用新增能力。一次抽签为 GLM 神族 vs DeepSeek 虫族，
+目录 logs/go-step-duels/micro-random-6rjhnasg；draw.json 保留随机结果/seed=269111064，未重抽。
+仍使用 Go glm-5.3-flash / deepseek-v4.1-flash，无回退，正常迷雾、非实时共同暂停、无debug/固定开局/用户建议。
+游戏18:20.36、墙钟24:11.47，GLM失去全部基地/工人/军队/产能后主动认输，离开确认；
+DeepSeek胜，result_source=acknowledged_concession_rule，不是自然清空所有建筑的引擎胜利。
+
+新微操真实触发：哨兵守护盾1次buff确认、力场2次能量回执（普通全军任务与常驻守备各1次）；
+女王输血6请求/5回执/1未确认。GLM主动生产两只哨兵并提到护盾，微操脚本择时施法，不能说每次施法点由模型选择。
+GLM第32轮主动use_ability时空加速，能量消耗+目标buff变化回执。DeepSeek未直接use_ability。
+精确基地标签注卵44发令/43能量与buff确认，字符串和整数标签都有真实成功，4基地；另1次接近停滞失败。
+模型没造破坏者、潜伏者、电兵，胆汁/埋地/风暴/反馈本场未覆盖，不能算通过或失败。
+真实入模combat_micro.automatic与近期回执可查observer-audit.json；ability-evidence.json链接原始请求/任务/标签确认。
+
+对战账本82/192（GLM40、DeepSeek42），82请求全部返回指定模型，无超时/API错误；另独立预检2/2。
+接受计划37/41份，4份被拒（缺revision_reason两次、重复append、错误取消已发生产任务）。
+原生拒绝1条光子炮CouldntReachTarget，保留原始状态，未证明唯一成因；生产者死亡另计真实战损。
+输血1次6秒未确认、女王注卵接近停滞、神族残局供电/前置选址、模型少量补兵/不断延后出击/200上限误判均见REPORT.md。
+没有把所有资源积压归于模型或程序，重建选址与未确认技能需要独立复现；本场未改生产源码。
+
+75份历史账本哈希不变，source_unchanged=true，当前/归档源码及回放SHA核验通过，暂停违规0、清理完成。
+回放match-01/match.SC2Replay，SHA=b0efc8b66a30e8b61242717e0cb745085b401c337702644f62e844ca7bfd889c。
+原有微操1135pass/2skip与12原生场景的源码仍完全相同；本轮只新增比赛记录和说明，未提交推送。
+
+## 当前工作区：精确基地标签注卵与三族局部微操（尚未提交）
+
+用户要求先修复原始基地标签，再补破坏者胆汁、潜伏者进攻埋地、电兵/哨兵技能并检查其他技能。
+已新增 arena/combat_spells.py，将 CombatMicro 扩为三族执行器，保持原有部队/任务目标和控制权边界。
+自动覆盖规则详见 MICRO_CONTROLS.md；显式 use_ability、侦察、袭矿/空投、自定义任务仍自行控制技能。
+施法先检查原生可用性、能量、当前可见目标、射程和当前友军位置；区域技能去重，通道不被旧攻击立即打断。
+技能仅回执 combat_micro_acknowledged；buff/完整形态用 confirmed；没有推断伤害、击杀或胜利。
+潜伏者/寡妇雷在明确移动前先起身，地面空间任务也支持该机械转换。
+
+注卵 base 现在接受己方基地 tag 整数/十进制字符串，统一表示后合并同一未完成请求；精确匹配，不回落别的基地。
+标准/ChatGPT schema、Go 实际规则和 zerg_injection 观测同时更新。缺失/敌方/未完工/非基地均不施法。
+同时修复无常规武器施法单位被全军/战术/防守筛选漏掉、常驻守备预先挡住埋地单位的移动、
+HighTemplar 与 high_templar 等显示名/引擎标准名不一致，schema 与执行选择均已接通。
+模型实际 control_policy、combat_micro.automatic 与系统规则也明确三族支持，不再只宣称人族技能。
+
+新测试 test_multirace_micro.py、扩展 test_queen_injection.py；原生零模型验证入口 verify_multirace_micro_live.py。
+原生验证使用正常迷雾、明确 debug 夹具，逐场等待旧胆汁/力场消失并检查同高度地形；不是模型比赛或胜率证明。
+早期布场污染、视野遮挡、旧引擎渡鸦矩阵50能量确认门槛、守备命名失败记录均留在 logs/multirace-micro-*。
+最终完整回归：1137 项，1135 通过、2 原有 skip，63.602 秒；日志 logs/multirace-micro-complete-tests.log，
+对应 manifest 核验 318 份 Python 源码前后不变。原生最终目录 logs/multirace-micro-ynax8145：
+12 项全部通过（含真实 Commander 常驻守备风暴和指定宏观孵化场标签注卵），engine_action_errors=0、
+model_calls=0、source_unchanged=true、historical_unchanged=true、cleanup_complete=true。
+回放 SHA、归档与当前源码另经 final-verification.json 核验；技能目录 ability-coverage.json 含591条绑定
+（29 automatic_local、410 native_order、152 explicit_model_order），是目录覆盖分类，不是591项技能效果实测。
+新增真实守备验证还抓出风暴错误避开己方建筑，已按风暴不伤建筑修复；友军地面/空中单位保护保留。
+此前不同布场/源版本的成功和失败均留存，不将旧成功源快照冒称为其他版本验证。
+
+上一场真实模型对局为 logs/go-step-duels/glm-deepseek-tvz-76d7gl0q：Go GLM 人族 vs DeepSeek 虫族，
+17:59.60 引擎确认人族胜，非实时，81/192（39/42），另有独立连通性2/2。目录包含 REPORT.md、
+observer-audit.json、highlights.json、回放和源码，历史73份文件哈希当时核验一致。该场使用本次修复前的微操，
+不能把新三族技能追认为它已使用。复盘指出旧微操只有人族自动能力，不能直接推断 GLM 模型更强。
+已有 go_step_series.py 的显式双方模型/factory 改动、Go Gemini 白名单及训练隐私拒绝处理、VIDEO_ROADMAP.md
+继续保留，没有重置 GPT/Gemini 失败预检和其他历史账本。当前未新打收费模型对局，也未提交/推送本轮改动。
+
 ## 本轮提交：主动进攻与跨轮计划
 
 基于当前分支codex/lan-ai-rooms的39771ab，用户要求增强进攻性并开始修改。

@@ -12,7 +12,8 @@ import uuid
 from arena.chatgpt_planner import ChatGPTSubscriptionPlanner
 
 GO_MODEL = 'opencode-go/deepseek-v4.1-flash'
-GO_MODELS = (GO_MODEL, 'opencode-go/deepseek-v4-pro', 'opencode-go/glm-5.3-flash')
+GO_MODELS = (GO_MODEL, 'opencode-go/deepseek-v4-pro', 'opencode-go/glm-5.3-flash',
+             'opencode-go/gemini-4-argon-contributor')
 GO_ENDPOINT = 'https://opencode.ai/zen/go/v1'
 KEY_ENV = 'open_api_key'
 GO_BATTLE_MAX_TOKENS = 16000
@@ -172,12 +173,17 @@ def perform_request(request, post):
         # Report only fixed diagnostic labels: provider messages can echo request
         # details/credentials and must never be written to the journal.
         topics=set()
+        privacy_setting_required=False
         labels=('schema','max_tokens','quota','credit','session','unsupported','reasoning',
                 'messages','coding','secret','binding','credential','authorization','proxy','limit','format')
         def collect_topics(message):
+            nonlocal privacy_setting_required
             if isinstance(message,str):
+                lower=message.lower()
+                if 'trains on request data' in lower and 'privacy settings' in lower:
+                    privacy_setting_required=True
                 topics.update('credential' if word=='secret' else word
-                              for word in labels if word in message.lower())
+                              for word in labels if word in lower)
         try:
             error=response.json().get('error',{})
             if isinstance(error,dict):
@@ -191,7 +197,10 @@ def perform_request(request, post):
         except (ValueError,TypeError,AttributeError):pass
         collect_topics(getattr(response,'text',''))
         if topics:result['provider_error_topics']=sorted(topics)
-        if result.get('provider_error_type') == 'insufficient_quota':
+        if privacy_setting_required:
+            result.update(error='OpenCode Go privacy settings block this model: it trains on request data; explicit user consent and a workspace Privacy setting change are required',
+                          error_kind='privacy_setting_required')
+        elif result.get('provider_error_type') == 'insufficient_quota':
             result.update(error='HTTP %d: OpenCode Go quota exceeded' % response.status_code,
                           error_kind='quota_exhausted')
         elif response.status_code in (401,402,403):

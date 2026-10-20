@@ -21,15 +21,17 @@ def specification(tree,race,args):
     if isinstance(timeout,bool) or not isinstance(timeout,int) or not 1<=timeout<=300:
         raise ValueError('inject_larva timeout_s must be an integer in 1..300')
     base=args.get('base','home')
-    if not isinstance(base,str) or base not in ('home','expansion') and not base.startswith('site_'):
-        raise ValueError('inject_larva base must be home, expansion or an observed site_N')
+    if isinstance(base,str) and base.isascii() and base.isdecimal():base=int(base)
+    if not (type(base) is int and 0<base<2**64 or isinstance(base,str) and
+            (base in ('home','expansion') or base.startswith('site_'))):
+        raise ValueError('inject_larva base must be home, expansion, an observed site_N or a positive owned base tag (integer or decimal string)')
     if ABILITY not in tree.abilities or tree.abilities[ABILITY].link_name!='SpawnLarva':
         raise ValueError('native inject ability identity mismatch')
     return dict(kind='inject_larva',base=base,ability=ABILITY,timeout_s=timeout)
 
 def report(w,q):
     protected=q.protected()
-    return dict(task=dict(skill='inject_larva',count=1,args=dict(base='home|expansion|observed site_N',timeout_s='optional integer 1..300, default 90')),
+    return dict(task=dict(skill='inject_larva',count=1,args=dict(base='home|expansion|observed site_N|owned base tag (integer or decimal string)',timeout_s='optional integer 1..300, default 90')),
         rule='Zerg only. One explicit cast, 25 Queen energy. Free owned Queen, own completed base. Native cast may move Queen to that base; units stay reserved while observed approach progresses. For distant travel explicitly increase timeout_s. Confirm actual energy spending + buff, NOT larvae already born. Existing buff prevents recast. No automatic cycle. Total request deadline defaults to 90 game seconds; missing orders or stalled approach fail earlier.',
         queens=[dict(tag=u.tag,pos=u.pos,energy=round(u.energy,1),allocated=u.tag in protected,
             orders=list(u.orders),order_targets=list(u.order_targets),order_positions=list(u.order_positions))
@@ -107,7 +109,8 @@ class InjectLarvaRun:
         if w.seconds<self.next_at:return
         self.next_at=w.seconds+.5;home=q.backend.homes[q.index];name=self.spec['base']
         bases=[u for u in w.my_units if u.type_id in (86,100,101) and u.done and not u.hallucination]
-        if name=='home':bases=[u for u in bases if u.distance(home)<15]
+        if type(name) is int:bases=[u for u in bases if u.tag==name]
+        elif name=='home':bases=[u for u in bases if u.distance(home)<15]
         elif name=='expansion':bases=[u for u in bases if u.distance(home)>=15]
         else:
             from arena.spatial import resource_sites
