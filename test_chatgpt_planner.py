@@ -174,5 +174,23 @@ class ChatGPTPlannerTests(unittest.TestCase):
             client.chat('system', '{}')
 
 
+class AbilitySchemaTests(unittest.TestCase):
+    def test_structured_battle_exposes_observed_native_ability(self):
+        schema=battle_output_schema({'native_abilities':{'enabled':True,'catalogue':{
+            '2063':{'name':'effect_blinding_cloud','target':'point'}}}})
+        branches=schema['properties']['tasks']['items']['anyOf']
+        ability=next((b for b in branches if b['properties']['skill']['enum']==['use_ability']),None)
+        self.assertIsNotNone(ability,'Structured ChatGPT decisions must be able to request native spells')
+        args=ability['properties']['args']
+        self.assertEqual(args['properties']['ability']['enum'],['effect_blinding_cloud'])
+        self.assertEqual(args['properties']['caster']['minimum'],1)
+        self.assertEqual(set(args['required']),{'caster','ability','target','timeout_s'})
+        self.assertFalse(args['additionalProperties'])
+    def test_disabled_native_abilities_are_not_advertised(self):
+        schema=battle_output_schema({'native_abilities':{'enabled':False}})
+        names=[name for b in schema['properties']['tasks']['items']['anyOf'] for name in b['properties']['skill']['enum']]
+        self.assertNotIn('use_ability',names)
+
+
 if __name__ == '__main__':
     unittest.main()

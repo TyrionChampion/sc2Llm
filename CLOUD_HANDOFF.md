@@ -1,5 +1,36 @@
 # 自主 bot 对战交接
 
+## 最新：GPT‑6 Luna 同场景独立盲测
+
+用户要求让gpt6-luna试同样场景。verify_army_tactics_live.py新增--model gpt-6-luna（默认仍gpt-6.1-terra），
+BudgetMailbox实例保留明确模型身份、禁止回退，预算角色通用化；未改兵力、地形、初始能量、战斗/胜负规则。新2测试，相关61项通过。
+记录logs/army-luna-abchqo23，复用上一轮20/22/24枪兵的已验证配对控制；接模型前均强制匹配军队初始SHA。
+三个全新平台gpt-6-luna代理，fork_turns=none，只获本方邮箱访问指令，无父历史/Terra结果/其他Luna经验/战术解法，自动施法关闭。
+20枪兵：18.93s虫族胜，剩4刺蛇2飞蛇；22：14.29s虫族败，剩1飞蛇；24：17.14s虫族胜，剩6刺蛇2飞蛇。
+Luna也3/3首轮自行选毒云，各6/5/6轮共17轮决策，10次毒云API发令/回执，真实effect/buff确认。均0原生拒绝、0任务失败/计划拒绝、0暂停违规。
+20组重复同点覆盖3坦克，22组只用一飞蛇施法并仅观察2坦克致盲，24组分开覆盖并调整刺蛇推进；两模型均2胜1败但败在不同组，不推断整体强弱。
+79份先前预算SHA不变，所有模型初始匹配/当时及当前归档源码/回放SHA核验通过，清理完成；见observer-audit.json、final-verification.json、comparison.json。
+仍是平台指定模型代理+ExternalPlanner邮箱+原生API，非已打通的订阅CLI。仍以地面战斗单位归零计局部胜负，不累计完整比赛胜场。场景提交包含代码、测试和文档，原始日志与回放保留本地。
+
+## 最新场景：飞蛇毒云对照与 GPT‑6.1 Terra 盲测
+
+用户要求继续用Linux PySC2，先证明枪兵/坦克/医疗机 vs 狗刺蛇/两飞蛇纯A虫族输，毒云可翻盘，再不提示解法交给Terra。
+新增verify_army_tactics_live.py、test_army_tactics_trial.py、ARMY_TACTICS_SCENARIOS.md。
+记录目录logs/army-trial-viqevba2：官方Flat128、正常迷雾、非实时，debug只布场/初始能量，交战无额外购买/改属性。
+固定32狗12刺蛇2飞蛇 vs 4架起坦克2医疗机，枪兵20/22/24三组。胜负是地面战斗部队归零，不算完整比赛引擎胜场。
+三组严格匹配初始SHA，均纯A虫族输、固定毒云虫族赢；均观察到effect10及4坦克buff83。早期地形/飞蛇出生受伤校准失败全部保留。
+
+按用户指定模型，以平台独立gpt-6.1-terra代理（fork_turns=none）分别连接ExternalPlanner本方邮箱，没有父历史/其他试验经验/战术提示/对照结果。
+全部虫族combat_micro=False，模型自行选择技能，由现有Commander/TaskQueue/NativeAbilityRun调用原生API，不由自动脚本放雾。
+20枪兵：Terra13.21s胜；22枪兵：18.21s胜；24枪兵：17.50s败。三次都首轮自行选毒云，不能把识别正确当全部取胜。
+强阵容败例：第二轮毒云改打枪兵，未续盖坦克，9.29s观察到坦克buff消失/重新冷却开火；12.86s点杀已晚。
+共17轮邮箱决策、各12预算、原生拒绝0、暂停违规0。22组错误cancel_task取消已发技能被整份拒绝，22/24组有发令后单位阵亡任务失败。
+三组初始一致、当时当前/归档源码/回放核验、历史账本不变、清理完成，见observer-audit.json及final-verification-at-battle-source.json。
+
+独立订阅CLI无局面预检1/1遇代理CONNECT403超时；没有改网络策略/回退模型。本次是平台独立代理+邮箱，不是已打通云端订阅HTTP接口。
+赛后发现并修复arena/chatgpt_planner.py结构化schema白名单漏use_ability，test_chatgpt_planner.py新增2测试；相关59项通过。
+该修复在所有盲测结束后，版本边界记录post-trial-fix.json，不追认结构化路径已有实战验证。
+
 ## 最新实战：随机 PvZ 三族微操观察（已完成）
 
 用户要求随机挑两个种族打一场，观察模型是否使用新增能力。一次抽签为 GLM 神族 vs DeepSeek 虫族，
